@@ -11,6 +11,7 @@ from .config import DEFAULT_CELLPOSE_CONFIG, DEFAULT_FEATURE_CONFIG
 from .features import compute_cell_features
 from .matching import MatchingConfig, greedy_match_cells, match_cells_per_patch, match_cells_per_cluster
 from .registration import RigidTransform, estimate_rigid_transform_from_matches
+from .robust_alignment import perform_global_registration, apply_transform_to_coordinates
 from .segmentation import CellposeSegmenter
 from .io_utils import load_image
 
@@ -585,17 +586,34 @@ def run_pipeline(
     feats2 = compute_cell_features(masks2, DEFAULT_FEATURE_CONFIG).reset_index(drop=True)
     h1, w1 = masks1.shape
     h2, w2 = masks2.shape
+
+    # --- Global Registration Step ---
+    print("Running robust global alignment...")
+    global_transform = perform_global_registration(feats1, feats2)
+
+    if global_transform is not None:
+        print("Global alignment successful.")
+        print(f"Initial rotation: {global_transform.rotation}")
+        print(f"Initial translation: {global_transform.translation}")
+        # Apply transform to create a temporary aligned dataframe for matching
+        feats2_aligned = apply_transform_to_coordinates(feats2, global_transform)
+    else:
+        print("Global alignment failed or insufficient matches. Proceeding with raw coordinates.")
+        feats2_aligned = feats2.copy()
+
     feats1 = assign_patches(feats1, w1, h1, x_col="centroid_x", y_col="centroid_y")
-    feats2 = assign_patches(feats2, w2, h2, x_col="centroid_x", y_col="centroid_y")
+    feats2_aligned = assign_patches(feats2_aligned, w1, h1, x_col="centroid_x", y_col="centroid_y")
+
     if use_spatial_clusters:
-        feats1, feats2 = assign_clusters_from_round1(
+        feats1, feats2_aligned = assign_clusters_from_round1(
             feats1,
-            feats2,
+            feats2_aligned,
             n_clusters=n_clusters,
             x_col="centroid_x",
             y_col="centroid_y",
             cluster_col="cluster_id",
         )
+
     if save_features_dir is not None:
         save_features_dir.mkdir(parents=True, exist_ok=True)
         # Add convenience x/y aliases expected by point_registration
@@ -612,15 +630,16 @@ def run_pipeline(
         print(f"Saved feature tables to {out1} and {out2}")
 
     match_cfg = MatchingConfig(top_k=top_k, position_weight=position_weight)
+
     if use_spatial_clusters:
         matches = match_cells_per_cluster(
-            feats1, feats2, match_cfg, cluster_col="cluster_id", top_k_per_cluster=top_k_per_patch
+            feats1, feats2_aligned, match_cfg, cluster_col="cluster_id", top_k_per_cluster=top_k_per_patch
         )
     else:
         if top_k_per_patch is not None:
-            matches = match_cells_per_patch(feats1, feats2, match_cfg, top_k_per_patch=top_k_per_patch)
+            matches = match_cells_per_patch(feats1, feats2_aligned, match_cfg, top_k_per_patch=top_k_per_patch)
         else:
-            matches = greedy_match_cells(feats1, feats2, match_cfg)
+            matches = greedy_match_cells(feats1, feats2_aligned, match_cfg)
 
     if use_topology_filtering:
         if "cell_id" not in feats1.columns:
@@ -633,13 +652,13 @@ def run_pipeline(
         candidate_matches = pd.DataFrame(
             {
                 "cell_id_r1": feats1.loc[matches["idx1"], "cell_id"].to_numpy() if not matches.empty else [],
-                "cell_id_r2": feats2.loc[matches["idx2"], "cell_id"].to_numpy() if not matches.empty else [],
+                "cell_id_r2": feats2_aligned.loc[matches["idx2"], "cell_id"].to_numpy() if not matches.empty else [],
             }
         )
 
         trusted_pairs, neighbor_matches = run_topology_matching_df(
             feats1,
-            feats2,
+            feats2_aligned,
             candidate_matches,
             image_width=w1,
             image_height=h1,
@@ -667,7 +686,7 @@ def run_pipeline(
         else:
             combined_pairs = combined_pairs.drop_duplicates(subset=["cell_id_r1", "cell_id_r2"])
             id_to_idx1 = {feats1.loc[i, "cell_id"]: i for i in feats1.index}
-            id_to_idx2 = {feats2.loc[i, "cell_id"]: i for i in feats2.index}
+            id_to_idx2 = {feats2_aligned.loc[i, "cell_id"]: i for i in feats2_aligned.index}
             rows = []
             for _, pair in combined_pairs.iterrows():
                 cid1 = pair["cell_id_r1"]
