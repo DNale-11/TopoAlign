@@ -1,0 +1,15 @@
+numpy>=1.22,<2.0            # Py3.10-compatible
+pandas>=1.5,<2.1            # Py3.10-compatible
+scikit-image>=0.20,<0.23    # Py3.10-compatible
+scikit-learn>=1.2,<1.5      # Py3.10-compatible
+scipy>=1.9,<1.13            # For scikit-image / cellpose
+imageio>=2.31,<3.0          # Py3.10-compatible
+tifffile>=2023.7,<2025.0    # Py3.10-compatible
+torch>=2.2,<2.5             # Needed by cellpose; choose cpu/cuda build as needed
+numba>=0.56,<0.63           # Cellpose dependency (align with llvmlite)
+llvmlite>=0.39,<0.46        # Pin with numba for Py3.10 wheels
+natsort>=8.0,<9.0           # Cellpose dependency
+tqdm>=4.65,<5.0             # Cellpose dependency
+cellpose>=4.0,<5.0          # Cellpose-SAM support
+napari[all]>=0.4.18         # Optional: interactive visualization
+matplotlib>=3.7,<3.10       # For static visualization
