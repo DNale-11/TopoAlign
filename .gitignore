@@ -1,0 +1,20 @@
+@"
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code
+.vscode/
+
+# Data files
+*.tif
+*.tiff
+
+# Outputs
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+"@ | Out-File -Encoding utf8 .gitignore

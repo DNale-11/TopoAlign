@@ -13,7 +13,7 @@ from .matching import MatchingConfig, greedy_match_cells, match_cells_per_patch,
 from .registration import RigidTransform, estimate_rigid_transform_from_matches
 from .robust_alignment import perform_global_registration, apply_transform_to_coordinates
 from .segmentation import CellposeSegmenter
-from .io_utils import load_image
+from .io_utils import infer_image_mode, load_image, project_intensity_max
 
 # Allow running as `python cell_registration/main.py` by setting package context.
 if __name__ == "__main__" and __package__ is None:  # pragma: no cover
@@ -555,6 +555,7 @@ def run_pipeline(
     top_k_per_patch: int | None = TOP_K_PER_PATCH,
     position_weight: float = DEFAULT_POSITION_WEIGHT,
     napari_view: bool = False,
+    segmentation_only: bool = False,
     save_match_table: Path = DEFAULT_SAVE_MATCH_TABLE,
     save_match_overlay_path: Path = DEFAULT_SAVE_MATCH_OVERLAY,
     save_segmentation_prefix: Path = DEFAULT_SAVE_SEGMENTATION_PREFIX,
@@ -579,8 +580,47 @@ def run_pipeline(
     img1 = load_image(img1_path)
     img2 = load_image(img2_path)
 
-    masks1, _, _ = segmenter.segment_array(img1)
-    masks2, _, _ = segmenter.segment_array(img2)
+    mode1 = infer_image_mode(img1)
+    mode2 = infer_image_mode(img2)
+    if mode1 != mode2:
+        raise ValueError(f"Both images must be either 2D or 3D Z-stacks; got {mode1} and {mode2}.")
+
+    use_zstack = mode1 == "3d_zstack"
+
+    if use_zstack:
+        _masks1_3d, masks1, _, _ = segmenter.segment_zstack(img1)
+        _masks2_3d, masks2, _, _ = segmenter.segment_zstack(img2)
+        overlay_img1 = project_intensity_max(img1)
+        overlay_img2 = project_intensity_max(img2)
+    else:
+        masks1, _, _ = segmenter.segment_array(img1)
+        masks2, _, _ = segmenter.segment_array(img2)    
+        overlay_img1 = img1
+        overlay_img2 = img2
+
+    if segmentation_only:
+        if save_segmentation_prefix is not None:
+            from .visualization import save_segmentation_plot
+
+            out1 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img1.tif")
+            out2 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img2.tif")
+            save_segmentation_plot(overlay_img1, masks1, out1, title="Segmentation image1")
+            save_segmentation_plot(overlay_img2, masks2, out2, title="Segmentation image2")
+            print(f"Saved segmentation plots to {out1} and {out2}")
+
+        if napari_view:
+            try:
+                import napari  # type: ignore
+                from .visualization import launch_napari_viewer
+            except ImportError:
+                print("napari not installed; skipping interactive viewer.")
+            else:
+                viewer1 = launch_napari_viewer(overlay_img1, masks1, title="Image1 segmentation")
+                viewer2 = launch_napari_viewer(overlay_img2, masks2, title="Image2 segmentation")
+                viewer1.window._qt_window.raise_()
+                viewer2.window._qt_window.raise_()
+                napari.run()
+        return
 
     feats1 = compute_cell_features(masks1, DEFAULT_FEATURE_CONFIG).reset_index(drop=True)
     feats2 = compute_cell_features(masks2, DEFAULT_FEATURE_CONFIG).reset_index(drop=True)
@@ -590,6 +630,13 @@ def run_pipeline(
     # --- Global Registration Step ---
     print("Running robust global alignment...")
     global_transform = perform_global_registration(feats1, feats2)
+
+    if global_transform is not None:
+        rot = getattr(global_transform, "rotation", np.nan)
+        trans = getattr(global_transform, "translation", np.array([np.nan, np.nan]))
+        if not (np.isfinite(rot) and np.all(np.isfinite(trans))):
+            print("Global alignment returned non-finite parameters; skipping global transform.")
+            global_transform = None
 
     if global_transform is not None:
         print("Global alignment successful.")
@@ -764,22 +811,22 @@ def run_pipeline(
 
         out1 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img1.tif")
         out2 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img2.tif")
-        save_segmentation_plot(img1, masks1, out1, title="Segmentation image1")
-        save_segmentation_plot(img2, masks2, out2, title="Segmentation image2")
+        save_segmentation_plot(overlay_img1, masks1, out1, title="Segmentation image1")
+        save_segmentation_plot(overlay_img2, masks2, out2, title="Segmentation image2")
         print(f"Saved segmentation plots to {out1} and {out2}")
 
     if save_match_overlay_path is not None:
         from .visualization import save_match_overlay
 
         overlay_path = save_match_overlay_path.with_suffix(".tif")
-        save_match_overlay(img1, img2, feats1, feats2, matches, overlay_path)
+        save_match_overlay(overlay_img1, overlay_img2, feats1, feats2, matches, overlay_path)
         print(f"Saved match overlay image to {overlay_path}")
 
     if save_match_plot_path is not None:
         from .visualization import save_match_plot
 
         match_plot_path = save_match_plot_path.with_suffix(".tif")
-        save_match_plot(img1, img2, feats1, feats2, matches, match_plot_path)
+        save_match_plot(overlay_img1, overlay_img2, feats1, feats2, matches, match_plot_path)
         print(f"Saved match plot to {match_plot_path}")
 
     if save_registration_overlay_path is not None:
@@ -787,9 +834,9 @@ def run_pipeline(
 
         reg_overlay_path = save_registration_overlay_path.with_suffix(".tif")
         save_registration_overlay(
-            img1,
+            overlay_img1,
             masks1,
-            img2,
+            overlay_img2,
             rotation=transform.rotation,
             translation=transform.translation,
             path=reg_overlay_path,
@@ -822,9 +869,11 @@ def run_pipeline(
                 except ImportError:
                     print("napari not installed; skipping interactive viewer.")
                 else:
-                    viewer1 = launch_napari_viewer(img1, masks1, feats1, title="Image1")
-                    viewer2 = launch_napari_viewer(img2, masks2, feats2, title="Image2")
-                    warped = warp_mask_to_image2(masks1, img2.shape[:2], transform.rotation, transform.translation)
+                    viewer1 = launch_napari_viewer(overlay_img1, masks1, feats1, title="Image1")
+                    viewer2 = launch_napari_viewer(overlay_img2, masks2, feats2, title="Image2")
+                    warped = warp_mask_to_image2(
+                        masks1, overlay_img2.shape[:2], transform.rotation, transform.translation
+                    )
                     viewer2.add_labels((warped > 0).astype(int), name="warped_mask1_on_image2", opacity=0.4)
                     viewer1.window._qt_window.raise_()  # bring windows forward
                     viewer2.window._qt_window.raise_()
@@ -915,6 +964,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--napari", action="store_true", help="Open napari viewers for segmentation results.")
     parser.add_argument(
+        "--segmentation-only",
+        action="store_true",
+        help="Run segmentation (and optional napari view) only; skip feature extraction, matching, registration.",
+    )
+    parser.add_argument(
         "--save-match-table",
         type=Path,
         default=DEFAULT_SAVE_MATCH_TABLE,
@@ -962,6 +1016,7 @@ def main():
         top_k_per_patch=args.top_per_patch,
         position_weight=args.position_weight,
         napari_view=args.napari,
+        segmentation_only=args.segmentation_only,
         save_match_table=args.save_match_table,
         save_match_overlay_path=args.save_match_overlay,
         save_segmentation_prefix=args.save_segmentation_prefix,

@@ -22,6 +22,8 @@ class CellposeConfig:
     flow_threshold: float = 0.4
     cellprob_threshold: float = 0.0
     min_size: int = 15
+    # Optional anisotropy for 3D Z-stacks (None -> isotropic / default behavior).
+    anisotropy: Optional[float] = None
 
 
 @dataclass
