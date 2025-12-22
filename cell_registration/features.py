@@ -14,7 +14,9 @@ from .config import CellFeaturesConfig
 BASE_PROPS: List[str] = [
     "label",
     "area",
-    "perimeter",
+    "perimeter", # Only valid for 2D slices or surface area in 3D (requires mesh usually)?
+                 # regionprops in 3D does not return 'perimeter' but 'area' is volume.
+                 # We will handle this dynamically.
     "eccentricity",
     "solidity",
     "major_axis_length",
@@ -35,43 +37,83 @@ def compute_cell_features(mask: np.ndarray, config: CellFeaturesConfig) -> pd.Da
     """
     Compute morphological/geometry features for each labeled cell using regionprops.
 
-    Required outputs (for registration/matching):
-    - centroid (x, y)
-    - area, perimeter
-    - roundness, eccentricity, solidity
-    - major/minor axis length
-    - major axis direction (orientation and unit vector)
+    Supports 2D and 3D masks.
     """
-    if mask.ndim != 2:
-        raise ValueError(f"Mask must be 2D, got shape {mask.shape}.")
+    is_3d = mask.ndim == 3
 
-    # Collect all properties in a single regionprops_table call (includes area/perimeter/eccentricity/solidity).
-    prop_names = list(dict.fromkeys(BASE_PROPS + list(config.extra_properties)))
+    # Adjust props for 3D
+    current_props = list(BASE_PROPS)
+    if is_3d:
+        # Perimeter is not standard in 3D regionprops (it calculates surface area but via mesh usually or not at all)
+        # We'll remove 'perimeter', 'eccentricity', 'orientation' if they cause issues or aren't supported same way.
+        # 'area' in 3D regionprops is number of voxels (Volume).
+        # 'major_axis_length' etc works in 3D.
+        if "perimeter" in current_props:
+            current_props.remove("perimeter")
+        # 'orientation' in 3D is not a single scalar (it's Euler angles or similar?), regionprops doesn't support 'orientation' for 3D.
+        if "orientation" in current_props:
+            current_props.remove("orientation")
+        # 'eccentricity' is 2D only in skimage regionprops.
+        if "eccentricity" in current_props:
+            current_props.remove("eccentricity")
+
+    prop_names = list(dict.fromkeys(current_props + list(config.extra_properties)))
+
+    # Filter out properties that might not exist for the dimensionality if manually added
+    # regionprops usually raises error if property not supported for dims
+
     props: Dict[str, np.ndarray] = regionprops_table(
         mask,
         properties=prop_names,
     )
 
     df = pd.DataFrame(props)
-    df = df.rename(
-        columns={
-            "label": "cell_id",
-            "centroid-0": "centroid_y",
-            "centroid-1": "centroid_x",
-        }
-    )
 
-    df["roundness"] = _roundness(df["area"].to_numpy(), df["perimeter"].to_numpy())
-    # Normalized positions in [0,1] relative to image size for spatial matching.
-    h, w = mask.shape
-    df["pos_x_norm"] = df["centroid_x"] / float(max(w, 1))
-    df["pos_y_norm"] = df["centroid_y"] / float(max(h, 1))
+    # Rename centroids
+    if is_3d:
+        # centroid-0: z, centroid-1: y, centroid-2: x
+        df = df.rename(
+            columns={
+                "label": "cell_id",
+                "centroid-0": "centroid_z",
+                "centroid-1": "centroid_y",
+                "centroid-2": "centroid_x",
+            }
+        )
+        # Fill missing 2D-specific columns with NaN or sensible defaults if needed by downstream
+        df["perimeter"] = 0.0
+        df["eccentricity"] = 0.0
+        df["orientation"] = 0.0
 
-    # Orientation (radians) is measured CCW from the horizontal axis to the major axis
-    # Provide a unit vector for downstream cosine similarity.
-    df["orientation"] = df["orientation"].astype(float)
-    df["axis_vec_x"] = np.cos(df["orientation"])
-    df["axis_vec_y"] = np.sin(df["orientation"])
+        # We can add 'volume' alias for area
+        df["volume"] = df["area"]
+
+    else:
+        df = df.rename(
+            columns={
+                "label": "cell_id",
+                "centroid-0": "centroid_y",
+                "centroid-1": "centroid_x",
+            }
+        )
+        # Calculate 2D specific metrics
+        df["roundness"] = _roundness(df["area"].to_numpy(), df["perimeter"].to_numpy())
+
+        # Orientation
+        df["orientation"] = df["orientation"].astype(float)
+        df["axis_vec_x"] = np.cos(df["orientation"])
+        df["axis_vec_y"] = np.sin(df["orientation"])
+
+    # Normalized positions in [0,1]
+    if is_3d:
+        d, h, w = mask.shape
+        df["pos_z_norm"] = df["centroid_z"] / float(max(d, 1))
+        df["pos_y_norm"] = df["centroid_y"] / float(max(h, 1))
+        df["pos_x_norm"] = df["centroid_x"] / float(max(w, 1))
+    else:
+        h, w = mask.shape
+        df["pos_y_norm"] = df["centroid_y"] / float(max(h, 1))
+        df["pos_x_norm"] = df["centroid_x"] / float(max(w, 1))
 
     if config.min_area is not None:
         df = df[df["area"] >= config.min_area]

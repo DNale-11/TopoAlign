@@ -8,7 +8,64 @@ import pandas as pd
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from skimage.measure import ransac
-from skimage.transform import EuclideanTransform
+
+from .registration import RigidTransform, estimate_rigid_transform_from_matches
+
+
+class RigidTransformModel:
+    """
+    Model class for scikit-image RANSAC.
+    Estimates a RigidTransform (Rotation + Translation) for N-dim.
+    """
+    def __init__(self):
+        self.params = None
+
+    def estimate(self, src, dst):
+        """
+        Estimate the transformation from src to dst.
+        src, dst: (N, D) arrays
+        """
+        # We can reuse our estimate_rigid_transform_from_matches function
+        # but we need to wrap inputs into dataframes or just extract the logic.
+        # Let's extract the pure numpy logic here to avoid overhead.
+
+        if len(src) < 2: # Need at least some points. 3 for 3D usually, 2 for 2D is enough if no scale.
+             return False
+
+        centroid_src = src.mean(axis=0)
+        centroid_dst = dst.mean(axis=0)
+
+        src_centered = src - centroid_src
+        dst_centered = dst - centroid_dst
+
+        H = src_centered.T @ dst_centered
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+
+        t = centroid_dst - (R @ centroid_src.T).T
+
+        self.params = (R, t)
+        return True
+
+    def residuals(self, src, dst):
+        """
+        Calculate residuals for each point.
+        """
+        R, t = self.params
+        src_transformed = (R @ src.T).T + t
+        return np.linalg.norm(src_transformed - dst, axis=1)
+
+    @property
+    def rotation(self):
+        return self.params[0]
+
+    @property
+    def translation(self):
+        return self.params[1]
 
 
 def get_feature_candidates(
@@ -20,49 +77,47 @@ def get_feature_candidates(
     """
     Find candidate matches based purely on feature similarity.
     Returns (src_points, dst_points) arrays for RANSAC.
-
-    src_points: Coordinates from df2 (source to be transformed)
-    dst_points: Coordinates from df1 (target)
-
-    Note: We map df2 -> df1.
     """
-    # 1. Standardize features
-    # Ensure columns exist
-    for col in feature_columns:
-        if col not in df1.columns or col not in df2.columns:
-            raise ValueError(f"Missing feature column {col}")
+    # Filter available columns
+    valid_cols = [c for c in feature_columns if c in df1.columns and c in df2.columns]
+    if not valid_cols:
+         # Fallback to just area/volume if nothing else
+         if "volume" in df1.columns and "volume" in df2.columns:
+             valid_cols = ["volume"]
+         elif "area" in df1.columns and "area" in df2.columns:
+             valid_cols = ["area"]
+         else:
+             raise ValueError("No matching feature columns found.")
 
     scaler = StandardScaler()
     combined = pd.concat(
-        [df1[list(feature_columns)], df2[list(feature_columns)]],
+        [df1[valid_cols], df2[valid_cols]],
         axis=0, ignore_index=True
     )
     scaled = scaler.fit_transform(combined)
     f1 = scaled[: len(df1)]
     f2 = scaled[len(df1) :]
 
-    # 2. Find top-k neighbors in feature space
-    # For each cell in df2, find k similar cells in df1
     nn = NearestNeighbors(n_neighbors=top_k, algorithm="auto")
     nn.fit(f1)
 
     distances, indices = nn.kneighbors(f2)
 
-    # 3. Flatten into correspondence arrays
-    # src: df2 points (repeated k times)
-    # dst: df1 points (the neighbors found)
+    # Coordinates
+    if "centroid_z" in df2.columns:
+        cols = ["centroid_z", "centroid_y", "centroid_x"]
+    else:
+        cols = ["centroid_y", "centroid_x"]
 
-    src_coords = df2[["centroid_x", "centroid_y"]].to_numpy()
-    dst_coords = df1[["centroid_x", "centroid_y"]].to_numpy()
+    src_coords = df2[cols].to_numpy()
+    dst_coords = df1[cols].to_numpy()
 
     src_list = []
     dst_list = []
 
     for i in range(len(df2)):
-        # i is index in df2
         p_src = src_coords[i]
         for neighbor_idx in indices[i]:
-            # neighbor_idx is index in df1
             p_dst = dst_coords[neighbor_idx]
             src_list.append(p_src)
             dst_list.append(p_dst)
@@ -74,44 +129,34 @@ def perform_global_registration(
     df1: pd.DataFrame,
     df2: pd.DataFrame,
     feature_columns: tuple[str, ...] = (
+        "volume",
         "area",
-        "perimeter",
-        "roundness",
-        "eccentricity",
-        "solidity",
         "major_axis_length",
         "minor_axis_length",
+        "solidity", # Note: eccentricity/perimeter might be missing in 3D
     ),
     top_k_candidates: int = 5,
-    ransac_min_samples: int = 3,
+    ransac_min_samples: int = 4, # Safer for 3D
     ransac_residual_threshold: float = 2.0,
     ransac_max_trials: int = 2000,
-) -> EuclideanTransform | None:
+) -> RigidTransform | None:
     """
     Estimate a global Rigid Transform (Rotation + Translation)
     aligning df2 (source) to df1 (target) using feature-guided RANSAC.
-
-    Returns None if registration fails.
     """
     if df1.empty or df2.empty:
         return None
 
-    # Get putative matches based on morphology
     src, dst = get_feature_candidates(df1, df2, feature_columns, top_k=top_k_candidates)
 
     if len(src) < ransac_min_samples:
         return None
 
-    # Run RANSAC
-    # EuclideanTransform model: 3 degrees of freedom (rotation, translation)
-    # It solves: dst = Matrix * src
     try:
-        # Seed global RNG for reproducibility if needed, or rely on caller.
-        # Removing random_state kwarg for compatibility with older skimage versions.
         np.random.seed(42)
         model, inliers = ransac(
             (src, dst),
-            EuclideanTransform,
+            RigidTransformModel,
             min_samples=ransac_min_samples,
             residual_threshold=ransac_residual_threshold,
             max_trials=ransac_max_trials
@@ -120,36 +165,32 @@ def perform_global_registration(
         print(f"RANSAC global registration failed: {e}")
         return None
 
-    return model
+    if model is None or model.params is None:
+        return None
+
+    return RigidTransform(rotation=model.rotation, translation=model.translation)
 
 
 def apply_transform_to_coordinates(
     df: pd.DataFrame,
-    transform: EuclideanTransform,
-    x_col: str = "centroid_x",
-    y_col: str = "centroid_y"
+    transform: RigidTransform,
 ) -> pd.DataFrame:
     """
-    Apply the transform to the coordinates in the dataframe
-    and return a copy with updated coordinates.
+    Apply the transform to the coordinates in the dataframe.
     """
     df_out = df.copy()
-    coords = df_out[[x_col, y_col]].to_numpy()
 
-    # transform(coords) applies the transformation
-    # Note: skimage EuclideanTransform operates on (N, 2) arrays
-    aligned = transform(coords)
+    if "centroid_z" in df_out.columns:
+        cols = ["centroid_z", "centroid_y", "centroid_x"]
+    else:
+        cols = ["centroid_y", "centroid_x"]
 
-    df_out[x_col] = aligned[:, 0]
-    df_out[y_col] = aligned[:, 1]
+    coords = df_out[cols].to_numpy()
 
-    # Also update normalized coordinates if they exist
-    # Note: This invalidates the normalization relative to original image size
-    # But for matching purposes, we just need them to be consistent with df1.
-    # To be safe, we should probably re-normalize or just let the matching
-    # use the raw centroid_x/y if we switch the matching config?
-    # The existing matching uses 'pos_x_norm'. We should update those too.
-    # Assuming the 'image_width' and 'image_height' were used to normalize.
-    # Ideally, we re-run the 'assign_patches' logic after alignment.
+    # Apply x_new = (R @ x_old.T).T + t
+    aligned = (transform.rotation @ coords.T).T + transform.translation
+
+    for i, col in enumerate(cols):
+        df_out[col] = aligned[:, i]
 
     return df_out

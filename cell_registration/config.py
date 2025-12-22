@@ -24,6 +24,10 @@ class CellposeConfig:
     min_size: int = 15
     # Optional anisotropy for 3D Z-stacks (None -> isotropic / default behavior).
     anisotropy: Optional[float] = None
+    # 3D specific settings
+    do_3D: bool = True
+    stitch_threshold: float = 0.0
+    flow3D_smooth: float = 0.0
 
 
 @dataclass

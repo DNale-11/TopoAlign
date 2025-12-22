@@ -68,7 +68,11 @@ def launch_napari_viewer(
     viewer.add_labels(mask, name=f"{title}-mask", opacity=0.5)
 
     if features is not None and not features.empty:
-        pts = features[["centroid_y", "centroid_x"]].to_numpy()
+        # Check if 3D
+        if "centroid_z" in features.columns:
+            pts = features[["centroid_z", "centroid_y", "centroid_x"]].to_numpy()
+        else:
+            pts = features[["centroid_y", "centroid_x"]].to_numpy()
         viewer.add_points(pts, name=f"{title}-centroids", size=6, face_color="cyan")
 
     return viewer
@@ -91,9 +95,11 @@ def save_match_overlay(
 ) -> None:
     """
     Create a side-by-side overlay of matched centroids and save as an RGB image.
-
     Lines connect matched cells between image1 (left) and image2 (right).
+    Requires 2D images and feats1/feats2 with centroid_x/centroid_y.
     """
+    # If 3D, image1/2 should be projections passed by caller.
+
     img1 = _normalize_for_overlay(_select_channel(image1))
     img2 = _normalize_for_overlay(_select_channel(image2))
 
@@ -134,11 +140,18 @@ def save_segmentation_plot(
 ) -> None:
     """
     Save a matplotlib figure showing grayscale image with mask boundaries.
+    If 3D, assumes projections provided.
     """
     img = _normalize_for_overlay(_select_channel(image))
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.imshow(img, cmap="gray")
+
+    # Check if mask is 3D
+    if mask.ndim == 3:
+         # Project max if not done
+         mask = np.max(mask, axis=0)
+
     ax.contour(mask, colors="lime", linewidths=0.6)
     ax.set_title(title)
     ax.axis("off")
@@ -160,7 +173,13 @@ def save_registration_overlay(
 ) -> None:
     """
     Warp mask1 (Image1 space) into Image2 space using rigid transform, then overlay on Image2.
+    Only supports 2D for now. 3D visualization requires specialized volume renderers.
     """
+    if mask1.ndim == 3:
+        # Warn or skip
+        print("save_registration_overlay: 3D overlay not fully supported, skipping.")
+        return
+
     warped_mask = warp_mask_to_image2(mask1, image2.shape[:2], rotation, translation)
 
     base = _normalize_for_overlay(_select_channel(image2))
@@ -187,6 +206,12 @@ def warp_mask_to_image2(
     """
     R = np.asarray(rotation, dtype=float)
     t = np.asarray(translation, dtype=float)
+
+    if R.shape != (2, 2):
+        # Fallback for identity or handle error if trying to use 3D matrix in 2D warp
+        # If R is 3x3, we can't use affine 2D transform directly
+        return np.zeros(image2_shape)
+
     R_inv = R.T  # orthonormal assumption
     t_inv = -R_inv @ t
 
@@ -223,6 +248,7 @@ def save_match_plot(
     """
     Save a matplotlib figure with matched centroids and connecting lines.
     """
+    # Assuming 2D or projected images/features
     img1 = _normalize_for_overlay(_select_channel(image1))
     img2 = _normalize_for_overlay(_select_channel(image2))
     h = max(img1.shape[0], img2.shape[0])
