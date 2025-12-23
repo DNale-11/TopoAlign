@@ -153,11 +153,13 @@ def run_pipeline(
     mode1 = infer_image_mode(img1)
     mode2 = infer_image_mode(img2)
 
-    # Allow mixing if careful, but for now enforce same
-    # Actually, we might want to register a 2D slice to a 3D volume?
-    # But user asks for 3D segmentation. We assume both are 3D or both 2D.
+    if mode1 != mode2:
+        raise ValueError(
+            f"Image modes must match. Image1 is {mode1}, Image2 is {mode2}. "
+            "Mixing 2D and 3D images is not supported. Please ensure both are 2D or both are 3D Z-stacks."
+        )
 
-    is_3d = "3d" in mode1 or "3d" in mode2
+    is_3d = (mode1 == "3d_zstack")
 
     print(f"Processing images. Mode 1: {mode1}, Mode 2: {mode2}. 3D Pipeline: {is_3d}")
 
