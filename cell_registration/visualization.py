@@ -10,8 +10,10 @@ import pandas as pd
 import imageio.v3 as iio
 from skimage import draw
 import matplotlib.pyplot as plt
-from skimage.transform import AffineTransform, warp
+from skimage.transform import warp
 from scipy.ndimage import binary_dilation
+
+from .registration import build_inverse_affine_transform
 
 
 def _select_channel(img: np.ndarray) -> np.ndarray:
@@ -185,22 +187,7 @@ def warp_mask_to_image2(
     """
     Warp mask1 into image2 coordinates using the estimated rigid transform.
     """
-    R = np.asarray(rotation, dtype=float)
-    t = np.asarray(translation, dtype=float)
-    R_inv = R.T  # orthonormal assumption
-    t_inv = -R_inv @ t
-
-    affine = AffineTransform(
-        matrix=np.array(
-            [
-                [R_inv[0, 0], R_inv[0, 1], t_inv[0]],
-                [R_inv[1, 0], R_inv[1, 1], t_inv[1]],
-                [0, 0, 1],
-            ],
-            dtype=float,
-        )
-    )
-
+    affine = build_inverse_affine_transform(rotation, translation)
     warped_mask = warp(
         mask1.astype(float),
         inverse_map=affine,
@@ -253,3 +240,5 @@ def save_match_plot(
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+

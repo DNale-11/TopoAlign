@@ -1,0 +1,159 @@
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+======================================================================
+  Cell Registration Benchmark
+======================================================================
+  Output dir: F:\programme\nxy\Cell registration\benchmark\results_tune\loo_smoke\holdout_g3\train\baseline_affine
+  Params saved to: benchmark_params.json
+  REG_PARAMS: {
+  "cellpose_diameter": 10.0,
+  "cellpose_flow_threshold": 0.0,
+  "cellpose_cellprob_threshold": 0.0,
+  "cellpose_min_size": 15,
+  "position_weight": 3.0,
+  "distance_threshold": 2.5,
+  "spatial_window_size": 100.0,
+  "top_k": 100,
+  "min_cells_for_two_stage": 20,
+  "coarse_top_k": 50,
+  "coarse_distance_threshold": 2.0,
+  "neighbor_k": 5,
+  "neighbor_weight": 1.0,
+  "landmark_weight": 10.0,
+  "max_theta_deg": 10.0,
+  "max_translation": 30.0,
+  "max_scale_change": 0.05,
+  "guided_min_position_weight": 4.0,
+  "guided_spatial_window_cap": 60.0,
+  "validation_min_confidence": 0.2,
+  "validation_max_feature_diff": 0.7,
+  "prefer_affine": true,
+  "ransac_max_trials": 500,
+  "ransac_residual_threshold": 3.0,
+  "similarity_residual_threshold": 5.0,
+  "fft_upsample_factor": 20,
+  "fft_max_shift": 20.0,
+  "fft_crop_ratio": 0.8,
+  "fft_max_iterations": 2
+}
+
+[1/5] Discovering image pairs...
+  Found 4 registration pairs
+    Group 1: D→B  |  src: C3-D-63-1_Merged_ch05_dapi_zmax.tif
+    Group 1: E→B  |  src: C3-E-63-1_Merged_ch05_dapi_zmax.tif
+    Group 2: D→B  |  src: C3-D-63-2_Merged_ch05_dapi_zmax.tif
+    Group 2: E→B  |  src: C3-E-63-2_Merged_ch05_dapi_zmax.tif
+
+[2/5] Initializing Cellpose-SAM segmenter (GPU=True)...
+  ✓ Segmenter ready
+
+[3/5] Running registrations...
+
+  [1/4] Group 1 - D→B
+    Source:    C3-D-63-1_Merged_ch05_dapi_zmax.tif
+    Reference: C3-B-63-1_Merged_ch05_dapi_zmax.tif
+    Image shapes: source=(1970, 1944), reference=(1975, 1944)
+    Cells found: source=1106, reference=1282
+    Coarse matches: 50
+    Coarse offset: dx=-6.75, dy=-41.14
+    Fine matches: 100
+    Validated matches: 100
+    RANSAC model: similarity | inliers: 7/100 | median residual: 2.37px
+    RANSAC inliers: 7/100
+    Guided rematch improved support: similarity, 12/100 inliers
+    Refining with k=5 neighbors (KNN)...
+    KNN refinement complete
+    FFT correction: dy=-2.10 dx=-0.20 (mag=2.11px)
+    FFT refinement applied
+    ⏱ Registration time: 25.53s
+    Metrics: PSNR=24.74 | SSIM=0.7266 | NCC=0.4056
+
+  [2/4] Group 1 - E→B
+    Source:    C3-E-63-1_Merged_ch05_dapi_zmax.tif
+    Reference: C3-B-63-1_Merged_ch05_dapi_zmax.tif
+    Image shapes: source=(1969, 1946), reference=(1975, 1944)
+    Cells found: source=1263, reference=1282
+    Coarse matches: 50
+    Coarse offset: dx=-1.74, dy=-62.31
+    Fine matches: 100
+    Validated matches: 100
+    RANSAC model: similarity | inliers: 13/100 | median residual: 2.04px
+    RANSAC inliers: 13/100
+    Guided rematch improved support: similarity, 24/100 inliers
+    Refining with k=5 neighbors (KNN)...
+    KNN refinement complete
+    FFT correction: dy=-0.75 dx=0.15 (mag=0.76px)
+    FFT refinement applied
+    ⏱ Registration time: 25.43s
+    Metrics: PSNR=28.52 | SSIM=0.7967 | NCC=0.8100
+
+  [3/4] Group 2 - D→B
+    Source:    C3-D-63-2_Merged_ch05_dapi_zmax.tif
+    Reference: C3-B-63-2_Merged_ch05_dapi_zmax.tif
+    Image shapes: source=(1977, 1948), reference=(1979, 1948)
+    Cells found: source=1047, reference=1200
+    Coarse matches: 50
+    Coarse offset: dx=36.48, dy=21.73
+    Fine matches: 100
+    Validated matches: 100
+    RANSAC model: similarity | inliers: 13/100 | median residual: 2.02px
+    RANSAC inliers: 13/100
+    Guided rematch improved support: similarity, 26/100 inliers
+    Refining with k=5 neighbors (KNN)...
+    KNN refinement complete
+    FFT correction: dy=-1.80 dx=1.00 (mag=2.06px)
+    FFT refinement applied
+    ⏱ Registration time: 24.69s
+    Metrics: PSNR=27.95 | SSIM=0.8062 | NCC=0.8113
+
+  [4/4] Group 2 - E→B
+    Source:    C3-E-63-2_Merged_ch05_dapi_zmax.tif
+    Reference: C3-B-63-2_Merged_ch05_dapi_zmax.tif
+    Image shapes: source=(1985, 1947), reference=(1979, 1948)
+    Cells found: source=1120, reference=1200
+    Coarse matches: 50
+    Coarse offset: dx=11.86, dy=-26.81
+    Fine matches: 100
+    Validated matches: 100
+    RANSAC model: similarity | inliers: 27/100 | median residual: 1.75px
+    RANSAC inliers: 27/100
+    Guided rematch improved support: similarity, 41/100 inliers
+    Refining with k=5 neighbors (KNN)...
+    KNN refinement complete
+    FFT correction: dy=-1.00 dx=-0.15 (mag=1.01px)
+    FFT refinement applied
+    ⏱ Registration time: 25.23s
+    Metrics: PSNR=27.80 | SSIM=0.7963 | NCC=0.8488
+
+[4/5] Generating visualizations and reports...
+  ✓ Saved results CSV: benchmark_results.csv
+  ✓ Saved metrics bar chart: metrics_bar_chart.png
+  ✓ Saved heatmap: metrics_heatmap.png
+  ✓ Saved timing chart: timing_chart.png
+  ✓ Saved group comparison: group_comparison.png
+
+  Generating difference maps...
+
+[5/5] Summary
+======================================================================
+Pair            PSNR       SSIM       NCC        MI         Time(s)   
+----------------------------------------------------------------------
+G1-D→B          24.74      0.7266     0.4056     0.3312     25.53     
+G1-E→B          28.52      0.7967     0.8100     0.7573     25.43     
+G2-D→B          27.95      0.8062     0.8113     0.6210     24.69     
+G2-E→B          27.80      0.7963     0.8488     0.7751     25.23     
+----------------------------------------------------------------------
+Average         27.25      0.7815     0.7189     0.6212     25.22     
+======================================================================
+
+All outputs saved to: F:\programme\nxy\Cell registration\benchmark\results_tune\loo_smoke\holdout_g3\train\baseline_affine
+Done!
+COMMAND:
+C:\Users\Administrator\anaconda3\envs\cell_registration\python.exe F:\programme\nxy\Cell registration\benchmark\run_benchmark.py --output-dir F:\programme\nxy\Cell registration\benchmark\results_tune\loo_smoke\holdout_g3\train\baseline_affine --sample-groups 1,2 --rounds D,E
+
