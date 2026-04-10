@@ -13,15 +13,15 @@ SUPPORTED_EXTENSIONS: Tuple[str, ...] = (".tif", ".tiff", ".png", ".jpg", ".jpeg
 class CellposeConfig:
     """Configuration for Cellpose-SAM segmentation."""
 
-    gpu: bool = False
+    gpu: bool = True
     # Use SAM checkpoint by default.
     pretrained_model: str = "cpsam"
     # model_type is ignored in cellpose 4.x; keep None.
     model_type: Optional[str] = None
-    diameter: Optional[float] = None
-    flow_threshold: float = 0.4
-    cellprob_threshold: float = 0.0
-    min_size: int = 15
+    diameter: Optional[float] = 8
+    flow_threshold: float = -2
+    cellprob_threshold: float = -2
+    min_size: int = 1
     # Optional anisotropy for 3D Z-stacks (None -> isotropic / default behavior).
     anisotropy: Optional[float] = None
 

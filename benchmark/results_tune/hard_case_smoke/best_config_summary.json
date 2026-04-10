@@ -1,0 +1,47 @@
+{
+  "sample_groups": [
+    1,
+    2,
+    3
+  ],
+  "rounds": [
+    "A",
+    "D"
+  ],
+  "hard_pairs": [
+    "1:A",
+    "1:D",
+    "2:A",
+    "3:A"
+  ],
+  "best_row": {
+    "config_name": "d_optimized_similarity",
+    "returncode": 0,
+    "output_dir": "F:\\programme\\nxy\\Cell registration\\benchmark\\results_tune\\hard_case_smoke\\d_optimized_similarity",
+    "log_path": "F:\\programme\\nxy\\Cell registration\\benchmark\\results_tune\\hard_case_smoke\\d_optimized_similarity\\tune.log",
+    "n_pairs": 6,
+    "mean_psnr": 27.934994034785333,
+    "mean_ssim": 0.7019681177463841,
+    "mean_ncc": 0.7898121228406766,
+    "mean_mi": 0.6266106211159373,
+    "min_ssim": 0.5863964944526795,
+    "min_ncc": 0.3804178492999611,
+    "score": 2.750837142086166,
+    "hard_n_pairs": 4,
+    "hard_mean_psnr": 27.04452679704619,
+    "hard_mean_ssim": 0.6317085762552782,
+    "hard_mean_ncc": 0.7363657633574465,
+    "hard_min_ssim": 0.5863964944526795,
+    "hard_min_ncc": 0.3804178492999611,
+    "hard_score": 3.3015612269488184,
+    "g1_a_ssim": 0.6113099046067438,
+    "g1_a_ncc": 0.8547665369704546,
+    "g1_d_ssim": 0.7240316340462983,
+    "g1_d_ncc": 0.3804178492999611,
+    "g2_a_ssim": 0.605096271915391,
+    "g2_a_ncc": 0.8630620515755831,
+    "g3_a_ssim": 0.5863964944526795,
+    "g3_a_ncc": 0.8472166155837872,
+    "combined_score": 3.053735388760625
+  }
+}

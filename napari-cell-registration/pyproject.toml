@@ -1,0 +1,62 @@
+[project]
+name = "napari-cell-registration"
+version = "0.1.0"
+description = "DAPI-based cell segmentation, matching, and registration for napari"
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+authors = [
+    {name = "Cell Registration Team"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: napari",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "napari>=0.4.18",
+    "numpy>=1.22,<2.0",
+    "pandas>=1.5,<2.1",
+    "scikit-image>=0.20,<0.23",
+    "scikit-learn>=1.2,<1.5",
+    "scipy>=1.9,<1.13",
+    "imageio>=2.31,<3.0",
+    "tifffile>=2023.7,<2025.0",
+    # torch is required by cellpose, but version should match user's CUDA/GPU
+    # Don't constrain - let user install appropriate version for their hardware
+    "numba>=0.56,<0.63",
+    "llvmlite>=0.39,<0.46",
+    "natsort>=8.0,<9.0",
+    "tqdm>=4.65,<5.0",
+    "cellpose>=4.0,<5.0",
+    "matplotlib>=3.7,<3.10",
+    "magicgui>=0.7.0",
+    "qtpy",
+]
+
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
+
+[project.entry-points."napari.manifest"]
+napari-cell-registration = "napari_cell_registration:napari.yaml"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-qt",
+]

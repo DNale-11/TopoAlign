@@ -1,0 +1,33 @@
+name: napari-cell-registration
+display_name: Cell Registration
+contributions:
+  commands:
+    # Automated segmentation command
+    - id: napari-cell-registration.segment_cells
+      title: Segment cells with Cellpose-SAM
+      python_name: napari_cell_registration._widget:segment_cells_widget
+    
+    # Manual segmentation command
+    - id: napari-cell-registration.manual_segmentation
+      title: Manual Cell Segmentation
+      python_name: napari_cell_registration._manual_seg_widget:ManualSegmentationWidget
+    
+    # Full registration workflow command
+    - id: napari-cell-registration.registration_workflow
+      title: Cell Registration Workflow
+      python_name: napari_cell_registration._widget:registration_workflow_widget
+  
+  widgets:
+    # Automated segmentation widget
+    - command: napari-cell-registration.segment_cells
+      display_name: Cell Segmentation (Cellpose)
+      autogenerate: true
+    
+    # Manual segmentation widget
+    - command: napari-cell-registration.manual_segmentation
+      display_name: Manual Segmentation
+    
+    # Full registration workflow widget
+    - command: napari-cell-registration.registration_workflow
+      display_name: Registration Workflow
+      autogenerate: true

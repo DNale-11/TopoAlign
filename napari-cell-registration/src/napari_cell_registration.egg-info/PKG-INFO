@@ -1,0 +1,82 @@
+Metadata-Version: 2.4
+Name: napari-cell-registration
+Version: 0.1.0
+Summary: DAPI-based cell segmentation, matching, and registration for napari
+Author: Cell Registration Team
+License: BSD-3-Clause
+Classifier: Development Status :: 3 - Alpha
+Classifier: Framework :: napari
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: BSD License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Topic :: Scientific/Engineering :: Image Processing
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: napari>=0.4.18
+Requires-Dist: numpy<2.0,>=1.22
+Requires-Dist: pandas<2.1,>=1.5
+Requires-Dist: scikit-image<0.23,>=0.20
+Requires-Dist: scikit-learn<1.5,>=1.2
+Requires-Dist: scipy<1.13,>=1.9
+Requires-Dist: imageio<3.0,>=2.31
+Requires-Dist: tifffile<2025.0,>=2023.7
+Requires-Dist: numba<0.63,>=0.56
+Requires-Dist: llvmlite<0.46,>=0.39
+Requires-Dist: natsort<9.0,>=8.0
+Requires-Dist: tqdm<5.0,>=4.65
+Requires-Dist: cellpose<5.0,>=4.0
+Requires-Dist: matplotlib<3.10,>=3.7
+Requires-Dist: magicgui>=0.7.0
+Requires-Dist: qtpy
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-qt; extra == "dev"
+
+# napari-cell-registration
+
+DAPI-based cell segmentation, matching, and registration plugin for napari.
+
+## Features
+
+- **Cell Segmentation**: Automatic nuclear segmentation using Cellpose-SAM
+- **Feature Extraction**: Extract morphological features from segmented cells
+- **Cell Matching**: Match cells between two imaging rounds using feature similarity
+- **Rigid Registration**: Estimate and apply rigid transforms between rounds
+- **Interactive Visualization**: View and validate results directly in napari
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+For development:
+```bash
+pip install -e ".[dev]"
+```
+
+## Usage
+
+1. Open napari:
+   ```bash
+   napari
+   ```
+
+2. Load your DAPI images as layers
+
+3. From the Plugins menu, select:
+   - **Cell Segmentation** - for quick segmentation only
+   - **Registration Workflow** - for complete registration pipeline
+
+## Requirements
+
+- Python >= 3.10
+- napari >= 0.4.18
+- cellpose >= 4.0
+- See `pyproject.toml` for complete dependency list
+
+## License
+
+BSD-3-Clause

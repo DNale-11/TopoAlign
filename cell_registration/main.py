@@ -10,7 +10,11 @@ from sklearn.neighbors import NearestNeighbors
 from .config import DEFAULT_CELLPOSE_CONFIG, DEFAULT_FEATURE_CONFIG
 from .features import compute_cell_features
 from .matching import MatchingConfig, greedy_match_cells, match_cells_per_patch, match_cells_per_cluster
-from .registration import RigidTransform, estimate_rigid_transform_from_matches
+from .registration import (
+    RigidTransform,
+    estimate_rigid_transform_from_matches,
+    estimate_rigid_transform_from_matches_ransac,
+)
 from .robust_alignment import perform_global_registration, apply_transform_to_coordinates
 from .segmentation import CellposeSegmenter
 from .io_utils import infer_image_mode, load_image, project_intensity_max
@@ -488,66 +492,6 @@ def compute_match_residuals(
     pts2_warp = (transform.rotation @ pts2.T).T + transform.translation
     return np.linalg.norm(pts1 - pts2_warp, axis=1)
 
-
-def estimate_rigid_transform_from_matches_ransac(
-    feats1: pd.DataFrame,
-    feats2: pd.DataFrame,
-    matches: pd.DataFrame,
-    max_trials: int = 1000,
-    residual_threshold: float = 2.0,
-    min_inliers: int = 3,
-) -> tuple[RigidTransform, np.ndarray]:
-    """
-    Estimate a robust rigid transform using RANSAC on matched pairs.
-    """
-    n_matches = len(matches)
-    if n_matches == 0:
-        raise ValueError("No matches provided to estimate transform.")
-    if n_matches < min_inliers:
-        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
-        inlier_mask = np.ones(n_matches, dtype=bool)
-        return transform, inlier_mask
-
-    rng = np.random.default_rng(0)
-    best_transform: RigidTransform | None = None
-    best_inliers = np.zeros(n_matches, dtype=bool)
-    best_inlier_count = 0
-    best_residual_sum = np.inf
-    sample_size = min(2, n_matches)
-
-    for _ in range(max_trials):
-        sample_indices = rng.choice(n_matches, size=sample_size, replace=False)
-        sample_matches = matches.iloc[sample_indices].reset_index(drop=True)
-        try:
-            candidate_transform = estimate_rigid_transform_from_matches(feats1, feats2, sample_matches)
-        except Exception:
-            continue
-
-        residuals = compute_match_residuals(feats1, feats2, matches, candidate_transform)
-        inliers = residuals <= residual_threshold
-        count = int(inliers.sum())
-        if count > best_inlier_count:
-            best_transform = candidate_transform
-            best_inliers = inliers
-            best_inlier_count = count
-            best_residual_sum = float(residuals[inliers].sum()) if count > 0 else np.inf
-        elif count == best_inlier_count and count > 0:
-            residual_sum = float(residuals[inliers].sum())
-            if residual_sum < best_residual_sum:
-                best_transform = candidate_transform
-                best_inliers = inliers
-                best_residual_sum = residual_sum
-
-    if best_transform is not None and best_inlier_count >= min_inliers:
-        refined_matches = matches.loc[best_inliers].reset_index(drop=True)
-        best_transform = estimate_rigid_transform_from_matches(feats1, feats2, refined_matches)
-        return best_transform, best_inliers
-
-    transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
-    inlier_mask = np.ones(n_matches, dtype=bool)
-    return transform, inlier_mask
-
-
 def run_pipeline(
     img1_path: Path = DEFAULT_IMG1_PATH,
     img2_path: Path = DEFAULT_IMG2_PATH,
@@ -574,10 +518,53 @@ def run_pipeline(
     use_ransac_transform: bool = False,
     ransac_max_trials: int = 1000,
     ransac_residual_threshold: float = 2.0,
+    save_npy: bool = False,
 ) -> None:
     segmenter = CellposeSegmenter(DEFAULT_CELLPOSE_CONFIG)
 
+    # Detect single-image mode (when same path is provided for both images)
+    single_image_mode = (img1_path == img2_path) and segmentation_only
+    
     img1 = load_image(img1_path)
+    
+    if single_image_mode:
+        # Only process one image in single-image segmentation mode
+        mode1 = infer_image_mode(img1)
+        use_zstack = mode1 == "3d_zstack"
+        
+        if use_zstack:
+            _masks1_3d, masks1, _, _ = segmenter.segment_zstack(img1)
+            overlay_img1 = project_intensity_max(img1)
+        else:
+            masks1, _, _ = segmenter.segment_array(img1)
+            overlay_img1 = img1
+        
+        # Save and/or display the single segmentation
+        if save_segmentation_prefix is not None:
+            import imageio.v3 as iio
+            
+            out1 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + ".tif")
+            iio.imwrite(out1, masks1.astype(np.uint16))
+            print(f"Saved segmentation mask to {out1}")
+
+            if save_npy:
+                npy_out = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + ".npy")
+                np.save(npy_out, masks1)
+                print(f"Saved segmentation npy to {npy_out}")
+        
+        if napari_view:
+            try:
+                import napari  # type: ignore
+                from .visualization import launch_napari_viewer
+            except ImportError:
+                print("napari not installed; skipping interactive viewer.")
+            else:
+                viewer = launch_napari_viewer(overlay_img1, masks1, title=f"{img1_path.name} segmentation")
+                viewer.window._qt_window.raise_()
+                napari.run()
+        return
+    
+    # Two-image mode (original behavior)
     img2 = load_image(img2_path)
 
     mode1 = infer_image_mode(img1)
@@ -600,13 +587,20 @@ def run_pipeline(
 
     if segmentation_only:
         if save_segmentation_prefix is not None:
-            from .visualization import save_segmentation_plot
+            import imageio.v3 as iio
 
             out1 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img1.tif")
             out2 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img2.tif")
-            save_segmentation_plot(overlay_img1, masks1, out1, title="Segmentation image1")
-            save_segmentation_plot(overlay_img2, masks2, out2, title="Segmentation image2")
-            print(f"Saved segmentation plots to {out1} and {out2}")
+            iio.imwrite(out1, masks1.astype(np.uint16))
+            iio.imwrite(out2, masks2.astype(np.uint16))
+            print(f"Saved segmentation masks to {out1} and {out2}")
+
+            if save_npy:
+                npy_out1 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img1.npy")
+                npy_out2 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img2.npy")
+                np.save(npy_out1, masks1)
+                np.save(npy_out2, masks2)
+                print(f"Saved segmentation npy to {npy_out1} and {npy_out2}")
 
         if napari_view:
             try:
@@ -769,7 +763,7 @@ def run_pipeline(
         residuals = compute_match_residuals(feats1, feats2, matches, transform)
         matches["residual_px"] = residuals
     else:
-        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches, use_scale=True)
         residuals = compute_match_residuals(feats1, feats2, matches, transform)
         matches["residual_px"] = residuals
 
@@ -784,7 +778,7 @@ def run_pipeline(
         kept = int(keep_mask.sum())
         if kept >= MIN_MATCHES_FOR_REFINEMENT and kept < len(matches):
             matches = matches.loc[keep_mask].reset_index(drop=True)
-            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches, use_scale=True)
             refined_residuals = compute_match_residuals(feats1, feats2, matches, transform)
             matches["residual_px"] = refined_residuals
             print(
@@ -883,18 +877,10 @@ def run_pipeline(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cell registration demo using Cellpose-SAM.")
     parser.add_argument(
-        "image1",
+        "images",
         type=Path,
-        nargs="?",
-        default=DEFAULT_IMG1_PATH,
-        help="Path to first image (target).",
-    )
-    parser.add_argument(
-        "image2",
-        type=Path,
-        nargs="?",
-        default=DEFAULT_IMG2_PATH,
-        help="Path to second image (source).",
+        nargs="+",
+        help="Path to image(s). For registration, provide exactly 2 images. For --segmentation-only, provide any number of images.",
     )
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Number of matches to use.")
     parser.add_argument(
@@ -1004,38 +990,94 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SAVE_FEATURES_DIR,
         help="Directory to save per-cell feature tables (round1_cells.csv, round2_cells.csv).",
     )
+    parser.add_argument(
+        "--save-npy",
+        action="store_true",
+        help="Save segmentation masks as .npy files.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    run_pipeline(
-        args.image1,
-        args.image2,
-        top_k=args.top_k,
-        top_k_per_patch=args.top_per_patch,
-        position_weight=args.position_weight,
-        napari_view=args.napari,
-        segmentation_only=args.segmentation_only,
-        save_match_table=args.save_match_table,
-        save_match_overlay_path=args.save_match_overlay,
-        save_segmentation_prefix=args.save_segmentation_prefix,
-        save_match_plot_path=args.save_match_plot,
-        save_registration_overlay_path=args.save_registration_overlay,
-        save_features_dir=args.save_features_dir,
-        use_spatial_clusters=args.use_spatial_clusters,
-        n_clusters=args.n_clusters,
-        use_topology_filtering=args.use_topology_filtering,
-        k_pos_nei=args.k_pos_nei,
-        k_neighbor=args.k_neighbor,
-        tau_pos=args.tau_pos,
-        tau_nei=args.tau_nei,
-        tau_map=args.tau_map,
-        use_ransac_transform=args.use_ransac_transform,
-        ransac_max_trials=args.ransac_max_trials,
-        ransac_residual_threshold=args.ransac_residual_threshold,
-    )
+    
+    # Handle batch segmentation mode
+    if args.segmentation_only:
+        if len(args.images) == 1:
+            # Single image segmentation
+            print(f"Processing single image: {args.images[0]}")
+            run_pipeline(
+                args.images[0],
+                args.images[0],  # Dummy second image, won't be used in segmentation_only mode
+                napari_view=args.napari,
+                segmentation_only=True,
+                save_segmentation_prefix=args.save_segmentation_prefix,
+                save_npy=args.save_npy,
+            )
+        else:
+            # Batch segmentation for multiple images
+            print(f"Processing {len(args.images)} images in batch mode...")
+            for i, img_path in enumerate(args.images, 1):
+                print(f"\n[{i}/{len(args.images)}] Processing: {img_path}")
+                # Create unique output prefix for each image
+                if args.save_segmentation_prefix:
+                    prefix = args.save_segmentation_prefix.with_name(
+                        f"{args.save_segmentation_prefix.stem}_image{i}"
+                    )
+                else:
+                    prefix = None
+                
+                run_pipeline(
+                    img_path,
+                    img_path,  # Dummy second image
+                    napari_view=False,  # Disable napari in batch mode
+                    segmentation_only=True,
+                    save_segmentation_prefix=prefix,
+                    save_npy=args.save_npy,
+                )
+            
+            # Optionally open napari after all processing if requested
+            if args.napari:
+                print("\nBatch processing complete. Napari viewing not supported for batch mode.")
+                print("Please view individual segmentation outputs in the outputs directory.")
+    else:
+        # Registration mode requires exactly 2 images
+        if len(args.images) != 2:
+            print(f"Error: Registration mode requires exactly 2 images, but {len(args.images)} were provided.")
+            print("For batch segmentation of multiple images, use --segmentation-only flag.")
+            sys.exit(1)
+        
+        run_pipeline(
+            args.images[0],
+            args.images[1],
+            top_k=args.top_k,
+            top_k_per_patch=args.top_per_patch,
+            position_weight=args.position_weight,
+            napari_view=args.napari,
+            segmentation_only=args.segmentation_only,
+            save_match_table=args.save_match_table,
+            save_match_overlay_path=args.save_match_overlay,
+            save_segmentation_prefix=args.save_segmentation_prefix,
+            save_match_plot_path=args.save_match_plot,
+            save_registration_overlay_path=args.save_registration_overlay,
+            save_features_dir=args.save_features_dir,
+            use_spatial_clusters=args.use_spatial_clusters,
+            n_clusters=args.n_clusters,
+            use_topology_filtering=args.use_topology_filtering,
+            k_pos_nei=args.k_pos_nei,
+            k_neighbor=args.k_neighbor,
+            tau_pos=args.tau_pos,
+            tau_nei=args.tau_nei,
+            tau_map=args.tau_map,
+            use_ransac_transform=args.use_ransac_transform,
+            ransac_max_trials=args.ransac_max_trials,
+            ransac_residual_threshold=args.ransac_residual_threshold,
+            save_npy=args.save_npy,
+        )
 
 
 if __name__ == "__main__":
     main()
+
+
+

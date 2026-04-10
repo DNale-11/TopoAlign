@@ -1,0 +1,21 @@
+{
+  "selected_config_name": "baseline_similarity",
+  "selected_config_args": {
+    "prefer_affine": false
+  },
+  "stage1_summary_path": "F:\\programme\\nxy\\Cell registration\\benchmark\\results_tune\\auto_pipeline_full\\stage1_summary.csv",
+  "stage2_summary_path": "F:\\programme\\nxy\\Cell registration\\benchmark\\results_tune\\auto_pipeline_full\\stage2_summary.csv",
+  "final_output_dir": "F:\\programme\\nxy\\Cell registration\\benchmark\\results_tune\\auto_pipeline_full\\final\\baseline_similarity",
+  "final_log_path": "F:\\programme\\nxy\\Cell registration\\benchmark\\results_tune\\auto_pipeline_full\\final\\baseline_similarity\\tune.log",
+  "final_returncode": 0,
+  "final_summary": {
+    "n_pairs": 12,
+    "mean_psnr": 27.904565993680823,
+    "mean_ssim": 0.7317342527979821,
+    "mean_ncc": 0.8169057247866099,
+    "mean_mi": 0.7088518873216888,
+    "min_ssim": 0.582094494196112,
+    "min_ncc": 0.3481628281083979,
+    "score": 2.765705723165037
+  }
+}

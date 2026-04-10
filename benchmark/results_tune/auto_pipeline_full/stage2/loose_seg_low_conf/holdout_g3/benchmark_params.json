@@ -1,0 +1,42 @@
+{
+  "sample_groups": [
+    3
+  ],
+  "rounds": [
+    "A",
+    "C",
+    "D",
+    "E"
+  ],
+  "reg_params": {
+    "cellpose_diameter": 8.0,
+    "cellpose_flow_threshold": -1.0,
+    "cellpose_cellprob_threshold": -1.0,
+    "cellpose_min_size": 8,
+    "position_weight": 3.5,
+    "distance_threshold": 2.2,
+    "spatial_window_size": 90.0,
+    "top_k": 80,
+    "min_cells_for_two_stage": 20,
+    "coarse_top_k": 50,
+    "coarse_distance_threshold": 2.0,
+    "neighbor_k": 5,
+    "neighbor_weight": 1.0,
+    "landmark_weight": 10.0,
+    "max_theta_deg": 10.0,
+    "max_translation": 30.0,
+    "max_scale_change": 0.05,
+    "guided_min_position_weight": 4.0,
+    "guided_spatial_window_cap": 60.0,
+    "validation_min_confidence": 0.15,
+    "validation_max_feature_diff": 0.8,
+    "prefer_affine": false,
+    "ransac_max_trials": 500,
+    "ransac_residual_threshold": 4.0,
+    "similarity_residual_threshold": 5.0,
+    "fft_upsample_factor": 20,
+    "fft_max_shift": 20.0,
+    "fft_crop_ratio": 0.8,
+    "fft_max_iterations": 2
+  }
+}

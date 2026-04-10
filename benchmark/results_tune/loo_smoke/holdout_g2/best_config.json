@@ -1,0 +1,33 @@
+{
+  "holdout_group": 2,
+  "train_groups": [
+    1,
+    3
+  ],
+  "rounds": [
+    "D",
+    "E"
+  ],
+  "best_config_name": "baseline_affine",
+  "best_config_args": {},
+  "train_summary": {
+    "n_pairs": 4,
+    "mean_psnr": 27.66518166801073,
+    "mean_ssim": 0.7890293431515949,
+    "mean_ncc": 0.7574126397525162,
+    "mean_mi": 0.7464758833299302,
+    "min_ssim": 0.7345126393493799,
+    "min_ncc": 0.428650503039951,
+    "score": 2.961362032493369
+  },
+  "holdout_summary": {
+    "n_pairs": 2,
+    "mean_psnr": 27.85901006482876,
+    "mean_ssim": 0.802345950759459,
+    "mean_ncc": 0.8356309046605472,
+    "mean_mi": 0.710071215718582,
+    "min_ssim": 0.8006876876788189,
+    "min_ncc": 0.8100851900071016,
+    "score": 3.4819947113247376
+  }
+}

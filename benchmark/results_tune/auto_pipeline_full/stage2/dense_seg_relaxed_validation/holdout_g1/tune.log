@@ -1,0 +1,157 @@
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used
+======================================================================
+  Cell Registration Benchmark
+======================================================================
+  Output dir: F:\programme\nxy\Cell registration\benchmark\results_tune\auto_pipeline_full\stage2\dense_seg_relaxed_validation\holdout_g1
+  Params saved to: benchmark_params.json
+  REG_PARAMS: {
+  "cellpose_diameter": 8.0,
+  "cellpose_flow_threshold": -2.0,
+  "cellpose_cellprob_threshold": -2.0,
+  "cellpose_min_size": 1,
+  "position_weight": 4.0,
+  "distance_threshold": 2.0,
+  "spatial_window_size": 80.0,
+  "top_k": 80,
+  "min_cells_for_two_stage": 20,
+  "coarse_top_k": 50,
+  "coarse_distance_threshold": 2.0,
+  "neighbor_k": 5,
+  "neighbor_weight": 1.0,
+  "landmark_weight": 10.0,
+  "max_theta_deg": 10.0,
+  "max_translation": 30.0,
+  "max_scale_change": 0.05,
+  "guided_min_position_weight": 4.0,
+  "guided_spatial_window_cap": 60.0,
+  "validation_min_confidence": 0.1,
+  "validation_max_feature_diff": 0.9,
+  "prefer_affine": false,
+  "ransac_max_trials": 500,
+  "ransac_residual_threshold": 4.0,
+  "similarity_residual_threshold": 5.0,
+  "fft_upsample_factor": 20,
+  "fft_max_shift": 20.0,
+  "fft_crop_ratio": 0.8,
+  "fft_max_iterations": 2
+}
+
+[1/5] Discovering image pairs...
+  Found 4 registration pairs
+    Group 1: A→B  |  src: C3-A-63-1 Merged_ch05_dapi_zmax.tif
+    Group 1: C→B  |  src: C3-C-63-1_Merged_ch05_dapi_zmax.tif
+    Group 1: D→B  |  src: C3-D-63-1_Merged_ch05_dapi_zmax.tif
+    Group 1: E→B  |  src: C3-E-63-1_Merged_ch05_dapi_zmax.tif
+
+[2/5] Initializing Cellpose-SAM segmenter (GPU=True)...
+  ✓ Segmenter ready
+
+[3/5] Running registrations...
+
+  [1/4] Group 1 - A→B
+    Source:    C3-A-63-1 Merged_ch05_dapi_zmax.tif
+    Reference: C3-B-63-1_Merged_ch05_dapi_zmax.tif
+    Image shapes: source=(1969, 1945), reference=(1975, 1944)
+    Cells found: source=1396, reference=1745
+    Coarse matches: 50
+    Coarse offset: dx=-25.63, dy=-47.47
+    Fine matches: 80
+    Validated matches: 80
+    RANSAC model: similarity | inliers: 69/80 | median residual: 0.84px
+    RANSAC inliers: 69/80
+    Guided rematch improved support: similarity, 73/80 inliers
+    Refining with k=5 neighbors (KNN)...
+    KNN refinement complete
+    FFT correction: dy=0.15 dx=0.05 (mag=0.16px)
+    FFT refinement applied
+    ⏱ Registration time: 38.11s
+    Metrics: PSNR=27.86 | SSIM=0.6015 | NCC=0.8528
+
+  [2/4] Group 1 - C→B
+    Source:    C3-C-63-1_Merged_ch05_dapi_zmax.tif
+    Reference: C3-B-63-1_Merged_ch05_dapi_zmax.tif
+    Image shapes: source=(1965, 1943), reference=(1975, 1944)
+    Cells found: source=1735, reference=1745
+    Coarse matches: 50
+    Coarse offset: dx=-24.13, dy=-42.15
+    Fine matches: 80
+    Validated matches: 80
+    RANSAC model: similarity | inliers: 42/80 | median residual: 1.12px
+    RANSAC inliers: 42/80
+    Guided rematch improved support: similarity, 55/80 inliers
+    Refining with k=5 neighbors (KNN)...
+    KNN refinement complete
+    FFT correction: dy=-0.40 dx=-0.25 (mag=0.47px)
+    FFT refinement applied
+    ⏱ Registration time: 38.45s
+    Metrics: PSNR=27.72 | SSIM=0.7549 | NCC=0.8605
+
+  [3/4] Group 1 - D→B
+    Source:    C3-D-63-1_Merged_ch05_dapi_zmax.tif
+    Reference: C3-B-63-1_Merged_ch05_dapi_zmax.tif
+    Image shapes: source=(1970, 1944), reference=(1975, 1944)
+    Cells found: source=1362, reference=1745
+    Coarse matches: 50
+    Coarse offset: dx=-2.28, dy=-19.82
+    Fine matches: 80
+    Validated matches: 80
+    RANSAC model: similarity | inliers: 8/80 | median residual: 2.59px
+    RANSAC inliers: 8/80
+    Guided rematch improved support: similarity, 16/80 inliers
+    Refining with k=5 neighbors (KNN)...
+    KNN refinement complete
+    FFT correction: dy=-0.80 dx=-0.65 (mag=1.03px)
+    FFT refinement applied
+    ⏱ Registration time: 37.36s
+    Metrics: PSNR=24.77 | SSIM=0.7283 | NCC=0.4067
+
+  [4/4] Group 1 - E→B
+    Source:    C3-E-63-1_Merged_ch05_dapi_zmax.tif
+    Reference: C3-B-63-1_Merged_ch05_dapi_zmax.tif
+    Image shapes: source=(1969, 1946), reference=(1975, 1944)
+    Cells found: source=1491, reference=1745
+    Coarse matches: 50
+    Coarse offset: dx=29.57, dy=10.08
+    Fine matches: 80
+    Validated matches: 80
+    RANSAC model: similarity | inliers: 5/80 | median residual: 3.08px
+    RANSAC inliers: 5/80
+    Guided rematch improved support: similarity, 5/80 inliers
+    Refining with k=5 neighbors (KNN)...
+    KNN refinement complete
+    ⏱ Registration time: 37.63s
+    Metrics: PSNR=21.56 | SSIM=0.5628 | NCC=0.0416
+
+[4/5] Generating visualizations and reports...
+  ✓ Saved results CSV: benchmark_results.csv
+  ✓ Saved metrics bar chart: metrics_bar_chart.png
+  ✓ Saved heatmap: metrics_heatmap.png
+  ✓ Saved timing chart: timing_chart.png
+  ✓ Saved group comparison: group_comparison.png
+
+  Generating difference maps...
+
+[5/5] Summary
+======================================================================
+Pair            PSNR       SSIM       NCC        MI         Time(s)   
+----------------------------------------------------------------------
+G1-A→B          27.86      0.6015     0.8528     0.6346     38.11     
+G1-C→B          27.72      0.7549     0.8605     0.9154     38.45     
+G1-D→B          24.77      0.7283     0.4067     0.3341     37.36     
+G1-E→B          21.56      0.5628     0.0416     0.0150     37.63     
+----------------------------------------------------------------------
+Average         25.48      0.6619     0.5404     0.4748     37.89     
+======================================================================
+
+All outputs saved to: F:\programme\nxy\Cell registration\benchmark\results_tune\auto_pipeline_full\stage2\dense_seg_relaxed_validation\holdout_g1
+Done!
+COMMAND:
+C:\Users\Administrator\anaconda3\envs\cell_registration\python.exe F:\programme\nxy\Cell registration\benchmark\run_benchmark.py --output-dir F:\programme\nxy\Cell registration\benchmark\results_tune\auto_pipeline_full\stage2\dense_seg_relaxed_validation\holdout_g1 --sample-groups 1 --rounds A,C,D,E --cellpose-diameter 8.0 --cellpose-flow-threshold -2.0 --cellpose-cellprob-threshold -2.0 --cellpose-min-size 1 --position-weight 4.0 --distance-threshold 2.0 --spatial-window-size 80.0 --top-k 80 --validation-min-confidence 0.1 --validation-max-feature-diff 0.9 --no-prefer-affine --ransac-residual-threshold 4.0
+

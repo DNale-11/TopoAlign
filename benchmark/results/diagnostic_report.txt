@@ -1,0 +1,111 @@
+================================================================================
+  DIAGNOSTIC: Why are metrics poor?
+================================================================================
+
+--- G1-A->B ---
+  Ours: min=0 max=87 mean=4.5 std=5.9
+  GT:   min=0 max=77 mean=4.9 std=6.0
+  Raw:          PSNR=28.81  SSIM=0.6408  NCC=0.8623
+  Normalized:   PSNR=27.70  SSIM=0.6070  NCC=0.8623
+  Hist-matched: PSNR=27.82  SSIM=0.6000  NCC=0.8617
+  Non-zero:     Ours=87.6%  GT=91.9%
+  Residual shift: dy=0 dx=-1
+
+--- G1-C->B ---
+  Ours: min=0 max=64 mean=4.1 std=4.9
+  GT:   min=0 max=65 mean=4.3 std=5.1
+  Raw:          PSNR=28.00  SSIM=0.7697  NCC=0.8665
+  Normalized:   PSNR=27.96  SSIM=0.7689  NCC=0.8665
+  Hist-matched: PSNR=27.92  SSIM=0.7321  NCC=0.8655
+  Non-zero:     Ours=95.4%  GT=95.4%
+  Residual shift: dy=1 dx=0
+
+--- G1-D->B ---
+  Ours: min=0 max=70 mean=3.2 std=4.0
+  GT:   min=0 max=77 mean=3.3 std=4.1
+  Raw:          PSNR=24.38  SSIM=0.7217  NCC=0.3350
+  Normalized:   PSNR=23.95  SSIM=0.7131  NCC=0.3350
+  Hist-matched: PSNR=24.38  SSIM=0.7112  NCC=0.3353
+  Non-zero:     Ours=96.9%  GT=96.0%
+  Residual shift: dy=-8 dx=-4
+
+--- G1-E->B ---
+  Ours: min=0 max=75 mean=4.9 std=5.5
+  GT:   min=0 max=93 mean=5.1 std=5.7
+  Raw:          PSNR=28.49  SSIM=0.8007  NCC=0.8049
+  Normalized:   PSNR=26.94  SSIM=0.7724  NCC=0.8049
+  Hist-matched: PSNR=28.40  SSIM=0.7581  NCC=0.8016
+  Non-zero:     Ours=94.6%  GT=94.8%
+  Residual shift: dy=0 dx=-1
+
+--- G2-A->B ---
+  Ours: min=0 max=80 mean=4.2 std=5.9
+  GT:   min=0 max=81 mean=4.7 std=5.9
+  Raw:          PSNR=28.18  SSIM=0.5885  NCC=0.8583
+  Normalized:   PSNR=28.15  SSIM=0.5876  NCC=0.8583
+  Hist-matched: PSNR=28.23  SSIM=0.5899  NCC=0.8569
+  Non-zero:     Ours=88.5%  GT=93.6%
+  Residual shift: dy=0 dx=-1
+
+--- G2-C->B ---
+  Ours: min=0 max=68 mean=5.4 std=5.8
+  GT:   min=0 max=71 mean=5.6 std=5.9
+  Raw:          PSNR=26.73  SSIM=0.7294  NCC=0.8442
+  Normalized:   PSNR=26.57  SSIM=0.7258  NCC=0.8442
+  Hist-matched: PSNR=26.69  SSIM=0.7135  NCC=0.8431
+  Non-zero:     Ours=97.9%  GT=98.1%
+  Residual shift: dy=0 dx=-2
+
+--- G2-D->B ---
+  Ours: min=0 max=79 mean=3.7 std=5.3
+  GT:   min=0 max=82 mean=3.9 std=5.4
+  Raw:          PSNR=25.43  SSIM=0.7569  NCC=0.6640
+  Normalized:   PSNR=25.28  SSIM=0.7548  NCC=0.6640
+  Hist-matched: PSNR=25.40  SSIM=0.7348  NCC=0.6634
+  Non-zero:     Ours=96.1%  GT=97.5%
+  Residual shift: dy=-2 dx=-4
+
+--- G2-E->B ---
+  Ours: min=0 max=96 mean=5.4 std=6.7
+  GT:   min=0 max=88 mean=5.7 std=6.9
+  Raw:          PSNR=22.65  SSIM=0.7054  NCC=0.4620
+  Normalized:   PSNR=22.19  SSIM=0.6939  NCC=0.4620
+  Hist-matched: PSNR=21.88  SSIM=0.6704  NCC=0.4599
+  Non-zero:     Ours=96.8%  GT=97.0%
+  Residual shift: dy=-10 dx=-5
+
+--- G3-A->B ---
+  Ours: min=0 max=76 mean=4.9 std=6.7
+  GT:   min=0 max=74 mean=5.3 std=6.7
+  Raw:          PSNR=25.99  SSIM=0.5289  NCC=0.8422
+  Normalized:   PSNR=25.82  SSIM=0.5223  NCC=0.8422
+  Hist-matched: PSNR=25.80  SSIM=0.5207  NCC=0.8417
+  Non-zero:     Ours=87.8%  GT=93.2%
+  Residual shift: dy=0 dx=-1
+
+--- G3-C->B ---
+  Ours: min=0 max=76 mean=5.2 std=5.2
+  GT:   min=0 max=77 mean=5.5 std=5.3
+  Raw:          PSNR=29.01  SSIM=0.7500  NCC=0.8669
+  Normalized:   PSNR=28.97  SSIM=0.7491  NCC=0.8669
+  Hist-matched: PSNR=28.98  SSIM=0.7454  NCC=0.8670
+  Non-zero:     Ours=97.8%  GT=97.8%
+  Residual shift: dy=-1 dx=-1
+
+--- G3-D->B ---
+  Ours: min=0 max=98 mean=6.5 std=8.5
+  GT:   min=0 max=95 mean=6.7 std=8.6
+  Raw:          PSNR=19.98  SSIM=0.6522  NCC=0.3396
+  Normalized:   PSNR=19.83  SSIM=0.6493  NCC=0.3396
+  Hist-matched: PSNR=19.69  SSIM=0.6424  NCC=0.3400
+  Non-zero:     Ours=97.2%  GT=97.2%
+  Residual shift: dy=-4 dx=-18
+
+--- G3-E->B ---
+  Ours: min=0 max=83 mean=6.1 std=7.4
+  GT:   min=0 max=91 mean=6.4 std=7.5
+  Raw:          PSNR=29.18  SSIM=0.8102  NCC=0.9099
+  Normalized:   PSNR=28.63  SSIM=0.8024  NCC=0.9099
+  Hist-matched: PSNR=29.12  SSIM=0.7962  NCC=0.9092
+  Non-zero:     Ours=98.4%  GT=98.5%
+  Residual shift: dy=-1 dx=0
