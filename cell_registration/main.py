@@ -11,7 +11,6 @@ from .config import DEFAULT_CELLPOSE_CONFIG, DEFAULT_FEATURE_CONFIG
 from .features import compute_cell_features
 from .matching import (
     MatchingConfig,
-    greedy_match_cells,
     match_cells_per_cluster,
     two_stage_match_cells,
 )
@@ -40,7 +39,7 @@ DEFAULT_SAVE_SEGMENTATION_PREFIX = Path("outputs/segmentation")
 DEFAULT_SAVE_MATCH_PLOT = Path("outputs/match_plot")
 DEFAULT_SAVE_REGISTRATION_OVERLAY = Path("outputs/registration_overlay")
 DEFAULT_SAVE_FEATURES_DIR = Path("outputs")
-DEFAULT_RESIDUAL_PRUNE_QUANTILE = 0.9
+DEFAULT_RESIDUAL_PRUNE_QUANTILE = None
 MIN_MATCHES_FOR_REFINEMENT = 3
 
 PATCH_GRID = 3  # 3x3 patches across the image
@@ -778,7 +777,7 @@ def run_pipeline(
         spatial_window_size=spatial_window_size,
         coarse_top_k=max(24, top_k),
         coarse_distance_threshold=2.0,
-        coarse_matching_mode="global",
+        coarse_matching_mode="morphology_guided",
         coarse_allow_scale=False,
         coarse_prefer_affine=False,
         coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
@@ -837,24 +836,23 @@ def run_pipeline(
         feats2_to_save.to_csv(out2, index=False)
         print(f"Saved feature tables to {out1} and {out2}")
 
-    match_cfg = MatchingConfig(
-        feature_weight=feature_weight,
-        topology_weight=topology_weight,
-        position_weight=position_weight,
-        top_k=top_k,
-        distance_threshold=distance_threshold,
-        spatial_window_size=spatial_window_size,
-    )
+    matches = two_stage.matches.copy()
 
     if use_spatial_clusters:
+        match_cfg = MatchingConfig(
+            feature_weight=feature_weight,
+            topology_weight=topology_weight,
+            position_weight=position_weight,
+            top_k=top_k,
+            distance_threshold=distance_threshold,
+            spatial_window_size=spatial_window_size,
+        )
         matches = match_cells_per_cluster(
             feats1_work,
             feats2_work,
             match_cfg,
             cluster_col="cluster_id",
         )
-    else:
-        matches = greedy_match_cells(feats1_work, feats2_work, match_cfg)
 
     if use_topology_filtering:
         # Topology filtering requires patch assignments internally

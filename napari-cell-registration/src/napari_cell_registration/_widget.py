@@ -15,21 +15,16 @@ from .core import (
     CellFeaturesConfig,
     CellposeConfig,
     CellposeSegmenter,
-    MatchingConfig,
-    MAIN_MATCHING_FEATURE_COLUMNS,
     MIN_MATCHES_FOR_REFINEMENT,
     apply_rigid_to_points,
-    apply_transform_to_coordinates,
     assign_patches,
     cast_warped_like_original,
     compute_cell_features,
     compute_match_residuals,
     estimate_rigid_transform_from_matches,
     estimate_rigid_transform_from_matches_ransac,
-    greedy_match_cells,
-    perform_global_registration,
     rigid_transform_to_affine,
-    run_topology_matching_df,
+    two_stage_match_cells,
 )
 from .core.point_registration import warp_image_with_transform
 
@@ -126,13 +121,7 @@ def registration_workflow_widget(
     top_k: int = 50,
     max_match_distance_px: int = 100,
     position_weight: float = 1.0,
-    use_topology_filtering: bool = False,
-    k_pos_nei: int = 5,
-    k_neighbor: int = 5,
-    tau_pos: Annotated[float, {"min": 0.0, "max": 2.0, "step": 0.05}] = 0.5,
-    tau_nei: Annotated[float, {"min": 0.0, "max": 2.0, "step": 0.05}] = 0.3,
-    tau_map: Annotated[float, {"min": 0.0, "max": 2.0, "step": 0.05}] = 0.3,
-    residual_prune_quantile: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.05}] = 0.9,
+    residual_prune_quantile: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.05}] = 0.0,
     use_ransac_transform: bool = False,
     ransac_max_trials: int = 1000,
     ransac_residual_threshold: float = 2.0,
@@ -173,127 +162,6 @@ def registration_workflow_widget(
             f"mean={pixel_distances.mean():.1f}px"
         )
 
-    def _rebuild_matches_from_topology_pairs(
-        base_matches: pd.DataFrame,
-        fixed_feats: pd.DataFrame,
-        moving_feats: pd.DataFrame,
-    ) -> pd.DataFrame:
-        def _enforce_one_to_one(candidate_pairs: pd.DataFrame) -> pd.DataFrame:
-            if candidate_pairs.empty:
-                return candidate_pairs.copy()
-
-            ordered = candidate_pairs.copy()
-            ordered["pair_stage"] = ordered["pair_stage"].fillna(1).astype(int)
-            ordered["pair_score"] = pd.to_numeric(
-                ordered["pair_score"],
-                errors="coerce",
-            ).fillna(np.inf)
-            ordered = ordered.drop_duplicates(subset=["cell_id_r1", "cell_id_r2"])
-            ordered = ordered.sort_values(
-                by=["pair_stage", "pair_score", "cell_id_r1", "cell_id_r2"],
-                ascending=[True, True, True, True],
-            )
-
-            used_r1: set = set()
-            used_r2: set = set()
-            kept_rows: list[pd.Series] = []
-            for _, row in ordered.iterrows():
-                if row["cell_id_r1"] in used_r1 or row["cell_id_r2"] in used_r2:
-                    continue
-                kept_rows.append(row)
-                used_r1.add(row["cell_id_r1"])
-                used_r2.add(row["cell_id_r2"])
-
-            if not kept_rows:
-                return ordered.iloc[0:0].copy()
-            return pd.DataFrame(kept_rows).reset_index(drop=True)
-
-        if base_matches.empty:
-            return pd.DataFrame(columns=["idx1", "idx2", "cell_id_1", "cell_id_2"])
-
-        candidate_matches = pd.DataFrame(
-            {
-                "cell_id_r1": fixed_feats.loc[base_matches["idx1"], "cell_id"].to_numpy(),
-                "cell_id_r2": moving_feats.loc[base_matches["idx2"], "cell_id"].to_numpy(),
-            }
-        )
-        trusted_pairs, neighbor_matches = run_topology_matching_df(
-            fixed_feats,
-            moving_feats,
-            candidate_matches,
-            image_width=mask1.shape[1],
-            image_height=mask1.shape[0],
-            k_pos_nei=k_pos_nei,
-            k_neighbor=k_neighbor,
-            tau_pos=tau_pos,
-            tau_nei=tau_nei,
-            tau_map=tau_map,
-        )
-
-        combined_pairs = trusted_pairs.copy()
-        if not combined_pairs.empty:
-            combined_pairs["pair_stage"] = 0
-            combined_pairs["pair_score"] = (
-                pd.to_numeric(combined_pairs.get("L_pos"), errors="coerce").fillna(np.inf)
-                + pd.to_numeric(combined_pairs.get("L_nei"), errors="coerce").fillna(np.inf)
-            )
-        neighbor_filtered = neighbor_matches
-        if not neighbor_matches.empty and "within_threshold" in neighbor_matches.columns:
-            neighbor_filtered = neighbor_matches[neighbor_matches["within_threshold"] == True]
-        if not neighbor_filtered.empty:
-            neighbor_filtered = neighbor_filtered.copy()
-            neighbor_filtered["pair_stage"] = 1
-            neighbor_filtered["pair_score"] = pd.to_numeric(
-                neighbor_filtered.get("dist_norm"),
-                errors="coerce",
-            ).fillna(np.inf)
-            combined_pairs = pd.concat([combined_pairs, neighbor_filtered], ignore_index=True)
-
-        if combined_pairs.empty:
-            show_info("  Topology filtering removed all candidate matches.")
-            return pd.DataFrame(columns=["idx1", "idx2", "cell_id_1", "cell_id_2"])
-
-        combined_pairs = _enforce_one_to_one(combined_pairs)
-        id_to_idx1 = {fixed_feats.loc[idx, "cell_id"]: idx for idx in fixed_feats.index}
-        id_to_idx2 = {moving_feats.loc[idx, "cell_id"]: idx for idx in moving_feats.index}
-        base_lookup = {}
-        for _, base_row in base_matches.iterrows():
-            key = (
-                fixed_feats.loc[base_row["idx1"], "cell_id"],
-                moving_feats.loc[base_row["idx2"], "cell_id"],
-            )
-            base_lookup[key] = base_row
-
-        rows: list[dict] = []
-        for _, pair in combined_pairs.iterrows():
-            cell_id_1 = pair["cell_id_r1"]
-            cell_id_2 = pair["cell_id_r2"]
-            idx1 = id_to_idx1.get(cell_id_1)
-            idx2 = id_to_idx2.get(cell_id_2)
-            if idx1 is None or idx2 is None:
-                continue
-            row = {
-                "idx1": idx1,
-                "idx2": idx2,
-                "cell_id_1": cell_id_1,
-                "cell_id_2": cell_id_2,
-            }
-            base_row = base_lookup.get((cell_id_1, cell_id_2))
-            if base_row is not None:
-                for extra in ("distance",):
-                    if extra in base_row and not pd.isna(base_row[extra]):
-                        row[extra] = base_row[extra]
-            for extra in ("L_pos", "L_nei", "dist_norm", "within_threshold", "patch_x", "patch_y"):
-                if extra in pair and not pd.isna(pair[extra]):
-                    row[extra] = pair[extra]
-            rows.append(row)
-
-        show_info(
-            "  Topology filtering: "
-            f"{len(trusted_pairs)} trusted anchors, {len(neighbor_filtered)} propagated neighbors"
-        )
-        return pd.DataFrame(rows).reset_index(drop=True)
-
     show_info("=== Starting Cell Registration Workflow ===")
 
     if save_results:
@@ -310,7 +178,7 @@ def registration_workflow_widget(
     feat_config = CellFeaturesConfig(
         min_area=min_area if min_area > 0 else None,
         max_area=max_area if max_area > 0 else None,
-        topology_neighbor_k=max(3, int(k_pos_nei)),
+        topology_neighbor_k=3,
     )
     feats1 = compute_cell_features(mask1, feat_config)
     n_cells1 = len(feats1)
@@ -333,53 +201,46 @@ def registration_workflow_widget(
         show_info("No cells available after feature extraction.")
         return
 
-    show_info("[3/5] Running global alignment and matching...")
-    global_transform = perform_global_registration(feats1, feats2, feature_columns=MAIN_MATCHING_FEATURE_COLUMNS)
-    if global_transform is not None:
-        translation = getattr(global_transform, "translation", np.array([np.nan, np.nan]))
-        if not np.all(np.isfinite(translation)):
-            global_transform = None
-
-    # Sanity check: reject if translation is unreasonably large
-    if global_transform is not None:
-        trans_mag = float(np.linalg.norm(global_transform.translation))
-        if trans_mag > 500.0:
-            show_info(
-                f"  Global alignment REJECTED: translation={trans_mag:.1f}px "
-                f"(exceeds 500px sanity limit)"
-            )
-            global_transform = None
-
-    if global_transform is not None:
-        tx, ty = global_transform.translation
-        show_info(
-            "  Global alignment: "
-            f"translation=({float(tx):.1f}, {float(ty):.1f}) px"
-        )
-        feats2_aligned = apply_transform_to_coordinates(feats2, global_transform)
-        feats2_aligned["pos_x_norm"] = feats2_aligned["centroid_x"] / float(max(mask1.shape[1], 1))
-        feats2_aligned["pos_y_norm"] = feats2_aligned["centroid_y"] / float(max(mask1.shape[0], 1))
-    else:
-        show_info("  Global alignment unavailable; matching will use raw coordinates.")
-        feats2_aligned = feats2.copy()
-
-    feats1_work = feats1.copy()
-    feats2_work = feats2_aligned.copy()
-
+    show_info("[3/5] Running morphology-guided matching...")
     max_dist = max(1, int(max_match_distance_px))
-    show_info(f"  Matching mode: global greedy matching (max distance={max_dist}px)")
-
-    match_config = MatchingConfig(
-        feature_columns=MAIN_MATCHING_FEATURE_COLUMNS,
+    match_result = two_stage_match_cells(
+        feats1,
+        feats2,
+        mask1.shape,
         feature_weight=1.0,
         topology_weight=0.0,
         position_weight=position_weight,
         top_k=max(1, int(top_k)),
         distance_threshold=None,
         spatial_window_size=float(max_dist),
+        min_cells_for_two_stage=10,
+        coarse_top_k=max(24, int(top_k)),
+        coarse_distance_threshold=2.0,
+        coarse_matching_mode="morphology_guided",
+        coarse_allow_scale=False,
+        coarse_prefer_affine=False,
+        coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
+        coarse_max_trials=min(max(int(ransac_max_trials), 200), 2000),
     )
+    matches = match_result.matches.copy()
 
-    matches = greedy_match_cells(feats1_work, feats2_work, match_config)
+    if len(match_result.coarse_matches) >= 3:
+        tx, ty = match_result.coarse_offset_xy
+        if match_result.coarse_transform_accepted:
+            show_info(
+                "  Coarse translation accepted: "
+                f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
+                f"median residual={match_result.coarse_median_inlier_residual:.2f}px, "
+                f"shift=({float(tx):.1f}, {float(ty):.1f}) px"
+            )
+        else:
+            show_info(
+                "  Coarse translation rejected: "
+                f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
+                f"median residual={match_result.coarse_median_inlier_residual:.2f}px"
+            )
+    else:
+        show_info("  Coarse translation skipped; insufficient confident candidates.")
 
     if not matches.empty and "distance" in matches.columns:
         show_info(
@@ -388,9 +249,6 @@ def registration_workflow_widget(
             f"max={matches['distance'].max():.2f}, "
             f"mean={matches['distance'].mean():.2f}"
         )
-
-    if use_topology_filtering:
-        matches = _rebuild_matches_from_topology_pairs(matches, feats1_work, feats2_work)
 
     if matches.empty:
         show_info("No matches available after matching; registration aborted.")

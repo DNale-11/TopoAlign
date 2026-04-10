@@ -7,10 +7,12 @@ from typing import Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
 from sklearn.preprocessing import StandardScaler
+from skimage.measure import ransac
 from skimage.transform import AffineTransform
 
-from .point_registration import estimate_robust_transform
+from .robust_alignment import TranslationTransform
 
 
 @dataclass
@@ -107,6 +109,85 @@ def _all_feature_columns(config: MatchingConfig) -> tuple[str, ...]:
     return tuple(dict.fromkeys(shape_cols + topology_cols))
 
 
+def _append_match_report_columns(
+    match_df: pd.DataFrame,
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    report_cols: Sequence[str],
+) -> pd.DataFrame:
+    if match_df.empty:
+        return match_df
+
+    idx1 = match_df["idx1"].to_numpy(dtype=int)
+    idx2 = match_df["idx2"].to_numpy(dtype=int)
+    out = match_df.copy()
+    out["cell_id_1"] = df1.iloc[idx1]["cell_id"].to_numpy()
+    out["cell_id_2"] = df2.iloc[idx2]["cell_id"].to_numpy()
+
+    for col in report_cols:
+        out[f"{col}_1"] = df1.iloc[idx1][col].to_numpy()
+        out[f"{col}_2"] = df2.iloc[idx2][col].to_numpy()
+
+    return out
+
+
+def _compute_robust_feature_scales(
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    feature_columns: Sequence[str],
+) -> np.ndarray:
+    if len(feature_columns) == 0:
+        return np.zeros(0, dtype=float)
+
+    combined = pd.concat(
+        [df1.loc[:, feature_columns], df2.loc[:, feature_columns]],
+        axis=0,
+        ignore_index=True,
+    )
+    scales: list[float] = []
+    for col in feature_columns:
+        values = combined[col].to_numpy(dtype=float)
+        median = np.nanmedian(values)
+        mad = np.nanmedian(np.abs(values - median))
+        scale = max(1.4826 * mad, 1e-3)
+        scales.append(float(scale))
+    return np.asarray(scales, dtype=float)
+
+
+def _resolve_guided_spatial_window(
+    spatial_window_size: float | None,
+    guided_spatial_window_size: float | None,
+    residual_threshold: float,
+) -> float:
+    if guided_spatial_window_size is not None and guided_spatial_window_size > 0:
+        return float(guided_spatial_window_size)
+    if spatial_window_size is not None and spatial_window_size > 0:
+        return float(spatial_window_size)
+    return max(20.0, float(residual_threshold) * 4.0)
+
+
+def _resolve_candidate_spatial_window(
+    image_shape: Sequence[int],
+    spatial_window_size: float | None,
+    coarse_spatial_window_size: float | None,
+    guided_spatial_window_size: float,
+) -> float:
+    if coarse_spatial_window_size is not None and coarse_spatial_window_size > 0:
+        return float(coarse_spatial_window_size)
+    if spatial_window_size is not None and spatial_window_size > 0:
+        return max(float(spatial_window_size) * 2.0, guided_spatial_window_size * 1.5)
+
+    h, w = image_shape[:2]
+    return max(guided_spatial_window_size * 2.5, 0.15 * float(max(h, w)))
+
+
+def _orientation_difference_deg(angle1: np.ndarray, angle2: np.ndarray) -> np.ndarray:
+    delta = np.abs(np.asarray(angle1, dtype=float) - np.asarray(angle2, dtype=float))
+    delta = np.mod(delta, np.pi)
+    delta = np.minimum(delta, np.pi - delta)
+    return np.rad2deg(delta)
+
+
 def compute_match_distance_matrix(
     df1: pd.DataFrame,
     df2: pd.DataFrame,
@@ -194,6 +275,162 @@ def _resolve_patch_top_k(
     return max(1, int(np.ceil(float(global_top_k) / float(patches))))
 
 
+def _build_local_morphology_candidates(
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    config: MatchingConfig,
+    *,
+    image_shape: Sequence[int],
+    top_k_per_cell: int,
+    spatial_window_size: float,
+    max_candidates: int | None,
+) -> pd.DataFrame:
+    shape_cols = tuple(getattr(config, "feature_columns", ()))
+    report_cols = tuple(
+        col
+        for col in dict.fromkeys(_all_feature_columns(config) + ("orientation",))
+        if col in df1.columns and col in df2.columns
+    )
+    _ensure_columns(df1, tuple(dict.fromkeys(shape_cols + ("centroid_x", "centroid_y"))))
+    _ensure_columns(df2, tuple(dict.fromkeys(shape_cols + ("centroid_x", "centroid_y"))))
+    if len(df1) == 0 or len(df2) == 0:
+        return pd.DataFrame(
+            columns=[
+                "idx1",
+                "idx2",
+                "distance",
+                "spatial_dist_px",
+                "translation_dx",
+                "translation_dy",
+                "cell_id_1",
+                "cell_id_2",
+            ]
+        )
+
+    top_k_per_cell = max(1, int(top_k_per_cell))
+    spatial_window_size = float(spatial_window_size)
+    fixed_coords = df1[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    moving_coords = df2[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    tree = cKDTree(moving_coords)
+
+    fixed_shape = df1.loc[:, shape_cols].to_numpy(dtype=float)
+    moving_shape = df2.loc[:, shape_cols].to_numpy(dtype=float)
+    scales = _compute_robust_feature_scales(df1, df2, shape_cols)
+    if scales.size == 0:
+        scales = np.ones(1, dtype=float)
+
+    rows: list[dict[str, float | int]] = []
+    for idx1, fixed_xy in enumerate(fixed_coords):
+        local_idxs = tree.query_ball_point(fixed_xy, r=spatial_window_size)
+        if not local_idxs:
+            continue
+
+        local_idxs = np.asarray(local_idxs, dtype=int)
+        diffs = fixed_shape[idx1] - moving_shape[local_idxs]
+        residuals = diffs / scales
+        if residuals.ndim == 1:
+            residuals = residuals[:, None]
+        shape_scores = np.sqrt(np.mean(np.square(residuals), axis=1))
+        spatial_dist = np.linalg.norm(moving_coords[local_idxs] - fixed_xy, axis=1)
+        order = np.lexsort((spatial_dist, shape_scores))
+
+        kept = 0
+        for order_idx in order:
+            score = float(shape_scores[order_idx])
+            if config.distance_threshold is not None and score > float(config.distance_threshold):
+                break
+
+            idx2 = int(local_idxs[order_idx])
+            moving_xy = moving_coords[idx2]
+            rows.append(
+                {
+                    "idx1": int(idx1),
+                    "idx2": idx2,
+                    "distance": score,
+                    "spatial_dist_px": float(spatial_dist[order_idx]),
+                    "translation_dx": float(fixed_xy[0] - moving_xy[0]),
+                    "translation_dy": float(fixed_xy[1] - moving_xy[1]),
+                }
+            )
+            kept += 1
+            if kept >= top_k_per_cell:
+                break
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "idx1",
+                "idx2",
+                "distance",
+                "spatial_dist_px",
+                "translation_dx",
+                "translation_dy",
+                "cell_id_1",
+                "cell_id_2",
+            ]
+        )
+
+    match_df = pd.DataFrame(rows).sort_values(
+        ["distance", "spatial_dist_px"], ascending=[True, True]
+    )
+    if max_candidates is not None and max_candidates > 0 and len(match_df) > max_candidates:
+        match_df = match_df.head(int(max_candidates))
+
+    return _append_match_report_columns(match_df.reset_index(drop=True), df1, df2, report_cols)
+
+
+def _filter_candidate_matches_by_hard_constraints(
+    coarse_matches: pd.DataFrame,
+    *,
+    max_area_ratio: float | None,
+    max_aspect_ratio_ratio: float | None,
+    max_orientation_diff_deg: float | None,
+    min_orientation_eccentricity: float,
+) -> pd.DataFrame:
+    if coarse_matches.empty:
+        return coarse_matches
+
+    out = coarse_matches.copy()
+    keep_mask = np.ones(len(out), dtype=bool)
+    eps = 1e-6
+
+    if {"area_1", "area_2"}.issubset(out.columns):
+        area_1 = np.maximum(out["area_1"].to_numpy(dtype=float), eps)
+        area_2 = np.maximum(out["area_2"].to_numpy(dtype=float), eps)
+        area_ratio = np.maximum(area_1, area_2) / np.minimum(area_1, area_2)
+        out["area_ratio"] = area_ratio
+        if max_area_ratio is not None and max_area_ratio > 0:
+            keep_mask &= area_ratio <= float(max_area_ratio)
+
+    if {"aspect_ratio_1", "aspect_ratio_2"}.issubset(out.columns):
+        ar_1 = np.maximum(out["aspect_ratio_1"].to_numpy(dtype=float), eps)
+        ar_2 = np.maximum(out["aspect_ratio_2"].to_numpy(dtype=float), eps)
+        aspect_ratio_ratio = np.maximum(ar_1, ar_2) / np.minimum(ar_1, ar_2)
+        out["aspect_ratio_ratio"] = aspect_ratio_ratio
+        if max_aspect_ratio_ratio is not None and max_aspect_ratio_ratio > 0:
+            keep_mask &= aspect_ratio_ratio <= float(max_aspect_ratio_ratio)
+
+    if {"orientation_1", "orientation_2"}.issubset(out.columns):
+        angle_diff = _orientation_difference_deg(
+            out["orientation_1"].to_numpy(dtype=float),
+            out["orientation_2"].to_numpy(dtype=float),
+        )
+        out["orientation_diff_deg"] = angle_diff
+        if max_orientation_diff_deg is not None and max_orientation_diff_deg > 0:
+            reliable_orientation = np.ones(len(out), dtype=bool)
+            if {"eccentricity_1", "eccentricity_2"}.issubset(out.columns):
+                reliable_orientation = (
+                    np.minimum(
+                        out["eccentricity_1"].to_numpy(dtype=float),
+                        out["eccentricity_2"].to_numpy(dtype=float),
+                    )
+                    >= float(min_orientation_eccentricity)
+                )
+            keep_mask &= (~reliable_orientation) | (angle_diff <= float(max_orientation_diff_deg))
+
+    return out.loc[keep_mask].reset_index(drop=True)
+
+
 def apply_transform_to_features(
     df: pd.DataFrame,
     transform: AffineTransform,
@@ -216,8 +453,8 @@ def estimate_global_offset_from_matches(
         return np.zeros(2, dtype=float)
 
     best = coarse_matches.nsmallest(min(max_pairs, len(coarse_matches)), "distance")
-    pts1 = df1.loc[best["idx1"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-    pts2 = df2.loc[best["idx2"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    pts1 = df1.iloc[best["idx1"].to_numpy(dtype=int)][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    pts2 = df2.iloc[best["idx2"].to_numpy(dtype=int)][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
     offsets = pts1 - pts2
     median = np.median(offsets, axis=0)
 
@@ -244,27 +481,37 @@ def _estimate_coarse_transform_from_matches(
     if len(coarse_matches) < 3:
         return AffineTransform(), np.zeros(2, dtype=float), "identity", 0, float("inf")
 
-    pts_fixed = df1.loc[coarse_matches["idx1"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-    pts_moving = df2.loc[coarse_matches["idx2"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    pts_fixed = df1.iloc[coarse_matches["idx1"].to_numpy(dtype=int)][
+        ["centroid_x", "centroid_y"]
+    ].to_numpy(dtype=float)
+    pts_moving = df2.iloc[coarse_matches["idx2"].to_numpy(dtype=int)][
+        ["centroid_x", "centroid_y"]
+    ].to_numpy(dtype=float)
 
     try:
-        robust = estimate_robust_transform(
-            pts_fixed,
-            pts_moving,
-            allow_scale=allow_scale,
-            prefer_affine=prefer_affine,
+        _ = (allow_scale, prefer_affine, similarity_residual_threshold)
+        min_samples = min(max(len(coarse_matches) // 10, 2), 6)
+        model, inliers = ransac(
+            (pts_moving, pts_fixed),
+            TranslationTransform,
+            min_samples=min_samples,
             residual_threshold=residual_threshold,
-            similarity_residual_threshold=similarity_residual_threshold,
             max_trials=max_trials,
         )
-        transform = robust.transform
-        method = robust.method
-        inlier_count = robust.inlier_count
-        median_inlier_residual = robust.median_inlier_residual
+        if model is None or inliers is None:
+            raise RuntimeError("RANSAC returned no translation model.")
+
+        residuals = model.residuals(pts_moving, pts_fixed)
+        transform = AffineTransform(translation=tuple(np.asarray(model.translation, dtype=float)))
+        method = "translation_ransac"
+        inlier_count = int(np.count_nonzero(inliers))
+        median_inlier_residual = (
+            float(np.median(residuals[inliers])) if inlier_count > 0 else float("inf")
+        )
     except Exception:
         offset_xy = estimate_global_offset_from_matches(df1, df2, coarse_matches)
         transform = AffineTransform(translation=(float(offset_xy[0]), float(offset_xy[1])))
-        method = "translation"
+        method = "translation_median"
         inlier_count = 0
         median_inlier_residual = float("inf")
 
@@ -313,6 +560,12 @@ def two_stage_match_cells(
     coarse_patch_rows: int = 3,
     coarse_patch_cols: int = 3,
     coarse_patch_top_k_per_patch: int | None = None,
+    coarse_candidates_per_cell: int = 5,
+    coarse_spatial_window_size: float | None = None,
+    coarse_max_area_ratio: float | None = 2.5,
+    coarse_max_aspect_ratio_ratio: float | None = 2.0,
+    coarse_max_orientation_diff_deg: float | None = 45.0,
+    coarse_min_orientation_eccentricity: float = 0.35,
     coarse_allow_scale: bool = False,
     coarse_prefer_affine: bool = False,
     coarse_residual_threshold: float = 5.0,
@@ -321,6 +574,7 @@ def two_stage_match_cells(
     coarse_min_inlier_count: int = 6,
     coarse_min_inlier_ratio: float = 0.35,
     coarse_max_median_inlier_residual: float | None = None,
+    guided_spatial_window_size: float | None = None,
 ) -> TwoStageMatchResult:
     coarse_matches = pd.DataFrame(columns=["idx1", "idx2", "distance"])
     aligned_df2 = df2
@@ -331,6 +585,11 @@ def two_stage_match_cells(
     coarse_inlier_ratio = 0.0
     coarse_median_inlier_residual = float("inf")
     coarse_transform_accepted = False
+    guided_window_size = _resolve_guided_spatial_window(
+        spatial_window_size,
+        guided_spatial_window_size,
+        coarse_residual_threshold,
+    )
 
     if len(df1) >= min_cells_for_two_stage and len(df2) >= min_cells_for_two_stage:
         coarse_config = MatchingConfig(
@@ -339,10 +598,41 @@ def two_stage_match_cells(
             position_weight=0.0,
             top_k=min(coarse_top_k, len(df1), len(df2)),
             distance_threshold=coarse_distance_threshold,
-            spatial_window_size=spatial_window_size,
+            spatial_window_size=coarse_spatial_window_size,
         )
         coarse_strategy = str(coarse_matching_mode).strip().lower()
-        if coarse_strategy == "patch":
+        if coarse_strategy in {"morphology_guided", "guided", "shape_knn", "local_shape"}:
+            candidate_window_size = _resolve_candidate_spatial_window(
+                image_shape,
+                spatial_window_size,
+                coarse_spatial_window_size,
+                guided_window_size,
+            )
+            coarse_matches = _build_local_morphology_candidates(
+                df1,
+                df2,
+                coarse_config,
+                image_shape=image_shape,
+                top_k_per_cell=coarse_candidates_per_cell,
+                spatial_window_size=candidate_window_size,
+                max_candidates=None,
+            )
+            coarse_matches = _filter_candidate_matches_by_hard_constraints(
+                coarse_matches,
+                max_area_ratio=coarse_max_area_ratio,
+                max_aspect_ratio_ratio=coarse_max_aspect_ratio_ratio,
+                max_orientation_diff_deg=coarse_max_orientation_diff_deg,
+                min_orientation_eccentricity=coarse_min_orientation_eccentricity,
+            )
+            if len(coarse_matches) > coarse_config.top_k:
+                coarse_matches = (
+                    coarse_matches.sort_values(
+                        ["distance", "spatial_dist_px"], ascending=[True, True]
+                    )
+                    .head(coarse_config.top_k)
+                    .reset_index(drop=True)
+                )
+        elif coarse_strategy == "patch":
             patch_rows = max(1, int(coarse_patch_rows))
             patch_cols = max(1, int(coarse_patch_cols))
             fixed_patched = _add_patch_coordinates(df1, image_shape, patch_rows, patch_cols)
@@ -397,13 +687,18 @@ def two_stage_match_cells(
             if coarse_transform_accepted:
                 aligned_df2 = apply_transform_to_features(df2, coarse_transform, image_shape)
 
+    fine_spatial_window_size = (
+        guided_window_size
+        if coarse_transform_accepted or spatial_window_size is None
+        else spatial_window_size
+    )
     fine_config = MatchingConfig(
         feature_weight=feature_weight,
         topology_weight=topology_weight,
         position_weight=position_weight,
         top_k=top_k,
         distance_threshold=distance_threshold,
-        spatial_window_size=spatial_window_size,
+        spatial_window_size=fine_spatial_window_size,
     )
     matches = greedy_match_cells(df1, aligned_df2, fine_config)
 
@@ -457,14 +752,7 @@ def greedy_match_cells(df1: pd.DataFrame, df2: pd.DataFrame, config: MatchingCon
     match_df = pd.DataFrame(matches, columns=["idx1", "idx2", "distance"])
     if match_df.empty:
         return pd.DataFrame(columns=["idx1", "idx2", "distance", "cell_id_1", "cell_id_2"])
-    match_df["cell_id_1"] = df1.iloc[match_df["idx1"]]["cell_id"].to_numpy()
-    match_df["cell_id_2"] = df2.iloc[match_df["idx2"]]["cell_id"].to_numpy()
-
-    for col in report_cols:
-        match_df[f"{col}_1"] = df1.iloc[match_df["idx1"]][col].to_numpy()
-        match_df[f"{col}_2"] = df2.iloc[match_df["idx2"]][col].to_numpy()
-
-    return match_df
+    return _append_match_report_columns(match_df, df1, df2, report_cols)
 
 
 def match_cells_per_patch(
@@ -525,14 +813,7 @@ def match_cells_per_patch(
         return pd.DataFrame(columns=["idx1", "idx2", "distance", "cell_id_1", "cell_id_2", "patch_x", "patch_y"])
 
     match_df = pd.DataFrame(rows, columns=["idx1", "idx2", "distance", "patch_x", "patch_y"])
-    match_df["cell_id_1"] = df1.loc[match_df["idx1"], "cell_id"].to_numpy()
-    match_df["cell_id_2"] = df2.loc[match_df["idx2"], "cell_id"].to_numpy()
-
-    for col in report_cols:
-        match_df[f"{col}_1"] = df1.loc[match_df["idx1"], col].to_numpy()
-        match_df[f"{col}_2"] = df2.loc[match_df["idx2"], col].to_numpy()
-
-    return match_df.reset_index(drop=True)
+    return _append_match_report_columns(match_df.reset_index(drop=True), df1, df2, report_cols)
 
 
 def match_cells_per_cluster(
