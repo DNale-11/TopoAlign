@@ -12,7 +12,7 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 from skimage.measure import ransac
-from skimage.transform import AffineTransform, SimilarityTransform, estimate_transform
+from skimage.transform import AffineTransform, EuclideanTransform, SimilarityTransform, estimate_transform
 
 try:
     import napari  # type: ignore
@@ -26,6 +26,37 @@ class RegistrationResult:
     pts_r1: np.ndarray
     pts_r2: np.ndarray
     pts_r2_reg: np.ndarray
+
+
+@dataclass
+class RobustTransformResult:
+    transform: AffineTransform
+    inliers: np.ndarray
+    residuals: np.ndarray
+    method: str
+
+    @property
+    def inlier_count(self) -> int:
+        return int(np.count_nonzero(self.inliers))
+
+    @property
+    def median_inlier_residual(self) -> float:
+        if self.inlier_count == 0:
+            return float("inf")
+        return float(np.median(self.residuals[self.inliers]))
+
+    @property
+    def mean_inlier_residual(self) -> float:
+        if self.inlier_count == 0:
+            return float("inf")
+        return float(np.mean(self.residuals[self.inliers]))
+
+    def score(self) -> tuple[int, float, float]:
+        return (
+            self.inlier_count,
+            -self.median_inlier_residual,
+            -self.mean_inlier_residual,
+        )
 
 
 def load_data(
@@ -90,10 +121,98 @@ def _gather_landmarks(
     return np.asarray(pts_r1, dtype=float), np.asarray(pts_r2, dtype=float)
 
 
+def _as_affine_transform(transform) -> AffineTransform:
+    return AffineTransform(matrix=np.asarray(transform.params, dtype=float))
+
+
+def _point_residuals(transform: AffineTransform, pts_moving: np.ndarray, pts_fixed: np.ndarray) -> np.ndarray:
+    pts_reg = transform(pts_moving)
+    return np.linalg.norm(pts_reg - pts_fixed, axis=1)
+
+
+def estimate_robust_transform(
+    pts_fixed: np.ndarray,
+    pts_moving: np.ndarray,
+    *,
+    prefer_affine: bool = False,
+    allow_scale: bool = False,
+    residual_threshold: float = 3.0,
+    similarity_residual_threshold: float | None = None,
+    max_trials: int = 500,
+    min_inliers: int = 3,
+    fallback_to_translation: bool = True,
+) -> RobustTransformResult:
+    if len(pts_fixed) != len(pts_moving):
+        raise ValueError("Point arrays must have the same length.")
+    if len(pts_fixed) < 3:
+        raise ValueError("Need at least 3 matched landmarks to estimate a transform.")
+
+    similarity_threshold = (
+        residual_threshold if similarity_residual_threshold is None else similarity_residual_threshold
+    )
+
+    candidates: list[tuple[str, str, type[AffineTransform], int, float]] = []
+    if not allow_scale:
+        candidates.append(("rigid", "euclidean", EuclideanTransform, 2, residual_threshold))
+    else:
+        if prefer_affine and len(pts_fixed) >= 4:
+            candidates.append(("affine", "affine", AffineTransform, 4, residual_threshold))
+        candidates.append(("similarity", "similarity", SimilarityTransform, 3, similarity_threshold))
+
+    best: RobustTransformResult | None = None
+    for display_name, estimate_method, model_cls, min_samples, threshold in candidates:
+        try:
+            model_robust, inliers = ransac(
+                (pts_moving, pts_fixed),
+                model_cls,
+                min_samples=min_samples,
+                residual_threshold=threshold,
+                max_trials=max_trials,
+            )
+        except Exception:
+            continue
+
+        if model_robust is None or inliers is None or int(inliers.sum()) < max(min_inliers, min_samples):
+            continue
+
+        try:
+            refit = estimate_transform(estimate_method, pts_moving[inliers], pts_fixed[inliers])
+            transform = _as_affine_transform(refit)
+        except Exception:
+            transform = _as_affine_transform(model_robust)
+
+        residuals = _point_residuals(transform, pts_moving, pts_fixed)
+        candidate = RobustTransformResult(
+            transform=transform,
+            inliers=np.asarray(inliers, dtype=bool),
+            residuals=residuals,
+            method=display_name,
+        )
+        if best is None or candidate.score() > best.score():
+            best = candidate
+
+    if best is not None:
+        return best
+
+    if not fallback_to_translation:
+        raise RuntimeError("RANSAC failed to find a valid transform.")
+
+    translation = np.median(pts_fixed - pts_moving, axis=0)
+    transform = AffineTransform(translation=(float(translation[0]), float(translation[1])))
+    residuals = _point_residuals(transform, pts_moving, pts_fixed)
+    inliers = residuals <= max(residual_threshold, similarity_threshold)
+    return RobustTransformResult(
+        transform=transform,
+        inliers=inliers,
+        residuals=residuals,
+        method="translation",
+    )
+
+
 def estimate_initial_transform(
     pts_r1: np.ndarray,
     pts_r2: np.ndarray,
-    method: Literal["similarity", "affine"] = "similarity",
+    method: Literal[ "similarity", "affine"] = "similarity",
     use_ransac: bool = True,
 ) -> AffineTransform:
     """Estimate a global transform mapping r2 -> r1 from landmarks."""
@@ -102,7 +221,7 @@ def estimate_initial_transform(
     elif method == "affine":
         model_cls = AffineTransform
     else:
-        raise ValueError("method must be 'similarity' or 'affine'")
+        raise ValueError("method must be'similarity', or 'affine'")
 
     if use_ransac:
         model_robust, inliers = ransac(

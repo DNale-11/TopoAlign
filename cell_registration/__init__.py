@@ -11,6 +11,7 @@ from .matching import MatchingConfig, greedy_match_cells
 from .registration import RigidTransform, estimate_rigid_transform_from_matches
 from .robust_alignment import perform_global_registration
 from .visualization import launch_napari_viewer, export_match_table, save_match_overlay
+from .mask_matching import MaskMatchConfig, MaskMatchResult, match_cells_by_mask_overlap, match_masks_pipeline
 
 __all__ = [
     "CellposeConfig",
@@ -27,4 +28,9 @@ __all__ = [
     "launch_napari_viewer",
     "export_match_table",
     "save_match_overlay",
+    "MaskMatchConfig",
+    "MaskMatchResult",
+    "match_cells_by_mask_overlap",
+    "match_masks_pipeline",
 ]
+

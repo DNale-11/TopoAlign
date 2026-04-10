@@ -72,7 +72,8 @@ python -m cell_registration.point_registration `
   .\outputs\top_matches.csv `
   --output-registered-csv .\outputs\round2_cells_registered.csv `
   --plot-path .\outputs\registration_plot.png `
+  --method translation `
   --napari
 
 
-python -m cell_registration.main B.tif C.tif --use-spatial-clusters --n-clusters 9 --position-weight 20 --top-per-patch 6 --top-k 200 --use-ransac-transform
+python -m cell_registration.main B.tif C.tif --position-weight 20 --top-per-patch 6 --top-k 200 --use-ransac-transform

@@ -33,6 +33,7 @@ class CellFeaturesConfig:
     min_area: Optional[int] = None
     max_area: Optional[int] = None
     extra_properties: Tuple[str, ...] = field(default_factory=tuple)
+    topology_neighbor_k: int = 3
 
 
 @dataclass
@@ -47,7 +48,23 @@ class MatchingConfig:
         "solidity",
         "major_axis_length",
         "minor_axis_length",
+        "aspect_ratio",
+        "elongation",
+        "equivalent_diameter",
     )
+    # Weight for morphology/feature similarity in the combined distance.
+    # Lower values make matching rely more on spatial consistency.
+    feature_weight: float = 1.0
+    # Local topology features help distinguish cells with similar morphology but different neighborhoods.
+    topology_feature_columns: Tuple[str, ...] = (
+        "nn_dist_1",
+        "nn_dist_2",
+        "nn_dist_3",
+        "local_density",
+        "neighbor_area_ratio_mean",
+        "neighbor_roundness_mean",
+    )
+    topology_weight: float = 0.0
     # Weight for spatial proximity (uses normalized positions)
     position_weight: float = 1.0
     # Maximum number of matches to return
@@ -58,6 +75,16 @@ class MatchingConfig:
     min_confidence: float = 0.0
     # Maximum allowed relative difference in features (0-1, e.g. 0.5 = 50% difference)
     max_feature_diff: float = 0.5
+    # Number of nearest matched neighbors used for local geometry profile validation (0 disables).
+    validation_neighbor_k: int = 0
+    # Maximum allowed median relative difference between local matched-neighbor distance profiles.
+    validation_max_neighbor_profile_diff: float = 0.35
+    # Maximum allowed ambiguity ratio against the next-best feasible alternative.
+    # <= 0 disables this filter. Lower values require a more distinctive best match.
+    validation_ambiguity_ratio: float = 0.0
+    # Minimum gap required between the chosen distance and the next-best feasible alternative.
+    # <= 0 disables this filter.
+    validation_ambiguity_min_gap: float = 0.0
     # Spatial search window size in pixels (None = no spatial constraint)
     # Cells can only match other cells within this pixel distance
     spatial_window_size: Optional[float] = None

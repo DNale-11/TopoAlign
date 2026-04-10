@@ -1,90 +1,118 @@
 """
-Benchmark script for cell registration pipeline.
+Object-level benchmark for the cell registration pipeline.
 
-Runs the existing registration pipeline (Cellpose segmentation → feature extraction →
-two-stage matching → RANSAC + KNN refinement → image warping) on unregistered images,
-compares results against ground truth, and produces quality metrics + visualizations.
-
-Usage:
-    python run_benchmark.py
+The benchmark evaluates the final estimated transform in fixed-image space using
+precomputed segmentations from the original raw images. Warped images are never
+re-segmented for the main benchmark.
 """
 
-# ── Fix Windows DLL loading for torch ────────────────────────────────────────
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-# Prepend torch DLL directory to PATH so Windows can find c10.dll
-_torch_lib = os.path.join(sys.prefix, "lib", "site-packages", "torch", "lib")
+from registration_runtime import (
+    CellposeConfig as SharedCellposeConfig,
+    CellposeSegmenter as SharedCellposeSegmenter,
+    DEFAULT_OBJECT_EVAL_PARAMS as SHARED_DEFAULT_OBJECT_EVAL_PARAMS,
+    DEFAULT_REG_PARAMS as SHARED_DEFAULT_REG_PARAMS,
+    NAPARI_CORE_IMPORT_ERROR as SHARED_NAPARI_CORE_IMPORT_ERROR,
+    compute_secondary_intensity_metrics as shared_compute_secondary_intensity_metrics,
+    get_or_create_segmentation as shared_get_or_create_segmentation,
+    prepare_torch_runtime as shared_prepare_torch_runtime,
+    run_registration as shared_run_registration,
+)
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from skimage.transform import AffineTransform
+from tifffile import imread, imwrite
+
+matplotlib.use("Agg")
+
+# Preload torch on Windows before importing cellpose-dependent modules.
+_torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+if not os.path.isdir(_torch_lib):
+    _torch_lib = os.path.join(sys.prefix, "lib", "site-packages", "torch", "lib")
 if os.path.isdir(_torch_lib):
     os.environ["PATH"] = _torch_lib + os.pathsep + os.environ.get("PATH", "")
     if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(_torch_lib)
+try:
+    import torch  # noqa: F401
+except Exception:
+    torch = None  # type: ignore[assignment]
 
-# Pre-import torch before any other torch-dependent package
-import torch  # noqa: F401, E402
-
-import time
-import re
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use("Agg")
-from tifffile import imread, imwrite
-from skimage.measure import ransac
-from skimage.transform import SimilarityTransform, resize
-from skimage.metrics import (
-    peak_signal_noise_ratio as psnr,
-    structural_similarity as ssim,
-    mean_squared_error as mse,
-    normalized_root_mse as nrmse,
-)
-
-# ── Add project to path ──────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "napari-cell-registration" / "src"))
 
-from napari_cell_registration.core import (
-    CellposeConfig,
-    CellposeSegmenter,
-    compute_cell_features,
-    CellFeaturesConfig,
-    greedy_match_cells,
-    MatchingConfig,
-)
-from napari_cell_registration.core.matching import apply_transform_to_features, two_stage_match_cells
-from napari_cell_registration.core.point_registration import (
-    estimate_robust_transform,
-    refine_transform_with_neighbors,
-    refine_transform_with_phase_correlation,
-    warp_image_with_transform,
-)
-from napari_cell_registration.core.validation import validate_matches
+from cell_registration.evaluation import compute_object_registration_metrics, compute_overlap_metrics
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+NAPARI_CORE_IMPORT_ERROR: Exception | None = None
+try:
+    from napari_cell_registration.core import (
+        CellFeaturesConfig,
+        CellposeConfig,
+        CellposeSegmenter,
+        MatchingConfig,
+        compute_cell_features,
+        greedy_match_cells,
+    )
+    from napari_cell_registration.core.matching import apply_transform_to_features, two_stage_match_cells
+    from napari_cell_registration.core.point_registration import (
+        compute_valid_overlap_mask,
+        estimate_robust_transform,
+        refine_transform_with_neighbors,
+        warp_image_with_transform,
+    )
+    from napari_cell_registration.core.validation import validate_matches
+except ImportError as exc:
+    NAPARI_CORE_IMPORT_ERROR = exc
+    CellFeaturesConfig = object
+    CellposeConfig = object
+    CellposeSegmenter = object
+    MatchingConfig = object
+
+    def _missing_dependency(*args, **kwargs):
+        raise ImportError(
+            "Benchmark runtime dependencies are missing. Install cellpose and related registration dependencies."
+        ) from NAPARI_CORE_IMPORT_ERROR
+
+    compute_cell_features = _missing_dependency
+    greedy_match_cells = _missing_dependency
+    apply_transform_to_features = _missing_dependency
+    two_stage_match_cells = _missing_dependency
+    compute_valid_overlap_mask = _missing_dependency
+    estimate_robust_transform = _missing_dependency
+    refine_transform_with_neighbors = _missing_dependency
+    warp_image_with_transform = _missing_dependency
+    validate_matches = _missing_dependency
+
+
 BENCHMARK_DIR = Path(__file__).resolve().parent
 UNREG_DIR = BENCHMARK_DIR / "unregistration"
 REG_DIR = BENCHMARK_DIR / "registration"
 DEFAULT_OUTPUT_DIR = BENCHMARK_DIR / "results"
-OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 
-ROUNDS = ["A", "C", "D", "E"]  # rounds to register (B is reference)
-SAMPLE_GROUPS = [1, 2, 3]
+DEFAULT_SAMPLE_GROUPS = [1, 2, 3]
+DEFAULT_ROUNDS = ["A", "C", "D", "E"]
 
-# Registration parameters aligned with the widget's robust workflow defaults.
 DEFAULT_REG_PARAMS = {
-    "cellpose_diameter": 10.0,
-    "cellpose_flow_threshold": 0.0,
-    "cellpose_cellprob_threshold": 0.0,
-    "cellpose_min_size": 15,
-    "position_weight": 3.0,
-    "distance_threshold": 2.5,
+    "cellpose_diameter": 15.0,
+    "cellpose_flow_threshold": -2.0,
+    "cellpose_cellprob_threshold": 1.0,
+    "cellpose_min_size": 5,
+    "position_weight": 50.0,
+    "distance_threshold": 2.0,
     "spatial_window_size": 100.0,
     "top_k": 100,
     "min_cells_for_two_stage": 20,
@@ -100,210 +128,321 @@ DEFAULT_REG_PARAMS = {
     "guided_spatial_window_cap": 60.0,
     "validation_min_confidence": 0.2,
     "validation_max_feature_diff": 0.7,
-    "prefer_affine": True,
+    "allow_scale": False,
+    "prefer_affine": False,
     "ransac_max_trials": 500,
     "ransac_residual_threshold": 3.0,
     "similarity_residual_threshold": 5.0,
-    "fft_upsample_factor": 20,
-    "fft_max_shift": 20.0,
-    "fft_crop_ratio": 0.8,
-    "fft_max_iterations": 2,
 }
-REG_PARAMS = DEFAULT_REG_PARAMS.copy()
 
-# ── Data classes ──────────────────────────────────────────────────────────────
+DEFAULT_OBJECT_EVAL_PARAMS = {
+    "instance_iou_threshold": 0.3,
+    "min_valid_instance_area_px": 20,
+    "min_valid_fraction": 0.5,
+}
+
+OBJECT_HEADLINE_METRICS = [
+    "match_f1",
+    "matched_mean_iou",
+    "centroid_error_median_px",
+    "centroid_error_p95_px",
+    "mask_dice",
+]
+OBJECT_SUPPORTING_METRICS = [
+    "mask_iou",
+    "matched_cells",
+    "match_precision",
+    "match_recall",
+    "tre_mean_px",
+    "tre_median_px",
+    "tre_p95_px",
+    "valid_overlap_ratio",
+    "eligible_moving_cells",
+    "eligible_fixed_cells",
+]
+OBJECT_ALL_METRICS = OBJECT_HEADLINE_METRICS + OBJECT_SUPPORTING_METRICS + [
+    "centroid_error_mean_px",
+]
+OBJECT_PLOT_METRICS = [
+    "match_f1",
+    "matched_mean_iou",
+    "centroid_error_median_px",
+    "centroid_error_p95_px",
+    "mask_dice",
+]
+SECONDARY_INTENSITY_METRICS = ["PSNR", "SSIM", "MSE", "NRMSE", "NCC", "MI", "valid_overlap_ratio"]
+
+
+def _prepare_torch_runtime() -> None:
+    """Load torch lazily so --help works without initializing the full runtime."""
+    torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+    if not os.path.isdir(torch_lib):
+        torch_lib = os.path.join(sys.prefix, "lib", "site-packages", "torch", "lib")
+    if os.path.isdir(torch_lib):
+        os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(torch_lib)
+    __import__("torch")
+
+
 @dataclass
 class ImagePair:
-    """One registration pair: round X → round B."""
     sample_group: int
-    round_name: str  # A, C, D, E
-    source_path: Path  # unregistered X image
-    reference_path: Path  # unregistered B image (reference)
-    ground_truth_path: Path  # registered ground truth (X→B)
+    round_name: str
+    source_path: Path
+    reference_path: Path
+    comparison_path: Path | None = None
+
+
+@dataclass
+class SegmentationArtifacts:
+    image_path: Path
+    image: np.ndarray = field(repr=False)
+    mask: np.ndarray = field(repr=False)
+    features: pd.DataFrame = field(repr=False)
+
+
+@dataclass
+class RegistrationArtifacts:
+    registered_image: np.ndarray = field(repr=False)
+    export_image: np.ndarray = field(repr=False)
+    valid_mask: np.ndarray = field(repr=False)
+    elapsed_seconds: float
+    transform: AffineTransform = field(repr=False)
+    moving_mask: np.ndarray = field(repr=False)
+    fixed_mask: np.ndarray = field(repr=False)
+    moving_features: pd.DataFrame = field(repr=False)
+    fixed_features: pd.DataFrame = field(repr=False)
+    diagnostics: dict[str, object] = field(default_factory=dict, repr=False)
 
 
 @dataclass
 class BenchmarkResult:
-    """Result of one registration + evaluation."""
     sample_group: int
     round_name: str
     registration_time_sec: float
-    metrics: Dict[str, float]
-    registered_image: Optional[np.ndarray] = field(default=None, repr=False)
+    object_metrics: dict[str, float]
+    diagnostics: dict[str, object] = field(default_factory=dict)
+    secondary_intensity_metrics: dict[str, float] | None = None
+    registered_image: np.ndarray | None = field(default=None, repr=False)
+    valid_mask: np.ndarray | None = field(default=None, repr=False)
+    match_table: pd.DataFrame | None = field(default=None, repr=False)
 
 
-# ── File discovery ────────────────────────────────────────────────────────────
-def find_unreg_image(sample_group: int, round_name: str) -> Optional[Path]:
-    """Find unregistered image for a given sample group and round."""
+def find_unreg_image(sample_group: int, round_name: str) -> Path | None:
     folder = UNREG_DIR / f"C-{sample_group}"
     if not folder.exists():
         return None
     pattern = f"C3-{round_name}-63-{sample_group}"
-    for f in folder.iterdir():
-        if f.suffix.lower() in (".tif", ".tiff") and pattern in f.name:
-            return f
+    for file_path in folder.iterdir():
+        if file_path.suffix.lower() in (".tif", ".tiff") and pattern in file_path.name:
+            return file_path
     return None
 
 
-def find_reg_ground_truth(sample_group: int, round_name: str) -> Optional[Path]:
-    """Find ground truth registered image for a given sample group and round."""
+def find_b_merged_reference(sample_group: int) -> Path | None:
     folder = REG_DIR / f"C1-{sample_group}"
     if not folder.exists():
         return None
-    pattern = f"C3-{round_name}-63-{sample_group}"
-    for f in folder.iterdir():
-        if f.suffix.lower() in (".tif", ".tiff") and pattern in f.name:
-            # Skip the B reference image itself
-            if f"C3-B-63-{sample_group}" in f.name:
-                continue
-            return f
+    pattern = f"C3-B-63-{sample_group}"
+    for file_path in folder.iterdir():
+        if file_path.suffix.lower() in (".tif", ".tiff") and pattern in file_path.name:
+            return file_path
     return None
 
 
-def discover_image_pairs() -> List[ImagePair]:
-    """Discover all image pairs for benchmarking."""
-    pairs = []
-    for sg in SAMPLE_GROUPS:
-        ref_path = find_unreg_image(sg, "B")
-        if ref_path is None:
-            print(f"  ⚠ Reference image B not found for sample group {sg}, skipping")
+def load_b_reference_channel5(path: Path) -> np.ndarray:
+    merged = imread(str(path))
+    if merged.ndim != 3:
+        raise ValueError(f"Expected a 3D merged TIFF at {path}, got shape {merged.shape}.")
+    if merged.shape[0] < 5:
+        raise ValueError(f"Expected at least 5 channels in {path}, got shape {merged.shape}.")
+    return merged[4]
+
+
+def discover_image_pairs(
+    sample_groups: list[int],
+    rounds: list[str],
+    *,
+    require_secondary_comparison: bool,
+) -> list[ImagePair]:
+    pairs: list[ImagePair] = []
+    for sample_group in sample_groups:
+        reference_path = find_unreg_image(sample_group, "B")
+        if reference_path is None:
+            print(f"  Reference image B not found for sample group {sample_group}, skipping")
             continue
-        for rnd in ROUNDS:
-            src = find_unreg_image(sg, rnd)
-            gt = find_reg_ground_truth(sg, rnd)
-            if src is None:
-                print(f"  ⚠ Source image {rnd} not found for sample group {sg}, skipping")
+
+        comparison_path = find_b_merged_reference(sample_group)
+        if require_secondary_comparison and comparison_path is None:
+            print(f"  Secondary comparison image B not found for sample group {sample_group}, skipping")
+            continue
+
+        for round_name in rounds:
+            source_path = find_unreg_image(sample_group, round_name)
+            if source_path is None:
+                print(f"  Source image {round_name} not found for sample group {sample_group}, skipping")
                 continue
-            if gt is None:
-                print(f"  ⚠ Ground truth {rnd}→B not found for sample group {sg}, skipping")
-                continue
-            pairs.append(ImagePair(
-                sample_group=sg,
-                round_name=rnd,
-                source_path=src,
-                reference_path=ref_path,
-                ground_truth_path=gt,
-            ))
+            pairs.append(
+                ImagePair(
+                    sample_group=sample_group,
+                    round_name=round_name,
+                    source_path=source_path,
+                    reference_path=reference_path,
+                    comparison_path=comparison_path,
+                )
+            )
     return pairs
 
 
-# ── Image quality metrics ─────────────────────────────────────────────────────
-def normalized_cross_correlation(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Compute NCC (normalized cross-correlation) between two images."""
-    img1_f = img1.astype(np.float64)
-    img2_f = img2.astype(np.float64)
-    mean1, mean2 = img1_f.mean(), img2_f.mean()
-    std1, std2 = img1_f.std(), img2_f.std()
-    if std1 < 1e-10 or std2 < 1e-10:
-        return 0.0
-    n = img1_f.size
-    ncc = np.sum((img1_f - mean1) * (img2_f - mean2)) / (n * std1 * std2)
-    return float(ncc)
+def to_2d_gray(img: np.ndarray) -> np.ndarray:
+    """Use the last channel for multichannel DAPI-like images."""
+    if img.ndim == 2:
+        return img
+    if img.ndim == 3:
+        if img.shape[0] <= 10 and img.shape[1] > 10 and img.shape[2] > 10:
+            return img[-1]
+        if img.shape[2] <= 10:
+            return img[..., -1]
+        return np.max(img, axis=0)
+    return np.asarray(img)
 
 
-def mutual_information(img1: np.ndarray, img2: np.ndarray, bins: int = 256) -> float:
-    """Compute mutual information between two images."""
-    # Quantize to integer bins
-    img1_q = np.clip(img1, 0, None)
-    img2_q = np.clip(img2, 0, None)
-    # Normalize to [0, bins-1]
-    max1 = img1_q.max() if img1_q.max() > 0 else 1
-    max2 = img2_q.max() if img2_q.max() > 0 else 1
-    img1_q = (img1_q / max1 * (bins - 1)).astype(np.int32)
-    img2_q = (img2_q / max2 * (bins - 1)).astype(np.int32)
+def align_images_for_comparison(
+    registered: np.ndarray,
+    comparison_image: np.ndarray,
+    valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    reg_2d = np.asarray(to_2d_gray(registered), dtype=np.float64)
+    ref_2d = np.asarray(to_2d_gray(comparison_image), dtype=np.float64)
+    h = min(reg_2d.shape[0], ref_2d.shape[0])
+    w = min(reg_2d.shape[1], ref_2d.shape[1])
+    if valid_mask is None:
+        mask = np.ones((h, w), dtype=bool)
+    else:
+        mask = np.asarray(valid_mask)[:h, :w] > 0.5
+    return reg_2d[:h, :w], ref_2d[:h, :w], mask
 
-    # Joint histogram
-    joint_hist = np.zeros((bins, bins), dtype=np.float64)
-    np.add.at(joint_hist, (img1_q.ravel(), img2_q.ravel()), 1)
-    joint_hist /= joint_hist.sum()
 
-    # Marginals
-    p1 = joint_hist.sum(axis=1)
-    p2 = joint_hist.sum(axis=0)
-
-    # Mutual information
-    nonzero = joint_hist > 0
-    mi = np.sum(
-        joint_hist[nonzero] * np.log2(joint_hist[nonzero] / (p1[:, None] * p2[None, :])[nonzero])
+def compute_secondary_intensity_metrics(
+    registered: np.ndarray,
+    comparison_image: np.ndarray,
+    valid_mask: np.ndarray | None,
+) -> dict[str, float]:
+    reg_2d, ref_2d, mask_2d = align_images_for_comparison(
+        registered,
+        comparison_image,
+        valid_mask=valid_mask,
     )
-    return float(mi)
+    return compute_overlap_metrics(reg_2d, ref_2d, valid_mask=mask_2d)
 
 
-def compute_all_metrics(registered: np.ndarray, ground_truth: np.ndarray) -> Dict[str, float]:
-    """Compute all image quality metrics between registered image and ground truth."""
-    # Ensure same dtype for comparison
-    reg = registered.astype(np.float64)
-    gt = ground_truth.astype(np.float64)
-
-    # Data range for PSNR/SSIM
-    data_range = max(gt.max() - gt.min(), reg.max() - reg.min())
-    if data_range < 1e-10:
-        data_range = 1.0
-
-    # Determine appropriate win_size for SSIM
-    min_dim = min(reg.shape[0], reg.shape[1])
-    win_size = min(7, min_dim if min_dim % 2 == 1 else min_dim - 1)
-    if win_size < 3:
-        win_size = 3
-
-    metrics = {}
-    metrics["PSNR"] = float(psnr(gt, reg, data_range=data_range))
-    metrics["SSIM"] = float(ssim(gt, reg, data_range=data_range, win_size=win_size))
-    metrics["MSE"] = float(mse(gt, reg))
-    metrics["NRMSE"] = float(nrmse(gt, reg))
-    metrics["NCC"] = normalized_cross_correlation(reg, gt)
-    metrics["MI"] = mutual_information(reg, gt)
-
-    return metrics
+def _cast_warped_image(warped: np.ndarray, source_dtype: np.dtype) -> np.ndarray:
+    if np.issubdtype(source_dtype, np.integer):
+        dtype_info = np.iinfo(source_dtype)
+        return np.clip(np.rint(warped), dtype_info.min, dtype_info.max).astype(source_dtype)
+    return warped.astype(source_dtype, copy=False)
 
 
-# ── Registration pipeline ────────────────────────────────────────────────────
-def run_registration(
+def _finalize_registration(
+    *,
     source_img: np.ndarray,
     reference_img: np.ndarray,
-    segmenter: CellposeSegmenter,
-) -> Tuple[np.ndarray, float]:
-    """
-    Run the complete registration pipeline on a pair of images.
+    source_mask: np.ndarray,
+    reference_mask: np.ndarray,
+    source_features: pd.DataFrame,
+    reference_features: pd.DataFrame,
+    transform: AffineTransform,
+    elapsed_seconds: float,
+    diagnostics: dict[str, object],
+) -> RegistrationArtifacts:
+    reference_shape = tuple(int(v) for v in to_2d_gray(reference_img).shape[:2])
+    source_shape = tuple(int(v) for v in to_2d_gray(source_img).shape[:2])
 
-    Returns (registered_image, elapsed_seconds).
+    registered_f = warp_image_with_transform(
+        source_img,
+        transform,
+        reference_shape,
+        order=1,
+    )
+    export_f = warp_image_with_transform(
+        source_img,
+        transform,
+        source_shape,
+        order=1,
+    )
+    registered = _cast_warped_image(registered_f, source_img.dtype)
+    export_image = _cast_warped_image(export_f, source_img.dtype)
+    valid_mask = compute_valid_overlap_mask(source_shape, transform, reference_shape)
+
+    return RegistrationArtifacts(
+        registered_image=registered,
+        export_image=export_image,
+        valid_mask=valid_mask,
+        elapsed_seconds=elapsed_seconds,
+        transform=transform,
+        moving_mask=source_mask,
+        fixed_mask=reference_mask,
+        moving_features=source_features,
+        fixed_features=reference_features,
+        diagnostics=diagnostics,
+    )
+
+
+def run_registration(
+    source_artifacts: SegmentationArtifacts,
+    reference_artifacts: SegmentationArtifacts,
+    reg_params: dict[str, Any],
+) -> RegistrationArtifacts:
     """
+    Run the registration pipeline using precomputed source/reference masks and features.
+    """
+    source_img = source_artifacts.image
+    reference_img = reference_artifacts.image
+    mask_src = source_artifacts.mask
+    mask_ref = reference_artifacts.mask
+    feats_src = source_artifacts.features
+    feats_ref = reference_artifacts.features
+
     t_start = time.perf_counter()
-
-    # ── 1. Segmentation ──────────────────────────────────────────────────
-    mask_src, _, _ = segmenter.segment_array(source_img)
-    mask_ref, _, _ = segmenter.segment_array(reference_img)
-
-    # ── 2. Feature extraction ────────────────────────────────────────────
-    feat_config = CellFeaturesConfig()
-    feats_src = compute_cell_features(mask_src, feat_config)
-    feats_ref = compute_cell_features(mask_ref, feat_config)
-
     n_src = len(feats_src)
     n_ref = len(feats_ref)
     print(f"    Cells found: source={n_src}, reference={n_ref}")
 
-    if n_src < 3 or n_ref < 3:
-        print("    ✗ Too few cells for registration, returning source image as-is")
-        elapsed = time.perf_counter() - t_start
-        return source_img.copy(), elapsed
+    reference_shape = tuple(int(v) for v in to_2d_gray(reference_img).shape[:2])
 
-    # ── 3. Two-stage matching ────────────────────────────────────────────
-    pw = REG_PARAMS["position_weight"]
-    dt = REG_PARAMS["distance_threshold"]
-    sw = REG_PARAMS["spatial_window_size"]
-    tk = REG_PARAMS["top_k"]
+    if n_src < 3 or n_ref < 3:
+        print("    Too few cells for registration, falling back to identity transform")
+        elapsed = time.perf_counter() - t_start
+        return _finalize_registration(
+            source_img=source_img,
+            reference_img=reference_img,
+            source_mask=mask_src,
+            reference_mask=mask_ref,
+            source_features=feats_src,
+            reference_features=feats_ref,
+            transform=AffineTransform(),
+            elapsed_seconds=elapsed,
+            diagnostics={
+                "transform_method": "insufficient_cells",
+                "inlier_count": 0,
+                "match_count": 0,
+                "median_inlier_residual": float("inf"),
+                "mean_inlier_residual": float("inf"),
+            },
+        )
+
     match_result = two_stage_match_cells(
         feats_ref,
         feats_src,
         mask_ref.shape,
-        position_weight=pw,
-        top_k=tk,
-        distance_threshold=dt,
-        spatial_window_size=sw,
-        min_cells_for_two_stage=REG_PARAMS["min_cells_for_two_stage"],
-        coarse_top_k=REG_PARAMS["coarse_top_k"],
-        coarse_distance_threshold=REG_PARAMS["coarse_distance_threshold"],
+        position_weight=reg_params["position_weight"],
+        top_k=reg_params["top_k"],
+        distance_threshold=reg_params["distance_threshold"],
+        spatial_window_size=reg_params["spatial_window_size"],
+        min_cells_for_two_stage=reg_params["min_cells_for_two_stage"],
+        coarse_top_k=reg_params["coarse_top_k"],
+        coarse_distance_threshold=reg_params["coarse_distance_threshold"],
     )
     if not match_result.coarse_matches.empty:
         print(f"    Coarse matches: {len(match_result.coarse_matches)}")
@@ -311,35 +450,59 @@ def run_registration(
             "    Coarse offset: "
             f"dx={match_result.coarse_offset_xy[0]:.2f}, dy={match_result.coarse_offset_xy[1]:.2f}"
         )
+
     matches = match_result.matches
     print(f"    Fine matches: {len(matches)}")
 
-    # Validate matches
     config_val = MatchingConfig(
-        distance_threshold=dt,
-        min_confidence=REG_PARAMS["validation_min_confidence"],
-        max_feature_diff=REG_PARAMS["validation_max_feature_diff"],
+        feature_weight=reg_params["feature_weight"],
+        position_weight=reg_params["position_weight"],
+        distance_threshold=reg_params["distance_threshold"],
+        min_confidence=reg_params["validation_min_confidence"],
+        max_feature_diff=reg_params["validation_max_feature_diff"],
+        validation_neighbor_k=reg_params["validation_neighbor_k"],
+        validation_max_neighbor_profile_diff=reg_params["validation_max_neighbor_profile_diff"],
+        validation_ambiguity_ratio=reg_params["validation_ambiguity_ratio"],
+        validation_ambiguity_min_gap=reg_params["validation_ambiguity_min_gap"],
+        spatial_window_size=reg_params["spatial_window_size"],
     )
     matches = validate_matches(matches, feats_ref, match_result.aligned_df2, config_val)
     print(f"    Validated matches: {len(matches)}")
 
     if len(matches) < 3:
-        print("    ✗ Too few matches for transform estimation, returning source as-is")
+        print("    Too few matches for transform estimation, falling back to identity transform")
         elapsed = time.perf_counter() - t_start
-        return source_img.copy(), elapsed
+        return _finalize_registration(
+            source_img=source_img,
+            reference_img=reference_img,
+            source_mask=mask_src,
+            reference_mask=mask_ref,
+            source_features=feats_src,
+            reference_features=feats_ref,
+            transform=AffineTransform(),
+            elapsed_seconds=elapsed,
+            diagnostics={
+                "transform_method": "insufficient_matches",
+                "inlier_count": 0,
+                "match_count": int(len(matches)),
+                "median_inlier_residual": float("inf"),
+                "mean_inlier_residual": float("inf"),
+            },
+        )
 
-    # ── 4. Transform estimation (RANSAC + AffineTransform) ────────────────
     pts_ref_yx = feats_ref.loc[matches["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
     pts_src_yx = feats_src.loc[matches["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
     pts_ref_xy = pts_ref_yx[:, ::-1]
     pts_src_xy = pts_src_yx[:, ::-1]
+
     robust = estimate_robust_transform(
         pts_ref_xy,
         pts_src_xy,
-        prefer_affine=bool(REG_PARAMS["prefer_affine"]),
-        residual_threshold=REG_PARAMS["ransac_residual_threshold"],
-        similarity_residual_threshold=REG_PARAMS["similarity_residual_threshold"],
-        max_trials=REG_PARAMS["ransac_max_trials"],
+        allow_scale=bool(reg_params["allow_scale"]),
+        prefer_affine=bool(reg_params["prefer_affine"]),
+        residual_threshold=reg_params["ransac_residual_threshold"],
+        similarity_residual_threshold=reg_params["similarity_residual_threshold"],
+        max_trials=reg_params["ransac_max_trials"],
     )
     affine = robust.transform
     print(
@@ -347,415 +510,347 @@ def run_registration(
         f"inliers: {robust.inlier_count}/{len(matches)} | "
         f"median residual: {robust.median_inlier_residual:.2f}px"
     )
-    inliers = np.asarray(robust.inliers, dtype=bool)
-    model_robust = affine
 
-    if inliers is None or inliers.sum() < 4:
-        # Fall back to SimilarityTransform (fewer parameters)
-        print("    ⚠ Affine RANSAC failed, trying SimilarityTransform...")
-        model_robust, inliers = ransac(
-            (pts_src_xy, pts_ref_xy),
-            SimilarityTransform,
-            min_samples=3,
-            residual_threshold=REG_PARAMS["similarity_residual_threshold"],
-            max_trials=REG_PARAMS["ransac_max_trials"],
-        )
-
-    if inliers is None or inliers.sum() < 3:
-        print("    ✗ RANSAC failed, using simple translation")
-        tx = np.median(pts_ref_xy[:, 0] - pts_src_xy[:, 0])
-        ty = np.median(pts_ref_xy[:, 1] - pts_src_xy[:, 1])
-        affine = SimilarityTransform(translation=(tx, ty))
-    else:
-        print(f"    RANSAC inliers: {inliers.sum()}/{len(inliers)}")
-        affine = model_robust
-
-    guided_feats_src = apply_transform_to_features(feats_src, affine, mask_ref.shape)
-    guided_spatial_cap = REG_PARAMS["guided_spatial_window_cap"]
+    guided_feats_src = apply_transform_to_features(feats_src, affine, reference_shape)
+    guided_spatial_cap = reg_params["guided_spatial_window_cap"]
+    spatial_window = reg_params["spatial_window_size"]
     if guided_spatial_cap is None or guided_spatial_cap <= 0:
-        guided_window = sw
+        guided_window = spatial_window
     else:
-        guided_window = sw if sw is None else min(sw, guided_spatial_cap)
+        guided_window = spatial_window if spatial_window is None else min(spatial_window, guided_spatial_cap)
     guided_config = MatchingConfig(
-        position_weight=max(pw, REG_PARAMS["guided_min_position_weight"]),
-        top_k=tk,
-        distance_threshold=None if dt is None else dt + 0.5,
+        position_weight=max(reg_params["position_weight"], reg_params["guided_min_position_weight"]),
+        top_k=reg_params["top_k"],
+        distance_threshold=None if reg_params["distance_threshold"] is None else reg_params["distance_threshold"] + 0.5,
         spatial_window_size=guided_window,
     )
     guided_matches = greedy_match_cells(feats_ref, guided_feats_src, guided_config)
     guided_matches = validate_matches(guided_matches, feats_ref, guided_feats_src, config_val)
     if len(guided_matches) >= 3:
-        guided_ref_yx = feats_ref.loc[guided_matches["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
-        guided_src_yx = feats_src.loc[guided_matches["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
+        guided_ref_xy = feats_ref.loc[guided_matches["idx1"], ["centroid_x", "centroid_y"]].to_numpy()
+        guided_src_xy = feats_src.loc[guided_matches["idx2"], ["centroid_x", "centroid_y"]].to_numpy()
         guided = estimate_robust_transform(
-            guided_ref_yx[:, ::-1],
-            guided_src_yx[:, ::-1],
-            prefer_affine=bool(REG_PARAMS["prefer_affine"]),
-            residual_threshold=REG_PARAMS["ransac_residual_threshold"],
-            similarity_residual_threshold=REG_PARAMS["similarity_residual_threshold"],
-            max_trials=REG_PARAMS["ransac_max_trials"],
+            guided_ref_xy,
+            guided_src_xy,
+            allow_scale=bool(reg_params["allow_scale"]),
+            prefer_affine=bool(reg_params["prefer_affine"]),
+            residual_threshold=reg_params["ransac_residual_threshold"],
+            similarity_residual_threshold=reg_params["similarity_residual_threshold"],
+            max_trials=reg_params["ransac_max_trials"],
         )
         if guided.score() > robust.score():
             matches = guided_matches
-            pts_ref_yx = guided_ref_yx
-            pts_src_yx = guided_src_yx
-            pts_ref_xy = guided_ref_yx[:, ::-1]
-            pts_src_xy = guided_src_yx[:, ::-1]
             robust = guided
             affine = robust.transform
+            pts_ref_xy = guided_ref_xy
+            pts_src_xy = guided_src_xy
             print(
                 f"    Guided rematch improved support: {robust.method}, "
                 f"{robust.inlier_count}/{len(matches)} inliers"
             )
+
     if robust.inlier_count >= 3:
-        pts_ref_xy = pts_ref_xy[robust.inliers]
-        pts_src_xy = pts_src_xy[robust.inliers]
+        pts_ref_xy_inliers = pts_ref_xy[robust.inliers]
+        pts_src_xy_inliers = pts_src_xy[robust.inliers]
     else:
-        pts_ref_xy = np.empty((0, 2), dtype=float)
-        pts_src_xy = np.empty((0, 2), dtype=float)
+        pts_ref_xy_inliers = np.empty((0, 2), dtype=float)
+        pts_src_xy_inliers = np.empty((0, 2), dtype=float)
 
-    # ── 5. KNN neighbor refinement ───────────────────────────────────────
-    print(f"    Refining with k={REG_PARAMS['neighbor_k']} neighbors (KNN)...")
-    affine = refine_transform_with_neighbors(
-        pts_ref_xy,
-        pts_src_xy,
-        initial=affine,
-        k=REG_PARAMS["neighbor_k"],
-        neighbor_weight=REG_PARAMS["neighbor_weight"],
-        landmark_weight=REG_PARAMS["landmark_weight"],
-        max_theta_deg=REG_PARAMS["max_theta_deg"],
-        max_translation=REG_PARAMS["max_translation"],
-        max_scale_change=REG_PARAMS["max_scale_change"],
-    )
-    if robust.method != "similarity" and len(pts_ref_xy) >= 3:
+    if len(pts_ref_xy_inliers) >= 3:
+        print(f"    Refining with k={reg_params['neighbor_k']} neighbors (KNN)...")
         affine = refine_transform_with_neighbors(
-            pts_ref_xy,
-            pts_src_xy,
+            pts_ref_xy_inliers,
+            pts_src_xy_inliers,
             initial=affine,
-            k=REG_PARAMS["neighbor_k"],
-            neighbor_weight=REG_PARAMS["neighbor_weight"],
-            landmark_weight=REG_PARAMS["landmark_weight"],
-            max_theta_deg=REG_PARAMS["max_theta_deg"],
-            max_translation=REG_PARAMS["max_translation"],
-            max_scale_change=REG_PARAMS["max_scale_change"],
-            optimize_translation_only=True,
+            k=reg_params["neighbor_k"],
+            neighbor_weight=reg_params["neighbor_weight"],
+            landmark_weight=reg_params["landmark_weight"],
+            max_theta_deg=reg_params["max_theta_deg"],
+            max_translation=reg_params["max_translation"],
+            max_scale_change=reg_params["max_scale_change"],
+            allow_scale=bool(reg_params["allow_scale"]),
         )
-    print("    KNN refinement complete")
+        if robust.method != "similarity":
+            affine = refine_transform_with_neighbors(
+                pts_ref_xy_inliers,
+                pts_src_xy_inliers,
+                initial=affine,
+                k=reg_params["neighbor_k"],
+                neighbor_weight=reg_params["neighbor_weight"],
+                landmark_weight=reg_params["landmark_weight"],
+                max_theta_deg=reg_params["max_theta_deg"],
+                max_translation=reg_params["max_translation"],
+                max_scale_change=reg_params["max_scale_change"],
+                allow_scale=bool(reg_params["allow_scale"]),
+                optimize_translation_only=True,
+            )
+        print("    KNN refinement complete")
 
-    try:
-        affine_fft, shift_yx = refine_transform_with_phase_correlation(
-            source_img,
-            reference_img,
-            affine,
-            output_shape=reference_img.shape[:2],
-            upsample_factor=REG_PARAMS["fft_upsample_factor"],
-            max_shift=REG_PARAMS["fft_max_shift"],
-            crop_ratio=REG_PARAMS["fft_crop_ratio"],
-            max_iterations=REG_PARAMS["fft_max_iterations"],
-        )
-        shift_mag = float(np.linalg.norm(shift_yx))
-        if shift_mag > 0:
-            print(f"    FFT correction: dy={shift_yx[0]:.2f} dx={shift_yx[1]:.2f} (mag={shift_mag:.2f}px)")
-            affine = affine_fft
-            print("    FFT refinement applied")
-    except Exception as e:
-        print(f"    FFT refinement failed: {e}")
-
-    registered_f = warp_image_with_transform(
-        source_img,
-        affine,
-        reference_img.shape[:2],
-        order=1,
+    elapsed = time.perf_counter() - t_start
+    return _finalize_registration(
+        source_img=source_img,
+        reference_img=reference_img,
+        source_mask=mask_src,
+        reference_mask=mask_ref,
+        source_features=feats_src,
+        reference_features=feats_ref,
+        transform=affine,
+        elapsed_seconds=elapsed,
+        diagnostics={
+            "transform_method": robust.method,
+            "inlier_count": int(robust.inlier_count),
+            "match_count": int(len(matches)),
+            "median_inlier_residual": float(robust.median_inlier_residual),
+            "mean_inlier_residual": float(robust.mean_inlier_residual),
+        },
     )
-    if np.issubdtype(source_img.dtype, np.integer):
-        dtype_info = np.iinfo(source_img.dtype)
-        registered = np.clip(np.rint(registered_f), dtype_info.min, dtype_info.max).astype(source_img.dtype)
-    else:
-        registered = registered_f.astype(source_img.dtype, copy=False)
 
-    elapsed = time.perf_counter() - t_start
-    return registered, elapsed
-    print("    ✓ KNN refinement complete")
 
-    # ── 6. Apply warp ────────────────────────────────────────────────────
-    if source_img.ndim == 2:
-        registered = warp(
-            source_img.astype(float),
-            inverse_map=affine.inverse,
-            output_shape=reference_img.shape[:2],
-            preserve_range=True,
-        ).astype(source_img.dtype)
-    elif source_img.ndim == 3:
-        registered = np.zeros(
-            (*reference_img.shape[:2], source_img.shape[2]),
-            dtype=source_img.dtype,
-        )
-        for c in range(source_img.shape[2]):
-            registered[..., c] = warp(
-                source_img[..., c].astype(float),
-                inverse_map=affine.inverse,
-                output_shape=reference_img.shape[:2],
-                preserve_range=True,
-            ).astype(source_img.dtype)
-    else:
-        registered = source_img.copy()
+def get_or_create_segmentation(
+    image_path: Path,
+    segmenter: CellposeSegmenter,
+    cache: dict[Path, SegmentationArtifacts],
+) -> SegmentationArtifacts:
+    if image_path in cache:
+        return cache[image_path]
 
-    # ── 7. FFT phase-correlation refinement ──────────────────────────────
-    #    Correct any residual sub-pixel or small-pixel shift after cell-based
-    #    registration by using intensity-based cross-correlation.
-    ref_f = reference_img.astype(np.float64)
-    reg_f = registered.astype(np.float64)
-    if ref_f.ndim == 3:
-        ref_f = ref_f[..., 0] if ref_f.shape[2] <= 4 else ref_f.mean(axis=-1)
-    if reg_f.ndim == 3:
-        reg_f = reg_f[..., 0] if reg_f.shape[2] <= 4 else reg_f.mean(axis=-1)
-    # Crop to same size for phase correlation
-    h_pc = min(ref_f.shape[0], reg_f.shape[0])
-    w_pc = min(ref_f.shape[1], reg_f.shape[1])
+    image = imread(str(image_path))
+    mask, _, _ = segmenter.segment_array(image)
+    features = compute_cell_features(mask, CellFeaturesConfig())
+    artifacts = SegmentationArtifacts(
+        image_path=image_path,
+        image=image,
+        mask=mask,
+        features=features,
+    )
+    cache[image_path] = artifacts
+    return artifacts
+
+
+# Keep the benchmark entrypoint on the shared runtime implementation used by the
+# unregistration batch exporter so both scripts stay behaviorally aligned.
+DEFAULT_REG_PARAMS = SHARED_DEFAULT_REG_PARAMS
+DEFAULT_OBJECT_EVAL_PARAMS = SHARED_DEFAULT_OBJECT_EVAL_PARAMS
+NAPARI_CORE_IMPORT_ERROR = SHARED_NAPARI_CORE_IMPORT_ERROR
+CellposeConfig = SharedCellposeConfig
+CellposeSegmenter = SharedCellposeSegmenter
+_prepare_torch_runtime = shared_prepare_torch_runtime
+compute_secondary_intensity_metrics = shared_compute_secondary_intensity_metrics
+get_or_create_segmentation = shared_get_or_create_segmentation
+run_registration = shared_run_registration
+
+
+def _fmt_metric(value: Any, precision: int = 4) -> str:
+    if value is None:
+        return "nan"
     try:
-        shift_yx, _error, _phasediff = phase_cross_correlation(
-            ref_f[:h_pc, :w_pc], reg_f[:h_pc, :w_pc],
-            upsample_factor=10,  # sub-pixel precision
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if np.isnan(numeric):
+        return "nan"
+    return f"{numeric:.{precision}f}"
+
+
+def build_results_tables(
+    results: list[BenchmarkResult],
+    object_eval_params: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    main_rows: list[dict[str, Any]] = []
+    secondary_rows: list[dict[str, Any]] = []
+
+    for result in results:
+        row: dict[str, Any] = {
+            "sample_group": result.sample_group,
+            "round_name": result.round_name,
+            "registration_time_sec": result.registration_time_sec,
+            "instance_iou_threshold": object_eval_params["instance_iou_threshold"],
+            "min_valid_instance_area_px": object_eval_params["min_valid_instance_area_px"],
+            "min_valid_fraction": object_eval_params["min_valid_fraction"],
+        }
+        row.update(result.object_metrics)
+        row.update(result.diagnostics)
+        main_rows.append(row)
+
+        if result.secondary_intensity_metrics is not None:
+            secondary_row = {
+                "sample_group": result.sample_group,
+                "round_name": result.round_name,
+                "registration_time_sec": result.registration_time_sec,
+            }
+            secondary_row.update(result.secondary_intensity_metrics)
+            secondary_rows.append(secondary_row)
+
+    main_df = pd.DataFrame(main_rows)
+    secondary_df = pd.DataFrame(secondary_rows) if secondary_rows else None
+    return main_df, secondary_df
+
+
+def write_results_tables(
+    output_dir: Path,
+    main_df: pd.DataFrame,
+    secondary_df: pd.DataFrame | None = None,
+) -> tuple[Path, Path | None]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    main_path = output_dir / "benchmark_results.csv"
+    main_df.to_csv(main_path, index=False)
+
+    secondary_path: Path | None = None
+    if secondary_df is not None:
+        secondary_path = output_dir / "benchmark_secondary_intensity_results.csv"
+        secondary_df.to_csv(secondary_path, index=False)
+
+    return main_path, secondary_path
+
+
+def compute_summary_frame(results_df: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for metric in metrics:
+        series = pd.to_numeric(results_df[metric], errors="coerce")
+        rows.append(
+            {
+                "metric": metric,
+                "median": float(series.median(skipna=True)),
+                "p25": float(series.quantile(0.25)),
+                "p75": float(series.quantile(0.75)),
+                "mean": float(series.mean(skipna=True)),
+            }
         )
-        shift_mag = np.sqrt(shift_yx[0]**2 + shift_yx[1]**2)
-        if shift_mag < 30:  # only apply if reasonable
-            print(f"    FFT correction: dy={shift_yx[0]:.2f} dx={shift_yx[1]:.2f} (mag={shift_mag:.2f}px)")
-            registered = ndi_shift(
-                registered.astype(np.float64), shift_yx, order=3, mode='constant', cval=0
-            ).astype(source_img.dtype)
-            print("    ✓ FFT refinement applied")
-        else:
-            print(f"    FFT shift too large ({shift_mag:.1f}px), skipping")
-    except Exception as e:
-        print(f"    ⚠ FFT refinement failed: {e}")
-
-    elapsed = time.perf_counter() - t_start
-    return registered, elapsed
+    return pd.DataFrame(rows)
 
 
-# ── Visualization ─────────────────────────────────────────────────────────────
-def to_2d_gray(img: np.ndarray) -> np.ndarray:
-    """Convert image to 2D grayscale for metric computation.
-    
-    For channels-first (C, H, W): use LAST channel (= DAPI / ch5).
-    For channels-last (H, W, C): use LAST channel.
-    """
-    if img.ndim == 2:
-        return img
-    if img.ndim == 3:
-        # Detect channels-first (C, H, W) vs channels-last (H, W, C)
-        if img.shape[0] <= 10 and img.shape[1] > 10 and img.shape[2] > 10:
-            return img[-1]  # last channel = DAPI (channel 5)
-        if img.shape[2] <= 4:
-            return img[..., -1]  # last channel
-        # Otherwise treat as z-stack, max project
-        return np.max(img, axis=0)
-    return img
-
-
-def align_images_for_comparison(
-    registered: np.ndarray, ground_truth: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Crop both images to their common overlapping region (no interpolation)."""
-    reg_2d = to_2d_gray(registered)
-    gt_2d = to_2d_gray(ground_truth)
-    h = min(reg_2d.shape[0], gt_2d.shape[0])
-    w = min(reg_2d.shape[1], gt_2d.shape[1])
-    return reg_2d[:h, :w].astype(np.float64), gt_2d[:h, :w].astype(np.float64)
-
-
-def plot_metrics_bar_chart(results_df: pd.DataFrame, output_path: Path) -> None:
-    """Create bar charts for each metric across all pairs."""
-    metrics_cols = ["PSNR", "SSIM", "MSE", "NRMSE", "NCC", "MI"]
-    n_metrics = len(metrics_cols)
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle("Registration Quality Metrics", fontsize=16, fontweight="bold")
-
+def plot_object_metric_panels(results_df: pd.DataFrame, output_path: Path) -> None:
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    axes_flat = axes.ravel()
+    labels = [f"G{row['sample_group']}-{row['round_name']}->B" for _, row in results_df.iterrows()]
     colors = plt.cm.Set2(np.linspace(0, 1, len(results_df)))
 
-    for idx, metric in enumerate(metrics_cols):
-        ax = axes[idx // 3, idx % 3]
-        labels = [f"G{r['sample_group']}-{r['round_name']}→B" for _, r in results_df.iterrows()]
-        values = results_df[metric].values
-
-        bars = ax.bar(range(len(values)), values, color=colors, edgecolor="gray", linewidth=0.5)
+    for index, metric in enumerate(OBJECT_PLOT_METRICS):
+        ax = axes_flat[index]
+        values = pd.to_numeric(results_df[metric], errors="coerce").to_numpy(dtype=float)
+        bars = ax.bar(range(len(values)), np.nan_to_num(values, nan=0.0), color=colors, edgecolor="gray", linewidth=0.5)
         ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-        ax.set_title(metric, fontsize=13, fontweight="bold")
-        ax.set_ylabel(metric)
+        ax.set_title(metric, fontsize=12, fontweight="bold")
         ax.grid(axis="y", alpha=0.3)
-
-        # Add value labels on bars
-        for bar, val in zip(bars, values):
+        for bar, value in zip(bars, values):
+            label = "nan" if np.isnan(value) else f"{value:.3f}"
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
                 bar.get_height(),
-                f"{val:.3f}" if abs(val) < 1000 else f"{val:.1f}",
-                ha="center", va="bottom", fontsize=7,
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=7,
             )
+
+    summary_metrics = compute_summary_frame(results_df, OBJECT_PLOT_METRICS)
+    ax = axes_flat[-1]
+    ax.axis("off")
+    lines = [
+        f"{row.metric}: median={row.median:.3f}, p25={row.p25:.3f}, p75={row.p75:.3f}, mean={row.mean:.3f}"
+        for row in summary_metrics.itertuples(index=False)
+    ]
+    ax.text(0.0, 1.0, "\n".join(lines), va="top", ha="left", family="monospace", fontsize=10)
 
     plt.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ Saved metrics bar chart: {output_path.name}")
 
 
-def plot_heatmap(results_df: pd.DataFrame, output_path: Path) -> None:
-    """Create a heatmap of all metrics for each pair."""
-    metrics_cols = ["PSNR", "SSIM", "MSE", "NRMSE", "NCC", "MI"]
-    labels = [f"G{r['sample_group']}-{r['round_name']}→B" for _, r in results_df.iterrows()]
+def plot_object_heatmap(results_df: pd.DataFrame, output_path: Path) -> None:
+    metrics = OBJECT_PLOT_METRICS
+    labels = [f"G{row['sample_group']}-{row['round_name']}->B" for _, row in results_df.iterrows()]
+    data = results_df[metrics].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
 
-    # Normalize each metric to [0,1] for heatmap
-    data = results_df[metrics_cols].values.astype(float)
     data_normalized = np.zeros_like(data)
-    for j in range(data.shape[1]):
-        col = data[:, j]
-        rng = col.max() - col.min()
-        if rng > 1e-10:
-            data_normalized[:, j] = (col - col.min()) / rng
+    for column_index in range(data.shape[1]):
+        column = data[:, column_index]
+        finite = np.isfinite(column)
+        if not np.any(finite):
+            continue
+        col_min = np.nanmin(column)
+        col_max = np.nanmax(column)
+        if abs(col_max - col_min) < 1e-10:
+            data_normalized[:, column_index] = 0.5
         else:
-            data_normalized[:, j] = 0.5
+            data_normalized[:, column_index] = (np.nan_to_num(column, nan=col_min) - col_min) / (col_max - col_min)
 
     fig, ax = plt.subplots(figsize=(10, max(4, len(labels) * 0.5 + 2)))
     im = ax.imshow(data_normalized, cmap="YlGnBu", aspect="auto")
-
-    ax.set_xticks(range(len(metrics_cols)))
-    ax.set_xticklabels(metrics_cols, fontsize=11)
+    ax.set_xticks(range(len(metrics)))
+    ax.set_xticklabels(metrics, fontsize=10, rotation=20, ha="right")
     ax.set_yticks(range(len(labels)))
     ax.set_yticklabels(labels, fontsize=10)
 
-    # Annotate with actual values
     for i in range(len(labels)):
-        for j in range(len(metrics_cols)):
-            val = data[i, j]
-            text = f"{val:.3f}" if abs(val) < 1000 else f"{val:.1f}"
-            ax.text(j, i, text, ha="center", va="center", fontsize=8,
-                    color="white" if data_normalized[i, j] > 0.6 else "black")
+        for j in range(len(metrics)):
+            value = data[i, j]
+            text = "nan" if np.isnan(value) else f"{value:.3f}"
+            ax.text(
+                j,
+                i,
+                text,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="white" if data_normalized[i, j] > 0.6 else "black",
+            )
 
-    ax.set_title("Registration Quality Heatmap (normalized)", fontsize=14, fontweight="bold")
+    ax.set_title("Object-Level Registration Metrics", fontsize=14, fontweight="bold")
     plt.colorbar(im, ax=ax, shrink=0.8, label="Normalized value")
     plt.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ Saved heatmap: {output_path.name}")
-
-
-def plot_difference_maps(
-    pair: ImagePair,
-    registered: np.ndarray,
-    ground_truth: np.ndarray,
-    output_path: Path,
-) -> None:
-    """Create side-by-side difference visualization."""
-    reg_2d, gt_2d = align_images_for_comparison(registered, ground_truth)
-    diff = np.abs(reg_2d - gt_2d)
-
-    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
-    title = f"Group {pair.sample_group} - Round {pair.round_name}→B"
-    fig.suptitle(title, fontsize=14, fontweight="bold")
-
-    # Source (unregistered)
-    src_img = imread(str(pair.source_path))
-    src_2d = to_2d_gray(src_img).astype(np.float64)
-    axes[0].imshow(src_2d, cmap="gray")
-    axes[0].set_title("Source (Unregistered)", fontsize=11)
-    axes[0].axis("off")
-
-    # Registered by our pipeline
-    axes[1].imshow(reg_2d, cmap="gray")
-    axes[1].set_title("Our Registration", fontsize=11)
-    axes[1].axis("off")
-
-    # Ground truth
-    axes[2].imshow(gt_2d, cmap="gray")
-    axes[2].set_title("Ground Truth", fontsize=11)
-    axes[2].axis("off")
-
-    # Difference map
-    im = axes[3].imshow(diff, cmap="hot")
-    axes[3].set_title("Difference (|Ours - GT|)", fontsize=11)
-    axes[3].axis("off")
-    plt.colorbar(im, ax=axes[3], shrink=0.8)
-
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
 
 
 def plot_timing_chart(results_df: pd.DataFrame, output_path: Path) -> None:
-    """Create a bar chart showing registration time per pair."""
     fig, ax = plt.subplots(figsize=(12, 5))
-    labels = [f"G{r['sample_group']}-{r['round_name']}→B" for _, r in results_df.iterrows()]
-    times = results_df["registration_time_sec"].values
-
+    labels = [f"G{row['sample_group']}-{row['round_name']}->B" for _, row in results_df.iterrows()]
+    times = pd.to_numeric(results_df["registration_time_sec"], errors="coerce").to_numpy(dtype=float)
     colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(times)))
-    bars = ax.bar(range(len(times)), times, color=colors, edgecolor="gray", linewidth=0.5)
+    bars = ax.bar(range(len(times)), np.nan_to_num(times, nan=0.0), color=colors, edgecolor="gray", linewidth=0.5)
 
-    for bar, t in zip(bars, times):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{t:.1f}s",
-            ha="center", va="bottom", fontsize=9,
-        )
+    for bar, value in zip(bars, times):
+        label = "nan" if np.isnan(value) else f"{value:.1f}s"
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), label, ha="center", va="bottom", fontsize=9)
 
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Time (seconds)")
     ax.set_title("Registration Time per Image Pair", fontsize=14, fontweight="bold")
     ax.grid(axis="y", alpha=0.3)
-
-    # Add average line
-    avg_time = times.mean()
-    ax.axhline(avg_time, color="red", linestyle="--", alpha=0.7, label=f"Average: {avg_time:.1f}s")
-    ax.legend()
+    avg_time = float(np.nanmean(times)) if len(times) else float("nan")
+    if np.isfinite(avg_time):
+        ax.axhline(avg_time, color="red", linestyle="--", alpha=0.7, label=f"Mean: {avg_time:.1f}s")
+        ax.legend()
 
     plt.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ Saved timing chart: {output_path.name}")
 
 
-def plot_group_comparison(results_df: pd.DataFrame, output_path: Path) -> None:
-    """Create grouped bar chart comparing metrics across sample groups."""
-    metrics = ["PSNR", "SSIM", "NCC"]
-    groups = sorted(results_df["sample_group"].unique())
-    n_groups = len(groups)
+def plot_secondary_intensity_panels(results_df: pd.DataFrame, output_path: Path) -> None:
+    metrics = ["SSIM", "NCC", "MI", "PSNR"]
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes_flat = axes.ravel()
+    labels = [f"G{row['sample_group']}-{row['round_name']}->B" for _, row in results_df.iterrows()]
+    colors = plt.cm.Accent(np.linspace(0, 1, len(results_df)))
 
-    fig, axes = plt.subplots(1, len(metrics), figsize=(6 * len(metrics), 5))
-    fig.suptitle("Metrics Comparison by Sample Group", fontsize=15, fontweight="bold")
-
-    group_colors = plt.cm.tab10(np.linspace(0, 0.3, n_groups))
-
-    for mi, metric in enumerate(metrics):
-        ax = axes[mi]
-        x = np.arange(len(ROUNDS))
-        width = 0.8 / n_groups
-
-        for gi, group in enumerate(groups):
-            group_data = results_df[results_df["sample_group"] == group]
-            vals = []
-            for rnd in ROUNDS:
-                row = group_data[group_data["round_name"] == rnd]
-                vals.append(row[metric].values[0] if len(row) > 0 else 0)
-            bars = ax.bar(x + gi * width, vals, width, label=f"Group {group}",
-                         color=group_colors[gi], edgecolor="gray", linewidth=0.5)
-
-        ax.set_xticks(x + width * (n_groups - 1) / 2)
-        ax.set_xticklabels([f"{r}→B" for r in ROUNDS])
-        ax.set_title(metric, fontsize=13, fontweight="bold")
-        ax.set_ylabel(metric)
-        ax.legend()
+    for index, metric in enumerate(metrics):
+        ax = axes_flat[index]
+        values = pd.to_numeric(results_df[metric], errors="coerce").to_numpy(dtype=float)
+        ax.bar(range(len(values)), np.nan_to_num(values, nan=0.0), color=colors, edgecolor="gray", linewidth=0.5)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax.set_title(metric, fontsize=12, fontweight="bold")
         ax.grid(axis="y", alpha=0.3)
 
     plt.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ Saved group comparison: {output_path.name}")
 
 
-# ── Main benchmark runner ─────────────────────────────────────────────────────
 def _parse_int_list(value: str) -> list[int]:
     parts = [item.strip() for item in value.split(",") if item.strip()]
     if not parts:
@@ -774,20 +869,18 @@ def _parse_round_list(value: str) -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the cell-registration benchmark.")
+    parser = argparse.ArgumentParser(description="Run the object-level cell-registration benchmark.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--sample-groups", type=_parse_int_list, default=None, help="Comma-separated sample groups.")
     parser.add_argument("--rounds", type=_parse_round_list, default=None, help="Comma-separated rounds, e.g. A,C,D,E.")
+    parser.add_argument("--feature-weight", type=float, default=DEFAULT_REG_PARAMS["feature_weight"])
+    parser.add_argument("--topology-weight", type=float, default=DEFAULT_REG_PARAMS["topology_weight"])
     parser.add_argument("--position-weight", type=float, default=DEFAULT_REG_PARAMS["position_weight"])
     parser.add_argument("--distance-threshold", type=float, default=DEFAULT_REG_PARAMS["distance_threshold"])
     parser.add_argument("--spatial-window-size", type=float, default=DEFAULT_REG_PARAMS["spatial_window_size"])
     parser.add_argument("--top-k", type=int, default=DEFAULT_REG_PARAMS["top_k"])
     parser.add_argument("--cellpose-diameter", type=float, default=DEFAULT_REG_PARAMS["cellpose_diameter"])
-    parser.add_argument(
-        "--cellpose-flow-threshold",
-        type=float,
-        default=DEFAULT_REG_PARAMS["cellpose_flow_threshold"],
-    )
+    parser.add_argument("--cellpose-flow-threshold", type=float, default=DEFAULT_REG_PARAMS["cellpose_flow_threshold"])
     parser.add_argument(
         "--cellpose-cellprob-threshold",
         type=float,
@@ -800,6 +893,54 @@ def parse_args() -> argparse.Namespace:
         "--coarse-distance-threshold",
         type=float,
         default=DEFAULT_REG_PARAMS["coarse_distance_threshold"],
+    )
+    parser.add_argument(
+        "--coarse-matching-mode",
+        choices=("global", "patch"),
+        default=DEFAULT_REG_PARAMS["coarse_matching_mode"],
+        help="Matcher used only during coarse matching before offset estimation.",
+    )
+    parser.add_argument(
+        "--coarse-patch-rows",
+        type=int,
+        default=DEFAULT_REG_PARAMS["coarse_patch_rows"],
+    )
+    parser.add_argument(
+        "--coarse-patch-cols",
+        type=int,
+        default=DEFAULT_REG_PARAMS["coarse_patch_cols"],
+    )
+    parser.add_argument(
+        "--coarse-patch-top-k-per-patch",
+        type=int,
+        default=DEFAULT_REG_PARAMS["coarse_patch_top_k_per_patch"],
+        help="Optional per-patch cap for coarse patch matching; <=0 falls back to automatic allocation.",
+    )
+    parser.add_argument(
+        "--coarse-image-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_REG_PARAMS["coarse_image_enabled"],
+        help="Run image-level coarse rigid initialization before cell matching.",
+    )
+    parser.add_argument(
+        "--coarse-image-target-max-dim",
+        type=int,
+        default=DEFAULT_REG_PARAMS["coarse_image_target_max_dim"],
+    )
+    parser.add_argument(
+        "--coarse-image-crop-ratio",
+        type=float,
+        default=DEFAULT_REG_PARAMS["coarse_image_crop_ratio"],
+    )
+    parser.add_argument(
+        "--coarse-image-upsample-factor",
+        type=int,
+        default=DEFAULT_REG_PARAMS["coarse_image_upsample_factor"],
+    )
+    parser.add_argument(
+        "--coarse-image-min-score",
+        type=float,
+        default=DEFAULT_REG_PARAMS["coarse_image_min_score"],
     )
     parser.add_argument("--neighbor-k", type=int, default=DEFAULT_REG_PARAMS["neighbor_k"])
     parser.add_argument("--neighbor-weight", type=float, default=DEFAULT_REG_PARAMS["neighbor_weight"])
@@ -819,6 +960,61 @@ def parse_args() -> argparse.Namespace:
         help="Cap (pixels) for guided rematch spatial window. <=0 disables capping.",
     )
     parser.add_argument(
+        "--guided-top-k",
+        type=int,
+        default=DEFAULT_REG_PARAMS["guided_top_k"],
+        help="Optional top-k cap used only during guided rematch; <=0 falls back to --top-k.",
+    )
+    parser.add_argument(
+        "--guided-distance-relaxation",
+        type=float,
+        default=DEFAULT_REG_PARAMS["guided_distance_relaxation"],
+        help="Extra distance threshold slack added only during guided rematch.",
+    )
+    parser.add_argument(
+        "--guided-matching-mode",
+        choices=("global", "patch"),
+        default=DEFAULT_REG_PARAMS["guided_matching_mode"],
+        help="Matcher used during guided rematch only.",
+    )
+    parser.add_argument(
+        "--guided-patch-rows",
+        type=int,
+        default=DEFAULT_REG_PARAMS["guided_patch_rows"],
+    )
+    parser.add_argument(
+        "--guided-patch-cols",
+        type=int,
+        default=DEFAULT_REG_PARAMS["guided_patch_cols"],
+    )
+    parser.add_argument(
+        "--guided-patch-top-k-per-patch",
+        type=int,
+        default=DEFAULT_REG_PARAMS["guided_patch_top_k_per_patch"],
+        help="Optional per-patch cap for guided patch matching; <=0 falls back to automatic allocation.",
+    )
+    parser.add_argument(
+        "--guided-residual-clip-mad-factor",
+        type=float,
+        default=DEFAULT_REG_PARAMS["guided_residual_clip_mad_factor"],
+        help="MAD multiplier used to clip high guided inlier residuals before refit; <=0 disables.",
+    )
+    parser.add_argument(
+        "--guided-residual-clip-min-inliers",
+        type=int,
+        default=DEFAULT_REG_PARAMS["guided_residual_clip_min_inliers"],
+    )
+    parser.add_argument(
+        "--guided-residual-clip-max-drop-fraction",
+        type=float,
+        default=DEFAULT_REG_PARAMS["guided_residual_clip_max_drop_fraction"],
+    )
+    parser.add_argument(
+        "--guided-residual-clip-min-median-gain-px",
+        type=float,
+        default=DEFAULT_REG_PARAMS["guided_residual_clip_min_median_gain_px"],
+    )
+    parser.add_argument(
         "--validation-min-confidence",
         type=float,
         default=DEFAULT_REG_PARAMS["validation_min_confidence"],
@@ -828,7 +1024,41 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_REG_PARAMS["validation_max_feature_diff"],
     )
-    parser.add_argument("--prefer-affine", action=argparse.BooleanOptionalAction, default=DEFAULT_REG_PARAMS["prefer_affine"])
+    parser.add_argument(
+        "--validation-neighbor-k",
+        type=int,
+        default=DEFAULT_REG_PARAMS["validation_neighbor_k"],
+        help="Matched-neighbor profile size used for local geometry validation; <=0 disables.",
+    )
+    parser.add_argument(
+        "--validation-max-neighbor-profile-diff",
+        type=float,
+        default=DEFAULT_REG_PARAMS["validation_max_neighbor_profile_diff"],
+        help="Maximum median relative difference allowed between local matched-neighbor distance profiles.",
+    )
+    parser.add_argument(
+        "--validation-ambiguity-ratio",
+        type=float,
+        default=DEFAULT_REG_PARAMS["validation_ambiguity_ratio"],
+        help="Maximum allowed ratio between a chosen match distance and its next-best feasible alternative; <=0 disables.",
+    )
+    parser.add_argument(
+        "--validation-ambiguity-min-gap",
+        type=float,
+        default=DEFAULT_REG_PARAMS["validation_ambiguity_min_gap"],
+        help="Minimum distance gap required against the next-best feasible alternative; <=0 disables.",
+    )
+    parser.add_argument(
+        "--allow-scale",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_REG_PARAMS["allow_scale"],
+        help="Allow similarity-scale estimation instead of rigid rotation+translation only.",
+    )
+    parser.add_argument(
+        "--prefer-affine",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_REG_PARAMS["prefer_affine"],
+    )
     parser.add_argument("--ransac-max-trials", type=int, default=DEFAULT_REG_PARAMS["ransac_max_trials"])
     parser.add_argument("--ransac-residual-threshold", type=float, default=DEFAULT_REG_PARAMS["ransac_residual_threshold"])
     parser.add_argument(
@@ -836,24 +1066,70 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_REG_PARAMS["similarity_residual_threshold"],
     )
-    parser.add_argument("--fft-upsample-factor", type=int, default=DEFAULT_REG_PARAMS["fft_upsample_factor"])
-    parser.add_argument("--fft-max-shift", type=float, default=DEFAULT_REG_PARAMS["fft_max_shift"])
-    parser.add_argument("--fft-crop-ratio", type=float, default=DEFAULT_REG_PARAMS["fft_crop_ratio"])
-    parser.add_argument("--fft-max-iterations", type=int, default=DEFAULT_REG_PARAMS["fft_max_iterations"])
+    parser.add_argument(
+        "--instance-iou-threshold",
+        type=float,
+        default=DEFAULT_OBJECT_EVAL_PARAMS["instance_iou_threshold"],
+    )
+    parser.add_argument(
+        "--min-valid-instance-area-px",
+        type=int,
+        default=DEFAULT_OBJECT_EVAL_PARAMS["min_valid_instance_area_px"],
+    )
+    parser.add_argument(
+        "--min-valid-fraction",
+        type=float,
+        default=DEFAULT_OBJECT_EVAL_PARAMS["min_valid_fraction"],
+    )
+    parser.add_argument("--save-plots", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--save-registered-images", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--save-diagnostics", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--save-match-tables", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--secondary-intensity-eval", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 
-def main():
-    global OUTPUT_DIR, SAMPLE_GROUPS, ROUNDS, REG_PARAMS
+def _save_diagnostic_manifest(
+    output_path: Path,
+    pair: ImagePair,
+    object_metrics: dict[str, float],
+    diagnostics: dict[str, object],
+    object_eval_params: dict[str, Any],
+    secondary_intensity_metrics: dict[str, float] | None,
+) -> None:
+    payload = {
+        "sample_group": pair.sample_group,
+        "round_name": pair.round_name,
+        "source_path": str(pair.source_path),
+        "reference_path": str(pair.reference_path),
+        "comparison_path": str(pair.comparison_path) if pair.comparison_path is not None else None,
+        "object_eval_params": object_eval_params,
+        "object_metrics": object_metrics,
+        "secondary_intensity_metrics": secondary_intensity_metrics,
+        "diagnostics": diagnostics,
+    }
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def main() -> None:
     args = parse_args()
-    OUTPUT_DIR = args.output_dir.resolve()
-    SAMPLE_GROUPS = args.sample_groups or [1, 2, 3]
-    ROUNDS = args.rounds or ["A", "C", "D", "E"]
-    REG_PARAMS = {
+    _prepare_torch_runtime()
+    if NAPARI_CORE_IMPORT_ERROR is not None:
+        raise ImportError(
+            "Benchmark runtime dependencies are missing. Install cellpose and related registration dependencies."
+        ) from NAPARI_CORE_IMPORT_ERROR
+
+    output_dir = args.output_dir.resolve()
+    sample_groups = args.sample_groups or DEFAULT_SAMPLE_GROUPS
+    rounds = args.rounds or DEFAULT_ROUNDS
+    reg_params = {
         "cellpose_diameter": args.cellpose_diameter,
         "cellpose_flow_threshold": args.cellpose_flow_threshold,
         "cellpose_cellprob_threshold": args.cellpose_cellprob_threshold,
         "cellpose_min_size": args.cellpose_min_size,
+        "feature_weight": args.feature_weight,
+        "topology_weight": args.topology_weight,
         "position_weight": args.position_weight,
         "distance_threshold": args.distance_threshold,
         "spatial_window_size": args.spatial_window_size,
@@ -861,6 +1137,15 @@ def main():
         "min_cells_for_two_stage": args.min_cells_for_two_stage,
         "coarse_top_k": args.coarse_top_k,
         "coarse_distance_threshold": args.coarse_distance_threshold,
+        "coarse_matching_mode": args.coarse_matching_mode,
+        "coarse_patch_rows": args.coarse_patch_rows,
+        "coarse_patch_cols": args.coarse_patch_cols,
+        "coarse_patch_top_k_per_patch": args.coarse_patch_top_k_per_patch,
+        "coarse_image_enabled": args.coarse_image_enabled,
+        "coarse_image_target_max_dim": args.coarse_image_target_max_dim,
+        "coarse_image_crop_ratio": args.coarse_image_crop_ratio,
+        "coarse_image_upsample_factor": args.coarse_image_upsample_factor,
+        "coarse_image_min_score": args.coarse_image_min_score,
         "neighbor_k": args.neighbor_k,
         "neighbor_weight": args.neighbor_weight,
         "landmark_weight": args.landmark_weight,
@@ -869,138 +1154,223 @@ def main():
         "max_scale_change": args.max_scale_change,
         "guided_min_position_weight": args.guided_min_position_weight,
         "guided_spatial_window_cap": args.guided_spatial_window_cap,
+        "guided_top_k": args.guided_top_k,
+        "guided_distance_relaxation": args.guided_distance_relaxation,
+        "guided_matching_mode": args.guided_matching_mode,
+        "guided_patch_rows": args.guided_patch_rows,
+        "guided_patch_cols": args.guided_patch_cols,
+        "guided_patch_top_k_per_patch": args.guided_patch_top_k_per_patch,
+        "guided_residual_clip_mad_factor": args.guided_residual_clip_mad_factor,
+        "guided_residual_clip_min_inliers": args.guided_residual_clip_min_inliers,
+        "guided_residual_clip_max_drop_fraction": args.guided_residual_clip_max_drop_fraction,
+        "guided_residual_clip_min_median_gain_px": args.guided_residual_clip_min_median_gain_px,
         "validation_min_confidence": args.validation_min_confidence,
         "validation_max_feature_diff": args.validation_max_feature_diff,
-        "prefer_affine": args.prefer_affine,
+        "validation_neighbor_k": args.validation_neighbor_k,
+        "validation_max_neighbor_profile_diff": args.validation_max_neighbor_profile_diff,
+        "validation_ambiguity_ratio": args.validation_ambiguity_ratio,
+        "validation_ambiguity_min_gap": args.validation_ambiguity_min_gap,
+        "allow_scale": args.allow_scale,
+        "prefer_affine": bool(args.allow_scale and args.prefer_affine),
         "ransac_max_trials": args.ransac_max_trials,
         "ransac_residual_threshold": args.ransac_residual_threshold,
         "similarity_residual_threshold": args.similarity_residual_threshold,
-        "fft_upsample_factor": args.fft_upsample_factor,
-        "fft_max_shift": args.fft_max_shift,
-        "fft_crop_ratio": args.fft_crop_ratio,
-        "fft_max_iterations": args.fft_max_iterations,
     }
+    object_eval_params = {
+        "instance_iou_threshold": args.instance_iou_threshold,
+        "min_valid_instance_area_px": args.min_valid_instance_area_px,
+        "min_valid_fraction": args.min_valid_fraction,
+    }
+
+    if args.prefer_affine and not args.allow_scale:
+        print("  Note: --prefer-affine ignored because --allow-scale is disabled.")
+
     print("=" * 70)
-    print("  Cell Registration Benchmark")
+    print("  Cell Registration Object-Level Benchmark")
     print("=" * 70)
 
-    # Create output directory
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    params_path = OUTPUT_DIR / "benchmark_params.json"
-    with open(params_path, "w", encoding="utf-8") as f:
-        json.dump({"sample_groups": SAMPLE_GROUPS, "rounds": ROUNDS, "reg_params": REG_PARAMS}, f, indent=2)
-    print(f"  Output dir: {OUTPUT_DIR}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    params_path = output_dir / "benchmark_params.json"
+    with open(params_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "sample_groups": sample_groups,
+                "rounds": rounds,
+                "reg_params": reg_params,
+                "object_eval_params": object_eval_params,
+                "secondary_intensity_eval": bool(args.secondary_intensity_eval),
+            },
+            handle,
+            indent=2,
+        )
+    print(f"  Output dir: {output_dir}")
     print(f"  Params saved to: {params_path.name}")
-    print(f"  REG_PARAMS: {json.dumps(REG_PARAMS, indent=2)}")
 
-    # Discover pairs
     print("\n[1/5] Discovering image pairs...")
-    pairs = discover_image_pairs()
+    pairs = discover_image_pairs(
+        sample_groups,
+        rounds,
+        require_secondary_comparison=bool(args.secondary_intensity_eval),
+    )
     print(f"  Found {len(pairs)} registration pairs")
-    for p in pairs:
-        print(f"    Group {p.sample_group}: {p.round_name}→B  |  src: {p.source_path.name}")
-
+    for pair in pairs:
+        print(f"    Group {pair.sample_group}: {pair.round_name} -> B | src: {pair.source_path.name}")
     if not pairs:
-        print("  ✗ No image pairs found. Check directory structure.")
+        print("  No image pairs found. Check directory structure.")
         return
 
-    # Initialize segmenter (once, to avoid re-loading model)
     print("\n[2/5] Initializing Cellpose-SAM segmenter (GPU=True)...")
-    cellpose_config = CellposeConfig(
-        gpu=True,
-        pretrained_model="cpsam",
-        diameter=REG_PARAMS["cellpose_diameter"],
-        flow_threshold=REG_PARAMS["cellpose_flow_threshold"],
-        cellprob_threshold=REG_PARAMS["cellpose_cellprob_threshold"],
-        min_size=REG_PARAMS["cellpose_min_size"],
+    segmenter = CellposeSegmenter(
+        CellposeConfig(
+            gpu=True,
+            pretrained_model="cpsam",
+            diameter=reg_params["cellpose_diameter"],
+            flow_threshold=reg_params["cellpose_flow_threshold"],
+            cellprob_threshold=reg_params["cellpose_cellprob_threshold"],
+            min_size=reg_params["cellpose_min_size"],
+        )
     )
-    segmenter = CellposeSegmenter(cellpose_config)
-    print("  ✓ Segmenter ready")
+    print("  Segmenter ready")
 
-    # Run registrations
+    segmentation_cache: dict[Path, SegmentationArtifacts] = {}
+    results: list[BenchmarkResult] = []
+
     print("\n[3/5] Running registrations...")
-    results: List[BenchmarkResult] = []
-
-    for i, pair in enumerate(pairs):
-        label = f"Group {pair.sample_group} - {pair.round_name}→B"
-        print(f"\n  [{i+1}/{len(pairs)}] {label}")
+    for index, pair in enumerate(pairs, start=1):
+        print(f"\n  [{index}/{len(pairs)}] Group {pair.sample_group} - {pair.round_name} -> B")
         print(f"    Source:    {pair.source_path.name}")
         print(f"    Reference: {pair.reference_path.name}")
+        if pair.comparison_path is not None:
+            print(f"    Secondary: {pair.comparison_path.name} [channel 5]")
 
-        # Load images
-        source_img = imread(str(pair.source_path))
-        reference_img = imread(str(pair.reference_path))
-        print(f"    Image shapes: source={source_img.shape}, reference={reference_img.shape}")
+        source_artifacts = get_or_create_segmentation(pair.source_path, segmenter, segmentation_cache)
+        reference_artifacts = get_or_create_segmentation(pair.reference_path, segmenter, segmentation_cache)
+        print(
+            "    Image shapes: "
+            f"source={source_artifacts.image.shape}, reference={reference_artifacts.image.shape}"
+        )
 
-        # Run registration (timed)
-        registered, elapsed = run_registration(source_img, reference_img, segmenter)
-        print(f"    ⏱ Registration time: {elapsed:.2f}s")
+        registration = run_registration(source_artifacts, reference_artifacts, reg_params)
+        print(f"    Registration time: {registration.elapsed_seconds:.2f}s")
 
-        # Save registered image
-        reg_output_path = OUTPUT_DIR / f"registered_G{pair.sample_group}_{pair.round_name}_to_B.tif"
-        imwrite(str(reg_output_path), registered)
+        object_metrics_result = compute_object_registration_metrics(
+            moving_mask=registration.moving_mask,
+            fixed_mask=registration.fixed_mask,
+            moving_features=registration.moving_features,
+            fixed_features=registration.fixed_features,
+            transform=registration.transform,
+            valid_mask=registration.valid_mask,
+            instance_iou_threshold=object_eval_params["instance_iou_threshold"],
+            min_valid_instance_area_px=object_eval_params["min_valid_instance_area_px"],
+            min_valid_fraction=object_eval_params["min_valid_fraction"],
+            return_match_table=bool(args.save_match_tables),
+        )
+        if args.save_match_tables:
+            object_metrics, match_table = object_metrics_result  # type: ignore[misc]
+        else:
+            object_metrics = object_metrics_result  # type: ignore[assignment]
+            match_table = None
 
-        # Load ground truth and compute metrics
-        gt_img = imread(str(pair.ground_truth_path))
-        reg_aligned, gt_aligned = align_images_for_comparison(registered, gt_img)
-        metrics = compute_all_metrics(reg_aligned, gt_aligned)
+        print(
+            "    Object metrics: "
+            f"match_f1={_fmt_metric(object_metrics['match_f1'])} | "
+            f"matched_mean_iou={_fmt_metric(object_metrics['matched_mean_iou'])} | "
+            f"centroid_median={_fmt_metric(object_metrics['centroid_error_median_px'])} | "
+            f"mask_dice={_fmt_metric(object_metrics['mask_dice'])}"
+        )
 
-        print(f"    Metrics: PSNR={metrics['PSNR']:.2f} | SSIM={metrics['SSIM']:.4f} | NCC={metrics['NCC']:.4f}")
+        secondary_intensity_metrics: dict[str, float] | None = None
+        if args.secondary_intensity_eval:
+            if pair.comparison_path is None:
+                raise ValueError("secondary_intensity_eval is enabled but comparison_path is missing.")
+            reference_b_ch5 = load_b_reference_channel5(pair.comparison_path)
+            secondary_intensity_metrics = compute_secondary_intensity_metrics(
+                registration.registered_image,
+                reference_b_ch5,
+                valid_mask=registration.valid_mask,
+            )
+            print(
+                "    Secondary intensity: "
+                f"SSIM={_fmt_metric(secondary_intensity_metrics['SSIM'])} | "
+                f"MI={_fmt_metric(secondary_intensity_metrics['MI'])} | "
+                f"overlap={_fmt_metric(secondary_intensity_metrics['valid_overlap_ratio'])}"
+            )
 
-        results.append(BenchmarkResult(
-            sample_group=pair.sample_group,
-            round_name=pair.round_name,
-            registration_time_sec=elapsed,
-            metrics=metrics,
-            registered_image=registered,
-        ))
+        if args.save_registered_images:
+            reg_output_path = output_dir / f"registered_G{pair.sample_group}_{pair.round_name}_to_B.tif"
+            imwrite(str(reg_output_path), registration.registered_image)
 
-    # Build results DataFrame
-    print("\n[4/5] Generating visualizations and reports...")
-    rows = []
-    for r in results:
-        row = {
-            "sample_group": r.sample_group,
-            "round_name": r.round_name,
-            "registration_time_sec": r.registration_time_sec,
-        }
-        row.update(r.metrics)
-        rows.append(row)
-    results_df = pd.DataFrame(rows)
+        if match_table is not None:
+            match_table_path = output_dir / f"matches_G{pair.sample_group}_{pair.round_name}_to_B.csv"
+            match_table.to_csv(match_table_path, index=False)
 
-    # Save CSV
-    csv_path = OUTPUT_DIR / "benchmark_results.csv"
-    results_df.to_csv(csv_path, index=False)
-    print(f"  ✓ Saved results CSV: {csv_path.name}")
+        if args.save_diagnostics:
+            diag_path = output_dir / f"diagnostic_G{pair.sample_group}_{pair.round_name}_to_B.json"
+            _save_diagnostic_manifest(
+                diag_path,
+                pair,
+                object_metrics=object_metrics,
+                diagnostics=registration.diagnostics,
+                object_eval_params=object_eval_params,
+                secondary_intensity_metrics=secondary_intensity_metrics,
+            )
 
-    # Generate visualizations
-    plot_metrics_bar_chart(results_df, OUTPUT_DIR / "metrics_bar_chart.png")
-    plot_heatmap(results_df, OUTPUT_DIR / "metrics_heatmap.png")
-    plot_timing_chart(results_df, OUTPUT_DIR / "timing_chart.png")
-    plot_group_comparison(results_df, OUTPUT_DIR / "group_comparison.png")
+        results.append(
+            BenchmarkResult(
+                sample_group=pair.sample_group,
+                round_name=pair.round_name,
+                registration_time_sec=registration.elapsed_seconds,
+                object_metrics=object_metrics,
+                diagnostics=registration.diagnostics,
+                secondary_intensity_metrics=secondary_intensity_metrics,
+                registered_image=registration.registered_image if (args.save_registered_images or args.save_plots) else None,
+                valid_mask=registration.valid_mask if args.save_plots else None,
+                match_table=match_table,
+            )
+        )
 
-    # Generate difference maps for each pair
-    print("\n  Generating difference maps...")
-    for pair, result in zip(pairs, results):
-        gt_img = imread(str(pair.ground_truth_path))
-        diff_path = OUTPUT_DIR / f"diff_G{pair.sample_group}_{pair.round_name}_to_B.png"
-        plot_difference_maps(pair, result.registered_image, gt_img, diff_path)
+    print("\n[4/5] Writing reports...")
+    main_df, secondary_df = build_results_tables(results, object_eval_params)
+    main_csv_path, secondary_csv_path = write_results_tables(output_dir, main_df, secondary_df)
+    print(f"  Saved main results CSV: {main_csv_path.name}")
+    if secondary_csv_path is not None:
+        print(f"  Saved secondary intensity CSV: {secondary_csv_path.name}")
 
-    # Summary report
+    summary_df = compute_summary_frame(main_df, OBJECT_PLOT_METRICS)
+    summary_path = output_dir / "benchmark_summary.csv"
+    summary_df.to_csv(summary_path, index=False)
+    print(f"  Saved summary CSV: {summary_path.name}")
+
+    if args.save_plots:
+        plot_object_metric_panels(main_df, output_dir / "object_metrics_panel.png")
+        plot_object_heatmap(main_df, output_dir / "object_metrics_heatmap.png")
+        plot_timing_chart(main_df, output_dir / "timing_chart.png")
+        if secondary_df is not None:
+            plot_secondary_intensity_panels(secondary_df, output_dir / "secondary_intensity_panel.png")
+
     print("\n[5/5] Summary")
-    print("=" * 70)
-    print(f"{'Pair':<15} {'PSNR':<10} {'SSIM':<10} {'NCC':<10} {'MI':<10} {'Time(s)':<10}")
-    print("-" * 70)
-    for _, r in results_df.iterrows():
-        label = f"G{int(r['sample_group'])}-{r['round_name']}→B"
-        print(f"{label:<15} {r['PSNR']:<10.2f} {r['SSIM']:<10.4f} {r['NCC']:<10.4f} {r['MI']:<10.4f} {r['registration_time_sec']:<10.2f}")
-    print("-" * 70)
-    print(f"{'Average':<15} {results_df['PSNR'].mean():<10.2f} {results_df['SSIM'].mean():<10.4f} "
-          f"{results_df['NCC'].mean():<10.4f} {results_df['MI'].mean():<10.4f} "
-          f"{results_df['registration_time_sec'].mean():<10.2f}")
-    print("=" * 70)
-    print(f"\nAll outputs saved to: {OUTPUT_DIR}")
-    print("Done!")
+    print("=" * 90)
+    print(
+        f"{'Pair':<15} {'F1':<10} {'IoU':<10} {'CentMed':<10} "
+        f"{'CentP95':<10} {'Dice':<10} {'Time(s)':<10}"
+    )
+    print("-" * 90)
+    for _, row in main_df.iterrows():
+        label = f"G{int(row['sample_group'])}-{row['round_name']}->B"
+        print(
+            f"{label:<15} {_fmt_metric(row['match_f1']):<10} {_fmt_metric(row['matched_mean_iou']):<10} "
+            f"{_fmt_metric(row['centroid_error_median_px']):<10} {_fmt_metric(row['centroid_error_p95_px']):<10} "
+            f"{_fmt_metric(row['mask_dice']):<10} {_fmt_metric(row['registration_time_sec'], precision=2):<10}"
+        )
+    print("-" * 90)
+    for summary_row in summary_df.itertuples(index=False):
+        print(
+            f"{summary_row.metric}: median={_fmt_metric(summary_row.median)} | "
+            f"p25={_fmt_metric(summary_row.p25)} | p75={_fmt_metric(summary_row.p75)} | "
+            f"mean={_fmt_metric(summary_row.mean)}"
+        )
+    print("=" * 90)
+    print(f"\nAll outputs saved to: {output_dir}")
 
 
 if __name__ == "__main__":

@@ -2,29 +2,42 @@
 napari widgets for cell registration workflows.
 """
 
-from typing import Optional, Annotated
+from typing import Annotated
 from pathlib import Path
 from enum import Enum
-import numpy as np
+
 import napari
+import numpy as np
 from napari.types import ImageData, LabelsData
 from napari.utils.notifications import show_info
 
 from .core import (
+    CellFeaturesConfig,
     CellposeConfig,
     CellposeSegmenter,
-    compute_cell_features,
-    CellFeaturesConfig,
-    greedy_match_cells,
     MatchingConfig,
+    MAIN_MATCHING_FEATURE_COLUMNS,
+    MIN_MATCHES_FOR_REFINEMENT,
+    apply_rigid_to_points,
+    apply_transform_to_coordinates,
+    assign_patches,
+    cast_warped_like_original,
+    compute_cell_features,
+    compute_match_residuals,
     estimate_rigid_transform_from_matches,
+    estimate_rigid_transform_from_matches_ransac,
+    greedy_match_cells,
+    match_cells_per_patch,
+    perform_global_registration,
+    rigid_transform_to_affine,
+    run_topology_matching_df,
 )
-from .core.validation import validate_matches, compute_match_quality_stats
-
+from .core.point_registration import warp_image_with_transform
 
 
 class CellposeModel(Enum):
     """Cellpose model options."""
+
     CPSAM = "cpsam"
     CYTO = "cyto"
     NUCLEI = "nuclei"
@@ -37,52 +50,27 @@ def segment_cells_widget(
     images: list[ImageData],
     model: CellposeModel = CellposeModel.CPSAM,
     gpu: bool = False,
-    diameter: float = 10,
-    flow_threshold: Annotated[float, {"min": -10.0, "max": 10.0, "step": 0.1}] = 0.0,
-    cellprob_threshold: Annotated[float, {"min": -10.0, "max": 10.0, "step": 0.1}] = 0.0,
-    min_size: int = 15,
+    diameter: float = 15,
+    flow_threshold: Annotated[float, {"min": -10.0, "max": 10.0, "step": 0.1}] = -2.0,
+    cellprob_threshold: Annotated[float, {"min": -10.0, "max": 10.0, "step": 0.1}] = 1.0,
+    min_size: int = 5,
     save_masks: bool = False,
     output_dir: str = "./segmentation_output",
 ):
     """
     Segment cells using Cellpose.
-    
+
     Supports batch processing of multiple images.
-    
-    Parameters
-    ----------
-    viewer : napari.Viewer
-        The napari viewer instance
-    images : list[ImageData]
-        Input images (DAPI channel) - can select multiple layers
-    model : CellposeModel
-        Cellpose model selection
-    gpu : bool
-        Whether to use GPU acceleration
-    diameter : float
-        Expected cell diameter in pixels (0 = auto-detect)
-    flow_threshold : float
-        Flow threshold (higher = fewer cells)
-    cellprob_threshold : float
-        Cell probability threshold
-    min_size : int
-        Minimum cell size in pixels
-    save_masks : bool
-        Save segmentation masks to disk
-    output_dir : str
-        Output directory for saved masks
     """
-    from pathlib import Path
     from tifffile import imwrite
-    
+
     if not images:
         show_info("Please select at least one image layer.")
         return
-    
-    show_info(f"=== Starting Cell Segmentation ===")
+
+    show_info("=== Starting Cell Segmentation ===")
     show_info(f"Model: {model.value} | Total images: {len(images)}")
-    
-    # Configure Cellpose
+
     config = CellposeConfig(
         gpu=gpu,
         pretrained_model=model.value,
@@ -91,60 +79,42 @@ def segment_cells_widget(
         cellprob_threshold=cellprob_threshold,
         min_size=min_size,
     )
-    
-    # Create segmenter
     segmenter = CellposeSegmenter(config)
-    
-    # Get the original layer names from viewer
-    layer_names = [layer.name for layer in viewer.layers if hasattr(layer, 'data')]
-    
-    # Prepare output directory if saving
+
+    layer_names = [layer.name for layer in viewer.layers if hasattr(layer, "data")]
+
     if save_masks:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         show_info(f"Masks will be saved to: {output_path.absolute()}")
-    
-    # Process each image
+
     for idx, image in enumerate(images):
-        progress = f"[{idx+1}/{len(images)}]"
-        
-        # Find matching layer name - FIX: avoid numpy array comparison ambiguity
-        layer_name = f"Image_{idx+1}"
+        progress = f"[{idx + 1}/{len(images)}]"
+        layer_name = f"Image_{idx + 1}"
         img_array = np.asarray(image)
         for name in layer_names:
             layer = viewer.layers[name]
-            if hasattr(layer, 'data'):
+            if hasattr(layer, "data"):
                 try:
-                    # Use shape and hash comparison instead of array_equal in boolean context
                     layer_data = np.asarray(layer.data)
                     if layer_data.shape == img_array.shape and np.array_equal(layer_data, img_array):
                         layer_name = name
                         break
-                except:
+                except Exception:
                     continue
-        
+
         show_info(f"{progress} Processing {layer_name}...")
-        
-        # Run segmentation
         mask, flows, styles = segmenter.segment_array(img_array)
-        
-        # Count cells
         n_cells = len(np.unique(mask)) - 1
-        
-        # Create mask name based on original image name
         mask_name = f"{layer_name}_mask"
-        
-        # Add mask to viewer
         viewer.add_labels(mask, name=mask_name, opacity=0.5)
-        
         show_info(f"{progress} {mask_name}: Found {n_cells} cells")
-        
-        # Save mask if requested
+
         if save_masks:
             mask_filename = output_path / f"{layer_name}_mask.tif"
             imwrite(str(mask_filename), mask.astype(np.uint16))
-            show_info(f"{progress} ✓ Saved: {mask_filename.name}")
-    
+            show_info(f"{progress} Saved: {mask_filename.name}")
+
     show_info(f"=== Segmentation Complete! Processed {len(images)} image(s) ===")
 
 
@@ -154,461 +124,438 @@ def registration_workflow_widget(
     image_round2: ImageData,
     mask_round1: LabelsData,
     mask_round2: LabelsData,
-    use_advanced_registration: bool = True,
-    use_neighbor_refinement: bool = True,
-    neighbor_k: int = 5,
-    gpu: bool = False,
-    use_two_stage_matching: bool = True,
-    position_weight: float = 3.0,
-    distance_threshold: float = 2.5,
-    spatial_window_size: float = 100.0,
-    top_k: int = 100,
+    top_k: int = 50,
+    top_k_per_patch: int = 6,
+    position_weight: float = 1.0,
+    use_topology_filtering: bool = False,
+    k_pos_nei: int = 5,
+    k_neighbor: int = 5,
+    tau_pos: Annotated[float, {"min": 0.0, "max": 2.0, "step": 0.05}] = 0.5,
+    tau_nei: Annotated[float, {"min": 0.0, "max": 2.0, "step": 0.05}] = 0.3,
+    tau_map: Annotated[float, {"min": 0.0, "max": 2.0, "step": 0.05}] = 0.3,
+    residual_prune_quantile: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.05}] = 0.9,
+    use_ransac_transform: bool = False,
+    ransac_max_trials: int = 1000,
+    ransac_residual_threshold: float = 2.0,
     min_area: int = 0,
     max_area: int = 0,
     save_results: bool = False,
     output_dir: str = "./registration_output",
 ):
-    """
-    Complete cell registration workflow using pre-segmented masks.
-    
-    Performs:
-    1. Feature extraction from masks
-    2. Cell matching (two-stage: coarse morphology-based, then fine position-based)
-    3. Registration (transform estimation with optional neighbor refinement)
-    4. Visualization of results with image overlay
-    
-    Parameters
-    ----------
-    viewer : napari.Viewer
-        The napari viewer instance
-    image_round1 : ImageData
-        First round original image (for overlay visualization)
-    image_round2 : ImageData
-        Second round original image (to be transformed)
-    mask_round1 : LabelsData
-        First round segmentation mask (reference)
-    mask_round2 : LabelsData
-        Second round segmentation mask (to be registered)
-    use_advanced_registration : bool
-        Use advanced registration (Similarity transform + RANSAC). If False, uses simple translation.
-    use_neighbor_refinement : bool
-        Apply neighbor-based refinement to preserve local structure (only if use_advanced_registration=True)
-    neighbor_k : int
-        Number of nearest neighbors to use in refinement (default: 5)
-    gpu : bool
-        Whether to use GPU for any GPU-accelerated operations (currently not used in matching/registration)
-    use_two_stage_matching : bool
-        Use two-stage matching: first morphology-only to estimate global offset, then position-weighted
-    position_weight : float
-        Weight for spatial position in final matching (default: 3.0 for high spatial weight)
-    distance_threshold : float
-        Maximum match distance threshold (standardized units) - rejects matches beyond this
-    spatial_window_size : float
-        Spatial search window radius in pixels (default: 100). Cells can only match within this distance.
-        Increase if images have large displacement; decrease for higher precision.
-    top_k : int
-        Maximum number of matches to return (default: 100)
-    min_area : int
-        Minimum cell area for filtering (0 = no filter)
-    max_area : int
-        Maximum cell area for filtering (0 = no filter)
-    save_results : bool
-        Save registration results (CSV and masks) to disk
-    output_dir : str
-        Output directory for saved results
-    """
-    from .core.visualization import warp_mask_to_image2
-    from skimage.transform import AffineTransform, warp, SimilarityTransform
-    from skimage.measure import ransac
-    from .core.matching import apply_transform_to_features, two_stage_match_cells
-    from .core.point_registration import estimate_robust_transform, refine_transform_with_neighbors
-    from pathlib import Path
-    from tifffile import imwrite
+    """Run the current cell-registration workflow on pre-segmented masks."""
     import pandas as pd
-    
-    # Import advanced registration if needed
-    if use_advanced_registration:
-        try:
-            _ = refine_transform_with_neighbors
-        except ImportError:
-            show_info("⚠ Advanced registration not available, falling back to simple method")
-            use_advanced_registration = False
-    
+    from tifffile import imwrite
+
+    def _add_match_layers(current_matches: pd.DataFrame, fixed_feats: pd.DataFrame, moving_feats: pd.DataFrame) -> None:
+        if current_matches.empty:
+            return
+
+        matched_pts1 = fixed_feats.loc[current_matches["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
+        matched_pts2 = moving_feats.loc[current_matches["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
+        viewer.add_points(matched_pts1, name="Matched Points Round 1", size=8, face_color="yellow")
+        viewer.add_points(matched_pts2, name="Matched Points Round 2", size=8, face_color="orange")
+
+        lines = [[matched_pts1[idx], matched_pts2[idx]] for idx in range(len(current_matches))]
+        if not lines:
+            return
+
+        viewer.add_shapes(
+            lines,
+            shape_type="line",
+            edge_width=1,
+            edge_color="cyan",
+            name="Match Lines",
+        )
+        pixel_distances = np.linalg.norm(matched_pts1 - matched_pts2, axis=1)
+        show_info(
+            "  Match line distances: "
+            f"min={pixel_distances.min():.1f}px, "
+            f"max={pixel_distances.max():.1f}px, "
+            f"mean={pixel_distances.mean():.1f}px"
+        )
+
+    def _rebuild_matches_from_topology_pairs(
+        base_matches: pd.DataFrame,
+        fixed_feats: pd.DataFrame,
+        moving_feats: pd.DataFrame,
+    ) -> pd.DataFrame:
+        def _enforce_one_to_one(candidate_pairs: pd.DataFrame) -> pd.DataFrame:
+            if candidate_pairs.empty:
+                return candidate_pairs.copy()
+
+            ordered = candidate_pairs.copy()
+            ordered["pair_stage"] = ordered["pair_stage"].fillna(1).astype(int)
+            ordered["pair_score"] = pd.to_numeric(
+                ordered["pair_score"],
+                errors="coerce",
+            ).fillna(np.inf)
+            ordered = ordered.drop_duplicates(subset=["cell_id_r1", "cell_id_r2"])
+            ordered = ordered.sort_values(
+                by=["pair_stage", "pair_score", "cell_id_r1", "cell_id_r2"],
+                ascending=[True, True, True, True],
+            )
+
+            used_r1: set = set()
+            used_r2: set = set()
+            kept_rows: list[pd.Series] = []
+            for _, row in ordered.iterrows():
+                if row["cell_id_r1"] in used_r1 or row["cell_id_r2"] in used_r2:
+                    continue
+                kept_rows.append(row)
+                used_r1.add(row["cell_id_r1"])
+                used_r2.add(row["cell_id_r2"])
+
+            if not kept_rows:
+                return ordered.iloc[0:0].copy()
+            return pd.DataFrame(kept_rows).reset_index(drop=True)
+
+        if base_matches.empty:
+            return pd.DataFrame(columns=["idx1", "idx2", "cell_id_1", "cell_id_2"])
+
+        candidate_matches = pd.DataFrame(
+            {
+                "cell_id_r1": fixed_feats.loc[base_matches["idx1"], "cell_id"].to_numpy(),
+                "cell_id_r2": moving_feats.loc[base_matches["idx2"], "cell_id"].to_numpy(),
+            }
+        )
+        trusted_pairs, neighbor_matches = run_topology_matching_df(
+            fixed_feats,
+            moving_feats,
+            candidate_matches,
+            image_width=mask1.shape[1],
+            image_height=mask1.shape[0],
+            k_pos_nei=k_pos_nei,
+            k_neighbor=k_neighbor,
+            tau_pos=tau_pos,
+            tau_nei=tau_nei,
+            tau_map=tau_map,
+        )
+
+        combined_pairs = trusted_pairs.copy()
+        if not combined_pairs.empty:
+            combined_pairs["pair_stage"] = 0
+            combined_pairs["pair_score"] = (
+                pd.to_numeric(combined_pairs.get("L_pos"), errors="coerce").fillna(np.inf)
+                + pd.to_numeric(combined_pairs.get("L_nei"), errors="coerce").fillna(np.inf)
+            )
+        neighbor_filtered = neighbor_matches
+        if not neighbor_matches.empty and "within_threshold" in neighbor_matches.columns:
+            neighbor_filtered = neighbor_matches[neighbor_matches["within_threshold"] == True]
+        if not neighbor_filtered.empty:
+            neighbor_filtered = neighbor_filtered.copy()
+            neighbor_filtered["pair_stage"] = 1
+            neighbor_filtered["pair_score"] = pd.to_numeric(
+                neighbor_filtered.get("dist_norm"),
+                errors="coerce",
+            ).fillna(np.inf)
+            combined_pairs = pd.concat([combined_pairs, neighbor_filtered], ignore_index=True)
+
+        if combined_pairs.empty:
+            show_info("  Topology filtering removed all candidate matches.")
+            return pd.DataFrame(columns=["idx1", "idx2", "cell_id_1", "cell_id_2"])
+
+        combined_pairs = _enforce_one_to_one(combined_pairs)
+        id_to_idx1 = {fixed_feats.loc[idx, "cell_id"]: idx for idx in fixed_feats.index}
+        id_to_idx2 = {moving_feats.loc[idx, "cell_id"]: idx for idx in moving_feats.index}
+        base_lookup = {}
+        for _, base_row in base_matches.iterrows():
+            key = (
+                fixed_feats.loc[base_row["idx1"], "cell_id"],
+                moving_feats.loc[base_row["idx2"], "cell_id"],
+            )
+            base_lookup[key] = base_row
+
+        rows: list[dict] = []
+        for _, pair in combined_pairs.iterrows():
+            cell_id_1 = pair["cell_id_r1"]
+            cell_id_2 = pair["cell_id_r2"]
+            idx1 = id_to_idx1.get(cell_id_1)
+            idx2 = id_to_idx2.get(cell_id_2)
+            if idx1 is None or idx2 is None:
+                continue
+            row = {
+                "idx1": idx1,
+                "idx2": idx2,
+                "cell_id_1": cell_id_1,
+                "cell_id_2": cell_id_2,
+            }
+            base_row = base_lookup.get((cell_id_1, cell_id_2))
+            if base_row is not None:
+                for extra in ("distance",):
+                    if extra in base_row and not pd.isna(base_row[extra]):
+                        row[extra] = base_row[extra]
+            for extra in ("L_pos", "L_nei", "dist_norm", "within_threshold", "patch_x", "patch_y"):
+                if extra in pair and not pd.isna(pair[extra]):
+                    row[extra] = pair[extra]
+            rows.append(row)
+
+        show_info(
+            "  Topology filtering: "
+            f"{len(trusted_pairs)} trusted anchors, {len(neighbor_filtered)} propagated neighbors"
+        )
+        return pd.DataFrame(rows).reset_index(drop=True)
+
     show_info("=== Starting Cell Registration Workflow ===")
-    
-    # Prepare output directory if saving
+
     if save_results:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         show_info(f"Results will be saved to: {output_path.absolute()}")
-    
-    # Convert to numpy arrays
+
     mask1 = np.asarray(mask_round1)
     mask2 = np.asarray(mask_round2)
     img1 = np.asarray(image_round1)
     img2 = np.asarray(image_round2)
-    
-    # Step 1: Feature extraction
+
     show_info("[1/5] Extracting features from Round 1...")
     feat_config = CellFeaturesConfig(
         min_area=min_area if min_area > 0 else None,
-        max_area=max_area if max_area > 0 else None
+        max_area=max_area if max_area > 0 else None,
+        topology_neighbor_k=max(3, int(k_pos_nei)),
     )
     feats1 = compute_cell_features(mask1, feat_config)
     n_cells1 = len(feats1)
-    show_info(f"  ✓ Round 1: {n_cells1} cells after filtering")
-    
+    show_info(f"  Round 1: {n_cells1} cells after filtering")
+
     show_info("[2/5] Extracting features from Round 2...")
     feats2 = compute_cell_features(mask2, feat_config)
     n_cells2 = len(feats2)
-    show_info(f"  ✓ Round 2: {n_cells2} cells after filtering")
-    
-    # Add all centroids to viewer
+    show_info(f"  Round 2: {n_cells2} cells after filtering")
+
     if not feats1.empty:
         pts1 = feats1[["centroid_y", "centroid_x"]].to_numpy()
         viewer.add_points(pts1, name="All Points Round 1", size=4, face_color="cyan", opacity=0.5)
-    
+
     if not feats2.empty:
         pts2 = feats2[["centroid_y", "centroid_x"]].to_numpy()
         viewer.add_points(pts2, name="All Points Round 2", size=4, face_color="magenta", opacity=0.5)
-    
-    # Step 2: Matching (Two-Stage Algorithm)
-    show_info("[3/5] Matching cells...")
-    
-    if use_two_stage_matching and n_cells1 >= 20 and n_cells2 >= 20:
-        show_info("  → Using two-stage matching to handle global offset...")
-        
-        # Stage 1: Coarse matching using morphology only (ignore position)
-        show_info("    [Stage 1] Morphology-based coarse matching...")
-        config_coarse = MatchingConfig(
-            position_weight=0.0,  # Ignore position in coarse matching
-            top_k=min(50, n_cells1, n_cells2),
-            distance_threshold=2.0,  # Reasonable morphology distance
-            spatial_window_size=spatial_window_size * 2.0,  # Use 2x window for coarse stage
+
+    if n_cells1 == 0 or n_cells2 == 0:
+        show_info("No cells available after feature extraction.")
+        return
+
+    show_info("[3/5] Running global alignment and matching...")
+    global_transform = perform_global_registration(feats1, feats2, feature_columns=MAIN_MATCHING_FEATURE_COLUMNS)
+    if global_transform is not None:
+        rotation = getattr(global_transform, "rotation", np.nan)
+        translation = getattr(global_transform, "translation", np.array([np.nan, np.nan]))
+        if not (np.isfinite(rotation) and np.all(np.isfinite(translation))):
+            global_transform = None
+
+    if global_transform is not None:
+        show_info(
+            "  Global alignment: "
+            f"rotation={float(global_transform.rotation):.4f} rad, "
+            f"translation=({float(global_transform.translation[0]):.1f}, {float(global_transform.translation[1]):.1f}) px"
         )
-        coarse_matches = greedy_match_cells(feats1, feats2, config_coarse)
-        show_info(f"    ✓ Coarse: {len(coarse_matches)} morphology-similar cells")
-        
-        # Use best coarse matches to estimate global offset
-        if len(coarse_matches) >= 3:
-            # Take top 20 best coarse matches for offset estimation
-            n_for_offset = min(20, len(coarse_matches))
-            best_coarse = coarse_matches.nsmallest(n_for_offset, 'distance')
-            
-            # Calculate average offset using MEDIAN (more robust than mean)
-            pts1_coarse = feats1.loc[best_coarse['idx1'], ['centroid_x', 'centroid_y']].to_numpy()
-            pts2_coarse = feats2.loc[best_coarse['idx2'], ['centroid_x', 'centroid_y']].to_numpy()
-            offset = np.median(pts1_coarse - pts2_coarse, axis=0)  # Median is robust to outliers
-            
-            show_info(f"    ✓ Estimated global offset: ({offset[0]:.1f}, {offset[1]:.1f}) pixels")
-            
-            # Apply offset to Round 2 features
-            feats2_aligned = feats2.copy()
-            feats2_aligned['centroid_x'] = feats2['centroid_x'] + offset[0]
-            feats2_aligned['centroid_y'] = feats2['centroid_y'] + offset[1]
-            # Recalculate normalized positions
-            h, w = mask1.shape
-            feats2_aligned['pos_x_norm'] = feats2_aligned['centroid_x'] / float(max(w, 1))
-            feats2_aligned['pos_y_norm'] = feats2_aligned['centroid_y'] / float(max(h, 1))
-        else:
-            show_info("    ⚠ Not enough coarse matches, skipping offset correction")
-            feats2_aligned = feats2
-        
-        # Stage 2: Fine matching with HIGH position weight on aligned features
-        show_info(f"    [Stage 2] Position-weighted fine matching (weight={position_weight}, window={spatial_window_size:.0f}px)...")
-        config_fine = MatchingConfig(
-            position_weight=position_weight,  # High position weight after alignment
-            top_k=top_k,
-            distance_threshold=distance_threshold,
-            spatial_window_size=spatial_window_size,  # Apply spatial window constraint
-        )
-        matches = greedy_match_cells(feats1, feats2_aligned, config_fine)
-        show_info(f"    ✓ Fine: {len(matches)} high-quality matches")
-        
+        feats2_aligned = apply_transform_to_coordinates(feats2, global_transform)
+        feats2_aligned["pos_x_norm"] = feats2_aligned["centroid_x"] / float(max(mask1.shape[1], 1))
+        feats2_aligned["pos_y_norm"] = feats2_aligned["centroid_y"] / float(max(mask1.shape[0], 1))
     else:
-        # Single-stage matching (fallback or when not enough cells)
-        if n_cells1 < 20 or n_cells2 < 20:
-            show_info("  → Too few cells, using single-stage matching...")
-        else:
-            show_info("  → Single-stage matching (two-stage disabled)...")
-        
-        config = MatchingConfig(
-            position_weight=position_weight,
-            top_k=top_k,
-            distance_threshold=distance_threshold,
-            spatial_window_size=spatial_window_size,  # Apply spatial window constraint
-        )
-        matches = greedy_match_cells(feats1, feats2, config)
-    
-    feats2_for_validation = feats2
-    if use_two_stage_matching:
-        match_result = two_stage_match_cells(
-            feats1,
-            feats2,
-            mask1.shape,
-            position_weight=position_weight,
-            top_k=top_k,
-            distance_threshold=distance_threshold,
-            spatial_window_size=spatial_window_size,
-        )
-        feats2_for_validation = match_result.aligned_df2
-        matches = match_result.matches
-        if not match_result.coarse_matches.empty:
-            show_info(f"    Coarse: {len(match_result.coarse_matches)} morphology-similar cells")
-            show_info(
-                "    Estimated global offset: "
-                f"({match_result.coarse_offset_xy[0]:.1f}, {match_result.coarse_offset_xy[1]:.1f}) pixels"
-            )
-        show_info(f"    Fine: {len(matches)} high-quality matches")
-    
-    # Validate matches
-    config_for_validation = MatchingConfig(
-        distance_threshold=distance_threshold,
-        min_confidence=0.2,
-        max_feature_diff=0.7,
+        show_info("  Global alignment unavailable; matching will use raw coordinates.")
+        feats2_aligned = feats2.copy()
+
+    feats1_work = assign_patches(feats1, mask1.shape[1], mask1.shape[0])
+    feats2_work = assign_patches(feats2_aligned, mask1.shape[1], mask1.shape[0])
+
+    if int(top_k_per_patch) > 0:
+        show_info(f"  Matching mode: 3x3 patch matching ({int(top_k_per_patch)} per patch)")
+    else:
+        show_info("  Matching mode: global greedy matching")
+
+    match_config = MatchingConfig(
+        feature_columns=MAIN_MATCHING_FEATURE_COLUMNS,
+        feature_weight=1.0,
+        topology_weight=0.0,
+        position_weight=position_weight,
+        top_k=max(1, int(top_k)),
+        distance_threshold=None,
+        spatial_window_size=None,
     )
-    matches = validate_matches(matches, feats1, feats2_for_validation, config_for_validation)
-    
-    # Compute and display match quality statistics
-    stats = compute_match_quality_stats(matches)
-    show_info(f"  ✓ Final matches: {stats['n_matches']}")
-    if stats['n_matches'] > 0:
-        show_info(f"    Distance: min={stats['distance_min']:.2f}, max={stats['distance_max']:.2f}, mean={stats['distance_mean']:.2f}")
-    
-    # Visualize matches as lines with color-coded quality
-    if not matches.empty:
-        # Create line segments connecting matched cells
-        matched_pts1 = feats1.loc[matches["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
-        matched_pts2 = feats2.loc[matches["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
-        
-        # Add matched feature points with unique colors
-        viewer.add_points(matched_pts1, name="Feature Points Round 1", size=8, face_color="yellow")
-        viewer.add_points(matched_pts2, name="Feature Points Round 2", size=8, face_color="orange")
-        
-        # Create lines with uniform color (no quality judgment)
-        lines = []
-        
-        # Calculate pixel distances for statistics only
-        pixel_distances = np.linalg.norm(matched_pts1 - matched_pts2, axis=1)
-        
-        # Create all lines
-        for i in range(len(matches)):
-            lines.append([matched_pts1[i], matched_pts2[i]])
-        
-        # Display statistics
-        show_info(f"    Match line statistics:")
-        show_info(f"      Distance: min={pixel_distances.min():.1f}px, max={pixel_distances.max():.1f}px, mean={pixel_distances.mean():.1f}px")
-        
-        # Add all lines in uniform cyan color
-        viewer.add_shapes(
-            lines,
-            shape_type='line',
-            edge_width=1,
-            edge_color='cyan',
-            name='Match Lines'
+
+    if int(top_k_per_patch) > 0:
+        matches = match_cells_per_patch(
+            feats1_work,
+            feats2_work,
+            match_config,
+            top_k_per_patch=int(top_k_per_patch),
         )
-    
-    # Step 3: Registration
+    else:
+        matches = greedy_match_cells(feats1_work, feats2_work, match_config)
+
+    if not matches.empty and "distance" in matches.columns:
+        show_info(
+            "  Match distances: "
+            f"min={matches['distance'].min():.2f}, "
+            f"max={matches['distance'].max():.2f}, "
+            f"mean={matches['distance'].mean():.2f}"
+        )
+
+    if use_topology_filtering:
+        matches = _rebuild_matches_from_topology_pairs(matches, feats1_work, feats2_work)
+
+    if matches.empty:
+        show_info("No matches available after matching; registration aborted.")
+        return
+
+    show_info(f"  Selected matches: {len(matches)}")
+
     show_info("[4/5] Estimating registration transform...")
     if len(matches) < 3:
-        show_info(f"  ✗ Warning: Only {len(matches)} matches found. Need at least 3 for transform estimation.")
+        show_info(f"  Only {len(matches)} matches found; need at least 3 to estimate a transform.")
         return
-    
-    # Prepare matched point arrays (y,x format for image coords, swap to x,y for skimage)
-    pts_r1_yx = feats1.loc[matches["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
-    pts_r2_yx = feats2.loc[matches["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
-    pts_r1_xy = pts_r1_yx[:, ::-1]  # swap to x,y
-    pts_r2_xy = pts_r2_yx[:, ::-1]
-    
-    if use_advanced_registration:
-        show_info("  → Using advanced registration (Similarity + RANSAC)...")
-        # Estimate similarity transform with RANSAC
-        model_robust, inliers = ransac(
-            (pts_r2_xy, pts_r1_xy),
-            SimilarityTransform,
-            min_samples=3,
-            residual_threshold=5.0,
-            max_trials=100,
-        )
-        
-        if inliers is None or inliers.sum() < 3:
-            show_info("  ✗ RANSAC failed, falling back to simple method")
-            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
-            affine_transform = AffineTransform(matrix=np.eye(3))
-            affine_transform.params[:2, 2] = transform.translation[::-1]  # only translation
-        else:
-            show_info(f"  ✓ RANSAC: {inliers.sum()}/{len(inliers)} inliers")
-            affine_transform = model_robust
-            
-            # Apply neighbor refinement if requested
-            if use_neighbor_refinement:
-                show_info(f"  → Refining with k={neighbor_k} neighbors...")
-                affine_transform = refine_transform_with_neighbors(
-                    pts_r1_xy,
-                    pts_r2_xy,
-                    initial=affine_transform,
-                    k=neighbor_k,
-                    neighbor_weight=1.0,
-                    landmark_weight=10.0,
-                    max_theta_deg=10.0,
-                    max_translation=30.0,
-                    max_scale_change=0.05,
-                )
-                show_info("  ✓ Refinement complete!")
-    else:
-        # Simple translation-only method
-        show_info("  → Using simple translation-only registration...")
-        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
-        affine_transform = AffineTransform(matrix=np.eye(3))
-        affine_transform.params[:2, 2] = transform.translation[::-1]  # swap y,x to x,y
-    
-    if use_advanced_registration:
-        robust = estimate_robust_transform(
-            pts_r1_xy,
-            pts_r2_xy,
-            prefer_affine=True,
-            residual_threshold=3.0,
-            similarity_residual_threshold=5.0,
-            max_trials=500,
-        )
-        affine_transform = robust.transform
-        show_info(
-            f"  Robust model: {robust.method} | "
-            f"inliers={robust.inlier_count}/{len(matches)} | "
-            f"median residual={robust.median_inlier_residual:.2f}px"
-        )
 
-        guided_feats2 = apply_transform_to_features(feats2, affine_transform, mask1.shape)
-        guided_config = MatchingConfig(
-            position_weight=max(position_weight, 4.0),
-            top_k=top_k,
-            distance_threshold=None if distance_threshold is None else distance_threshold + 0.5,
-            spatial_window_size=None if spatial_window_size is None else min(spatial_window_size, 60.0),
+    if use_ransac_transform:
+        transform, inlier_mask = estimate_rigid_transform_from_matches_ransac(
+            feats1,
+            feats2,
+            matches,
+            max_trials=int(ransac_max_trials),
+            residual_threshold=float(ransac_residual_threshold),
+            min_inliers=MIN_MATCHES_FOR_REFINEMENT,
         )
-        guided_matches = greedy_match_cells(feats1, guided_feats2, guided_config)
-        guided_matches = validate_matches(guided_matches, feats1, guided_feats2, config_for_validation)
-        if len(guided_matches) >= 3:
-            guided_r1_yx = feats1.loc[guided_matches["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
-            guided_r2_yx = feats2.loc[guided_matches["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
-            guided = estimate_robust_transform(
-                guided_r1_yx[:, ::-1],
-                guided_r2_yx[:, ::-1],
-                prefer_affine=True,
-                residual_threshold=3.0,
-                similarity_residual_threshold=5.0,
-                max_trials=500,
+        matches = matches.copy()
+        matches["ransac_inlier"] = inlier_mask
+        inlier_count = int(inlier_mask.sum())
+        show_info(f"  RANSAC support: {inlier_count}/{len(matches)} inliers")
+        all_residuals = compute_match_residuals(feats1, feats2, matches, transform)
+        if inlier_count >= MIN_MATCHES_FOR_REFINEMENT:
+            inlier_residuals = all_residuals[inlier_mask]
+            inlier_median = float(np.median(inlier_residuals))
+            inlier_mad = float(np.median(np.abs(inlier_residuals - inlier_median)))
+            robust_scale = max(1.4826 * inlier_mad, 0.5)
+            model_threshold = max(
+                float(ransac_residual_threshold) * 2.0,
+                inlier_median + 3.0 * robust_scale,
             )
-            if guided.score() > robust.score():
-                matches = guided_matches
-                pts_r1_yx = guided_r1_yx
-                pts_r2_yx = guided_r2_yx
-                pts_r1_xy = guided_r1_yx[:, ::-1]
-                pts_r2_xy = guided_r2_yx[:, ::-1]
-                robust = guided
-                affine_transform = robust.transform
+            keep_mask = all_residuals <= model_threshold
+            keep_count = int(keep_mask.sum())
+            if MIN_MATCHES_FOR_REFINEMENT <= keep_count < len(matches):
+                matches = matches.loc[keep_mask].reset_index(drop=True)
+                transform, _ = estimate_rigid_transform_from_matches_ransac(
+                    feats1,
+                    feats2,
+                    matches,
+                    max_trials=int(ransac_max_trials),
+                    residual_threshold=float(ransac_residual_threshold),
+                    min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+                )
                 show_info(
-                    f"  Guided rematch improved support: "
-                    f"{robust.inlier_count}/{len(matches)} inliers"
+                    "  RANSAC model consistency filter: "
+                    f"kept {keep_count}/{len(keep_mask)} matches at <= {model_threshold:.2f}px"
                 )
+        else:
+            show_info("  Too few RANSAC inliers to filter matches safely; keeping all matches")
+    else:
+        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
 
-        if use_neighbor_refinement and robust.inlier_count >= 3:
-            pts_fit_r1 = pts_r1_xy[robust.inliers]
-            pts_fit_r2 = pts_r2_xy[robust.inliers]
-            affine_transform = refine_transform_with_neighbors(
-                pts_fit_r1,
-                pts_fit_r2,
-                initial=affine_transform,
-                k=neighbor_k,
-                neighbor_weight=1.0,
-                landmark_weight=10.0,
-                max_theta_deg=10.0,
-                max_translation=30.0,
-                max_scale_change=0.05,
-                optimize_translation_only=(robust.method != "similarity"),
+    residuals = compute_match_residuals(feats1, feats2, matches, transform)
+    matches = matches.copy()
+    matches["residual_px"] = residuals
+
+    if (
+        0.0 < float(residual_prune_quantile) < 1.0
+        and len(matches) >= MIN_MATCHES_FOR_REFINEMENT
+    ):
+        threshold = float(np.quantile(residuals, float(residual_prune_quantile)))
+        keep_mask = residuals <= threshold
+        kept = int(keep_mask.sum())
+        if kept >= MIN_MATCHES_FOR_REFINEMENT and kept < len(matches):
+            matches = matches.loc[keep_mask].reset_index(drop=True)
+            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+            matches["residual_px"] = compute_match_residuals(feats1, feats2, matches, transform)
+            show_info(
+                f"  Residual pruning: kept {kept}/{len(residuals)} matches at <= {threshold:.2f}px"
             )
-            show_info("  Refinement complete!")
-    
-    show_info(f"  ✓ Registration complete!")
-    
-    # Step 4: Apply transformation and visualize
+
+    affine_transform = rigid_transform_to_affine(transform)
+    rotation_deg = float(np.degrees(np.arctan2(transform.rotation[1, 0], transform.rotation[0, 0])))
+    show_info(
+        "  Final transform: "
+        f"rotation={rotation_deg:.2f} deg, "
+        f"translation=({float(transform.translation[0]):.1f}, {float(transform.translation[1]):.1f}) px"
+    )
+    if len(matches) > 0:
+        show_info(
+            "  Residuals: "
+            f"min={matches['residual_px'].min():.2f}px, "
+            f"max={matches['residual_px'].max():.2f}px, "
+            f"mean={matches['residual_px'].mean():.2f}px"
+        )
+
     show_info("[5/5] Applying transformation and creating overlay...")
-    
-    # Warp the image
-    if img2.ndim == 2:
-        # 2D grayscale image
-        img2_warped = warp(
-            img2.astype(float),
-            inverse_map=affine_transform.inverse,
-            output_shape=img1.shape,
-            preserve_range=True
-        ).astype(img2.dtype)
-    elif img2.ndim == 3:
-        # 3D image with channels - warp each channel separately
-        img2_warped = np.zeros_like(img1)
-        for c in range(min(img2.shape[-1], img1.shape[-1] if img1.ndim == 3 else 1)):
-            if img1.ndim == 3:
-                img2_warped[..., c] = warp(
-                    img2[..., c].astype(float),
-                    inverse_map=affine_transform.inverse,
-                    output_shape=img1.shape[:2],
-                    preserve_range=True
-                ).astype(img2.dtype)
-            else:
-                img2_warped = warp(
-                    img2[..., c].astype(float),
-                    inverse_map=affine_transform.inverse,
-                    output_shape=img1.shape,
-                    preserve_range=True
-                ).astype(img2.dtype)
-                break
-    
-    # Add warped image to viewer
-    viewer.add_image(img2_warped, name="Registered Map", opacity=0.5, colormap="green", blending="additive")
-    
-    # Also add transformed centroids for verification
-    pts_r2_reg = affine_transform(pts_r2_xy)[:, ::-1]  # convert back to y,x
-    viewer.add_points(pts_r2_reg, name="Registered Point", size=6, face_color="red", opacity=0.8)
-    
-    show_info("  ✓ Visualization complete!")
-    
-    # Save results if requested
+    _add_match_layers(matches, feats1, feats2)
+
+    img2_warped = warp_image_with_transform(img2, affine_transform, mask1.shape[:2], order=1)
+    img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
+    image_kwargs = {"name": "Registered Image Round 2", "opacity": 0.5, "blending": "additive"}
+    if img2_registered.ndim == 2:
+        image_kwargs["colormap"] = "green"
+    viewer.add_image(img2_registered, **image_kwargs)
+
+    mask2_warped = warp_image_with_transform(mask2.astype(np.int32), affine_transform, mask1.shape[:2], order=0)
+    mask2_registered = np.rint(mask2_warped).astype(np.int32)
+    viewer.add_labels(mask2_registered, name="Registered Mask Round 2", opacity=0.35)
+
+    all_pts_r2_xy = feats2[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    all_pts_r2_registered_xy = apply_rigid_to_points(all_pts_r2_xy, transform.rotation, transform.translation)
+    viewer.add_points(
+        all_pts_r2_registered_xy[:, ::-1],
+        name="Registered Points Round 2",
+        size=5,
+        face_color="red",
+        opacity=0.7,
+    )
+
+    show_info("  Visualization complete.")
+
     if save_results:
         show_info("Saving results...")
-        
-        # Save registered image
         img_filename = output_path / "registered_image.tif"
-        imwrite(str(img_filename), img2_warped)
-        show_info(f"  ✓ Saved: {img_filename.name}")
-        
-        # Save feature CSVs
+        imwrite(str(img_filename), img2_registered)
+        show_info(f"  Saved: {img_filename.name}")
+
+        mask_filename = output_path / "registered_mask.tif"
+        imwrite(str(mask_filename), mask2_registered)
+        show_info(f"  Saved: {mask_filename.name}")
+
         feats1_csv = output_path / "features_round1.csv"
         feats1.to_csv(feats1_csv, index=False)
-        show_info(f"  ✓ Saved: {feats1_csv.name}")
-        
+        show_info(f"  Saved: {feats1_csv.name}")
+
         feats2_csv = output_path / "features_round2.csv"
         feats2.to_csv(feats2_csv, index=False)
-        show_info(f"  ✓ Saved: {feats2_csv.name}")
-        
-        # Save matches
+        show_info(f"  Saved: {feats2_csv.name}")
+
         matches_csv = output_path / "matches.csv"
         matches.to_csv(matches_csv, index=False)
-        show_info(f"  ✓ Saved: {matches_csv.name} ({len(matches)} matches)")
-        
-        # Save registered centroids
-        pts_r2_reg_df = pd.DataFrame({
-            'centroid_y': pts_r2_reg[:, 0],
-            'centroid_x': pts_r2_reg[:, 1]
-        })
+        show_info(f"  Saved: {matches_csv.name} ({len(matches)} matches)")
+
+        registered_feats2 = feats2.copy()
+        registered_feats2["centroid_x"] = all_pts_r2_registered_xy[:, 0]
+        registered_feats2["centroid_y"] = all_pts_r2_registered_xy[:, 1]
+        registered_feats2["pos_x_norm"] = registered_feats2["centroid_x"] / float(max(mask1.shape[1], 1))
+        registered_feats2["pos_y_norm"] = registered_feats2["centroid_y"] / float(max(mask1.shape[0], 1))
+        registered_feats2 = assign_patches(registered_feats2, mask1.shape[1], mask1.shape[0])
+
+        registered_feats_csv = output_path / "registered_features_round2.csv"
+        registered_feats2.to_csv(registered_feats_csv, index=False)
+        show_info(f"  Saved: {registered_feats_csv.name}")
+
+        pts_r2_reg_df = registered_feats2.loc[:, ["cell_id", "centroid_y", "centroid_x"]]
         reg_pts_csv = output_path / "registered_centroids_round2.csv"
         pts_r2_reg_df.to_csv(reg_pts_csv, index=False)
-        show_info(f"  ✓ Saved: {reg_pts_csv.name}")
-        
-        # Save transform matrix
+        show_info(f"  Saved: {reg_pts_csv.name}")
+
         transform_file = output_path / "transform_matrix.txt"
-        with open(transform_file, 'w') as f:
-            f.write("Affine Transform Matrix:\n")
-            f.write(str(affine_transform.params))
-        show_info(f"  ✓ Saved: {transform_file.name}")
-    
+        with open(transform_file, "w", encoding="utf-8") as handle:
+            handle.write("Affine Transform Matrix:\n")
+            handle.write(f"{affine_transform.params}\n\n")
+            handle.write("Rotation Matrix:\n")
+            handle.write(f"{transform.rotation}\n\n")
+            handle.write("Translation Vector:\n")
+            handle.write(f"{transform.translation}\n")
+        show_info(f"  Saved: {transform_file.name}")
+
     show_info("=== Registration Complete! ===")
-    show_info(f"Check 'Registered Map' and 'Registered Point' layers for results.")
+    show_info("Check the registered image, mask, and point layers for results.")
