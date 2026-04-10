@@ -27,7 +27,6 @@ from .core import (
     estimate_rigid_transform_from_matches,
     estimate_rigid_transform_from_matches_ransac,
     greedy_match_cells,
-    match_cells_per_patch,
     perform_global_registration,
     rigid_transform_to_affine,
     run_topology_matching_df,
@@ -125,7 +124,7 @@ def registration_workflow_widget(
     mask_round1: LabelsData,
     mask_round2: LabelsData,
     top_k: int = 50,
-    top_k_per_patch: int = 6,
+    max_match_distance_px: int = 100,
     position_weight: float = 1.0,
     use_topology_filtering: bool = False,
     k_pos_nei: int = 5,
@@ -337,16 +336,25 @@ def registration_workflow_widget(
     show_info("[3/5] Running global alignment and matching...")
     global_transform = perform_global_registration(feats1, feats2, feature_columns=MAIN_MATCHING_FEATURE_COLUMNS)
     if global_transform is not None:
-        rotation = getattr(global_transform, "rotation", np.nan)
         translation = getattr(global_transform, "translation", np.array([np.nan, np.nan]))
-        if not (np.isfinite(rotation) and np.all(np.isfinite(translation))):
+        if not np.all(np.isfinite(translation)):
+            global_transform = None
+
+    # Sanity check: reject if translation is unreasonably large
+    if global_transform is not None:
+        trans_mag = float(np.linalg.norm(global_transform.translation))
+        if trans_mag > 500.0:
+            show_info(
+                f"  Global alignment REJECTED: translation={trans_mag:.1f}px "
+                f"(exceeds 500px sanity limit)"
+            )
             global_transform = None
 
     if global_transform is not None:
+        tx, ty = global_transform.translation
         show_info(
             "  Global alignment: "
-            f"rotation={float(global_transform.rotation):.4f} rad, "
-            f"translation=({float(global_transform.translation[0]):.1f}, {float(global_transform.translation[1]):.1f}) px"
+            f"translation=({float(tx):.1f}, {float(ty):.1f}) px"
         )
         feats2_aligned = apply_transform_to_coordinates(feats2, global_transform)
         feats2_aligned["pos_x_norm"] = feats2_aligned["centroid_x"] / float(max(mask1.shape[1], 1))
@@ -355,13 +363,11 @@ def registration_workflow_widget(
         show_info("  Global alignment unavailable; matching will use raw coordinates.")
         feats2_aligned = feats2.copy()
 
-    feats1_work = assign_patches(feats1, mask1.shape[1], mask1.shape[0])
-    feats2_work = assign_patches(feats2_aligned, mask1.shape[1], mask1.shape[0])
+    feats1_work = feats1.copy()
+    feats2_work = feats2_aligned.copy()
 
-    if int(top_k_per_patch) > 0:
-        show_info(f"  Matching mode: 3x3 patch matching ({int(top_k_per_patch)} per patch)")
-    else:
-        show_info("  Matching mode: global greedy matching")
+    max_dist = max(1, int(max_match_distance_px))
+    show_info(f"  Matching mode: global greedy matching (max distance={max_dist}px)")
 
     match_config = MatchingConfig(
         feature_columns=MAIN_MATCHING_FEATURE_COLUMNS,
@@ -370,18 +376,10 @@ def registration_workflow_widget(
         position_weight=position_weight,
         top_k=max(1, int(top_k)),
         distance_threshold=None,
-        spatial_window_size=None,
+        spatial_window_size=float(max_dist),
     )
 
-    if int(top_k_per_patch) > 0:
-        matches = match_cells_per_patch(
-            feats1_work,
-            feats2_work,
-            match_config,
-            top_k_per_patch=int(top_k_per_patch),
-        )
-    else:
-        matches = greedy_match_cells(feats1_work, feats2_work, match_config)
+    matches = greedy_match_cells(feats1_work, feats2_work, match_config)
 
     if not matches.empty and "distance" in matches.columns:
         show_info(

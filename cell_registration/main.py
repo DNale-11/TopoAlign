@@ -12,7 +12,6 @@ from .features import compute_cell_features
 from .matching import (
     MatchingConfig,
     greedy_match_cells,
-    match_cells_per_patch,
     match_cells_per_cluster,
     two_stage_match_cells,
 )
@@ -34,7 +33,7 @@ DEFAULT_FEATURE_WEIGHT = 1.0
 DEFAULT_TOPOLOGY_WEIGHT = 0.35
 DEFAULT_POSITION_WEIGHT = 4.0
 DEFAULT_DISTANCE_THRESHOLD = 2.0
-DEFAULT_SPATIAL_WINDOW_SIZE = 90.0
+DEFAULT_SPATIAL_WINDOW_SIZE = 100.0
 DEFAULT_SAVE_MATCH_TABLE = Path("outputs/top_matches.csv")
 DEFAULT_SAVE_MATCH_OVERLAY = Path("outputs/match _overlay")
 DEFAULT_SAVE_SEGMENTATION_PREFIX = Path("outputs/segmentation")
@@ -43,7 +42,6 @@ DEFAULT_SAVE_REGISTRATION_OVERLAY = Path("outputs/registration_overlay")
 DEFAULT_SAVE_FEATURES_DIR = Path("outputs")
 DEFAULT_RESIDUAL_PRUNE_QUANTILE = 0.9
 MIN_MATCHES_FOR_REFINEMENT = 3
-TOP_K_PER_PATCH = 6  # default 6 per patch -> 54 for 3x3 grid
 
 PATCH_GRID = 3  # 3x3 patches across the image
 PATCH_W = 1.0 / PATCH_GRID
@@ -692,7 +690,6 @@ def run_pipeline(
     img1_path: Path = DEFAULT_IMG1_PATH,
     img2_path: Path = DEFAULT_IMG2_PATH,
     top_k: int = DEFAULT_TOP_K,
-    top_k_per_patch: int | None = TOP_K_PER_PATCH,
     feature_weight: float = DEFAULT_FEATURE_WEIGHT,
     topology_weight: float = DEFAULT_TOPOLOGY_WEIGHT,
     position_weight: float = DEFAULT_POSITION_WEIGHT,
@@ -776,15 +773,12 @@ def run_pipeline(
         feature_weight=feature_weight,
         topology_weight=topology_weight,
         position_weight=position_weight,
-        top_k=max(top_k, (top_k_per_patch or 0) * PATCH_GRID * PATCH_GRID),
+        top_k=top_k,
         distance_threshold=distance_threshold,
         spatial_window_size=spatial_window_size,
         coarse_top_k=max(24, top_k),
         coarse_distance_threshold=2.0,
-        coarse_matching_mode="patch",
-        coarse_patch_rows=PATCH_GRID,
-        coarse_patch_cols=PATCH_GRID,
-        coarse_patch_top_k_per_patch=2,
+        coarse_matching_mode="global",
         coarse_allow_scale=False,
         coarse_prefer_affine=False,
         coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
@@ -815,8 +809,8 @@ def run_pipeline(
     else:
         print("Coarse alignment skipped; insufficient confident coarse matches.")
 
-    feats1_work = assign_patches(feats1, w1, h1, x_col="centroid_x", y_col="centroid_y")
-    feats2_work = assign_patches(feats2_aligned, w1, h1, x_col="centroid_x", y_col="centroid_y")
+    feats1_work = feats1.copy()
+    feats2_work = feats2_aligned.copy()
 
     if use_spatial_clusters:
         feats1_work, feats2_work = assign_clusters_from_round1(
@@ -858,30 +852,22 @@ def run_pipeline(
             feats2_work,
             match_cfg,
             cluster_col="cluster_id",
-            top_k_per_cluster=top_k_per_patch,
         )
     else:
-        if top_k_per_patch is not None:
-            matches = match_cells_per_patch(
-                feats1_work,
-                feats2_work,
-                match_cfg,
-                top_k_per_patch=top_k_per_patch,
-            )
-        else:
-            matches = greedy_match_cells(feats1_work, feats2_work, match_cfg)
+        matches = greedy_match_cells(feats1_work, feats2_work, match_cfg)
 
     if use_topology_filtering:
-        if "cell_id" not in feats1_work.columns:
-            feats1_work = feats1_work.copy()
-            feats1_work["cell_id"] = feats1_work.index
-        if "cell_id" not in feats2_work.columns:
-            feats2_work = feats2_work.copy()
-            feats2_work["cell_id"] = feats2_work.index
+        # Topology filtering requires patch assignments internally
+        feats1_topo = assign_patches(feats1_work, w1, h1, x_col="centroid_x", y_col="centroid_y")
+        feats2_topo = assign_patches(feats2_work, w1, h1, x_col="centroid_x", y_col="centroid_y")
+        if "cell_id" not in feats1_topo.columns:
+            feats1_topo["cell_id"] = feats1_topo.index
+        if "cell_id" not in feats2_topo.columns:
+            feats2_topo["cell_id"] = feats2_topo.index
         matches = rebuild_matches_from_topology_pairs(
             matches,
-            feats1_work,
-            feats2_work,
+            feats1_topo,
+            feats2_topo,
             image_width=w1,
             image_height=h1,
             k_pos_nei=k_pos_nei,
@@ -1042,38 +1028,22 @@ def run_pipeline(
     if napari_view:
         try:
             import napari  # type: ignore
+            from .visualization import launch_napari_viewer, warp_mask_to_image2
         except ImportError:
             print("napari not installed; skipping interactive viewer.")
         else:
-            if top_k_per_patch is not None:
-                if matches.empty:
-                    print("No top-per-region matches to display in napari.")
-                else:
-                    pts_r1 = feats1.loc[matches["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
-                    pts_r2 = feats2.loc[matches["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
-                    pts_r2_reg = _apply_rigid_to_points(pts_r2, transform.rotation, transform.translation)
-                    title = "Top-per-cluster registration" if use_spatial_clusters else "Top-per-patch registration (54 cells)"
-                    viewer = napari.Viewer(title=title)
-                    viewer.add_points(pts_r1, name="round1 top", face_color="cyan", size=12, opacity=0.9)
-                    viewer.add_points(pts_r2, name="round2 top (pre)", face_color="orange", size=10, opacity=0.6)
-                    viewer.add_points(pts_r2_reg, name="round2 top (reg)", face_color="magenta", size=12, opacity=0.9)
-                    viewer.window._qt_window.raise_()
-                    napari.run()
+            if matches.empty:
+                print("No matches to display in napari.")
             else:
-                try:
-                    from .visualization import launch_napari_viewer, warp_mask_to_image2
-                except ImportError:
-                    print("napari not installed; skipping interactive viewer.")
-                else:
-                    viewer1 = launch_napari_viewer(overlay_img1, masks1, feats1, title="Image1")
-                    viewer2 = launch_napari_viewer(overlay_img2, masks2, feats2, title="Image2")
-                    warped = warp_mask_to_image2(
-                        masks1, overlay_img2.shape[:2], transform.rotation, transform.translation
-                    )
-                    viewer2.add_labels((warped > 0).astype(int), name="warped_mask1_on_image2", opacity=0.4)
-                    viewer1.window._qt_window.raise_()  # bring windows forward
-                    viewer2.window._qt_window.raise_()
-                    napari.run()
+                viewer1 = launch_napari_viewer(overlay_img1, masks1, feats1, title="Image1")
+                viewer2 = launch_napari_viewer(overlay_img2, masks2, feats2, title="Image2")
+                warped = warp_mask_to_image2(
+                    masks1, overlay_img2.shape[:2], transform.rotation, transform.translation
+                )
+                viewer2.add_labels((warped > 0).astype(int), name="warped_mask1_on_image2", opacity=0.4)
+                viewer1.window._qt_window.raise_()
+                viewer2.window._qt_window.raise_()
+                napari.run()
     
 
 def parse_args() -> argparse.Namespace:
@@ -1123,12 +1093,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SPATIAL_WINDOW_SIZE,
         help="Maximum centroid distance in pixels for a feasible fine-stage match.",
     )
-    parser.add_argument(
-        "--top-per-patch",
-        type=int,
-        default=TOP_K_PER_PATCH,
-        help="If set, pick this many best matches per 3x3 patch (e.g., 6 -> up to 54 total).",
-    )
+
     parser.add_argument(
         "--use-spatial-clusters",
         action="store_true",
@@ -1233,7 +1198,6 @@ def main():
         args.image1,
         args.image2,
         top_k=args.top_k,
-        top_k_per_patch=args.top_per_patch,
         feature_weight=args.feature_weight,
         topology_weight=args.topology_weight,
         position_weight=args.position_weight,

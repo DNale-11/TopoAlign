@@ -10,7 +10,7 @@ from .config import (
 )
 from .segmentation import CellposeSegmenter
 from .features import compute_cell_features
-from .matching import greedy_match_cells, match_cells_per_patch, match_cells_per_cluster
+from .matching import greedy_match_cells, match_cells_per_cluster
 from .registration import estimate_rigid_transform_from_matches
 from .validation import validate_matches, compute_match_quality_stats
 from .robust_alignment import perform_global_registration, apply_transform_to_coordinates
@@ -37,7 +37,6 @@ __all__ = [
     "CellposeSegmenter",
     "compute_cell_features",
     "greedy_match_cells",
-    "match_cells_per_patch",
     "match_cells_per_cluster",
     "estimate_rigid_transform_from_matches",
     "perform_global_registration",

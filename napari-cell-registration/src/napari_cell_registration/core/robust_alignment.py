@@ -1,5 +1,8 @@
 """
 Robust global alignment using RANSAC on feature-based candidate matches.
+
+Uses a translation-only model (no rotation) since cell imaging rounds
+are assumed to differ only by a small shift.
 """
 
 from __future__ import annotations
@@ -10,6 +13,52 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from skimage.measure import ransac
 from skimage.transform import EuclideanTransform
+
+
+class TranslationTransform:
+    """Translation-only 2D transform compatible with skimage RANSAC.
+
+    This model estimates only (tx, ty) with zero rotation, which is more
+    robust than ``EuclideanTransform`` when feature-based candidate matches
+    are noisy and could otherwise lead RANSAC to fit spurious large rotations.
+    """
+
+    def __init__(self):
+        self._translation = np.zeros(2, dtype=float)
+
+    # -- properties compatible with EuclideanTransform --
+    @property
+    def rotation(self) -> float:
+        """Always 0 – no rotation is estimated."""
+        return 0.0
+
+    @property
+    def translation(self) -> np.ndarray:
+        return self._translation.copy()
+
+    @property
+    def params(self) -> np.ndarray:
+        """3×3 homogeneous matrix (translation only)."""
+        m = np.eye(3, dtype=float)
+        m[0, 2] = self._translation[0]
+        m[1, 2] = self._translation[1]
+        return m
+
+    # -- skimage RANSAC interface --
+    def estimate(self, src: np.ndarray, dst: np.ndarray) -> bool:
+        """Estimate translation as the mean of (dst − src)."""
+        self._translation = np.mean(dst - src, axis=0)
+        return True
+
+    def residuals(self, src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+        """Per-point Euclidean residual after applying the translation."""
+        transformed = src + self._translation
+        return np.sqrt(np.sum((transformed - dst) ** 2, axis=1))
+
+    # -- callable interface --
+    def __call__(self, coords: np.ndarray) -> np.ndarray:
+        """Apply translation to an (N, 2) coordinate array."""
+        return np.asarray(coords, dtype=float) + self._translation
 
 
 def get_feature_candidates(
@@ -75,9 +124,12 @@ def perform_global_registration(
     ransac_min_samples: int = 3,
     ransac_residual_threshold: float = 2.0,
     ransac_max_trials: int = 2000,
-) -> EuclideanTransform | None:
+) -> TranslationTransform | None:
     """
-    Estimate a global rigid transform aligning df2 to df1.
+    Estimate a global **translation-only** transform aligning df2 to df1.
+
+    Uses RANSAC with a ``TranslationTransform`` model so that noisy
+    feature candidates cannot produce spurious large rotations.
     """
     if df1.empty or df2.empty:
         return None
@@ -90,7 +142,7 @@ def perform_global_registration(
         np.random.seed(42)
         model, _ = ransac(
             (src, dst),
-            EuclideanTransform,
+            TranslationTransform,
             min_samples=ransac_min_samples,
             residual_threshold=ransac_residual_threshold,
             max_trials=ransac_max_trials,
@@ -103,12 +155,13 @@ def perform_global_registration(
 
 def apply_transform_to_coordinates(
     df: pd.DataFrame,
-    transform: EuclideanTransform,
+    transform,
     x_col: str = "centroid_x",
     y_col: str = "centroid_y",
 ) -> pd.DataFrame:
     """
-    Apply a EuclideanTransform to feature coordinates and return a copy.
+    Apply a transform (TranslationTransform or EuclideanTransform) to
+    feature coordinates and return a copy.
     """
     out = df.copy()
     coords = out[[x_col, y_col]].to_numpy(dtype=float)

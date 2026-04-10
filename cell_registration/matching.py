@@ -339,7 +339,7 @@ def two_stage_match_cells(
             position_weight=0.0,
             top_k=min(coarse_top_k, len(df1), len(df2)),
             distance_threshold=coarse_distance_threshold,
-            spatial_window_size=None if spatial_window_size is None else spatial_window_size * 2.0,
+            spatial_window_size=spatial_window_size,
         )
         coarse_strategy = str(coarse_matching_mode).strip().lower()
         if coarse_strategy == "patch":

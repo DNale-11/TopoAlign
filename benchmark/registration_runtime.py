@@ -114,11 +114,13 @@ DEFAULT_REG_PARAMS = {
     "coarse_patch_rows": 3,
     "coarse_patch_cols": 3,
     "coarse_patch_top_k_per_patch": None,
-    "coarse_image_enabled": False,
+    # Enable a conservative image-level translation initialization by default.
+    # This stabilizes feature matching on cases where morphology alone is too ambiguous.
+    "coarse_image_enabled": True,
     "coarse_image_target_max_dim": 256,
     "coarse_image_crop_ratio": 0.85,
     "coarse_image_upsample_factor": 10,
-    "coarse_image_min_score": 0.05,
+    "coarse_image_min_score": 0.25,
     "neighbor_k": 5,
     "neighbor_weight": 1.0,
     "landmark_weight": 10.0,
