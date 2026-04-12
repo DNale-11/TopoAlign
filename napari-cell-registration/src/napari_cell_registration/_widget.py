@@ -26,7 +26,12 @@ from .core import (
     rigid_transform_to_affine,
     two_stage_match_cells,
 )
-from .core.point_registration import warp_image_with_transform
+from .core.point_registration import (
+    warp_image_with_transform,
+    compute_valid_overlap_mask,
+    fit_tps_from_matches,
+    warp_image_with_tps,
+)
 
 
 class CellposeModel(Enum):
@@ -127,6 +132,8 @@ def registration_workflow_widget(
     ransac_residual_threshold: float = 2.0,
     min_area: int = 0,
     max_area: int = 0,
+    use_tps: bool = True,
+    tps_regularization: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.001}] = 0.001,
     save_results: bool = False,
     output_dir: str = "./registration_output",
 ):
@@ -342,15 +349,47 @@ def registration_workflow_widget(
     show_info("[5/5] Applying transformation and creating overlay...")
     _add_match_layers(matches, feats1, feats2)
 
-    img2_warped = warp_image_with_transform(img2, affine_transform, mask1.shape[:2], order=1)
-    img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
+    if use_tps and len(matches) >= 3:
+        # --- TPS warp: non-rigid, landmark-guided ---
+        show_info("  Using TPS warp (non-rigid, landmark-guided)...")
+        pts_fixed_xy = feats1.loc[matches["idx1"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+        pts_moving_xy = feats2.loc[matches["idx2"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+        tps = fit_tps_from_matches(
+            pts_fixed_xy,
+            pts_moving_xy,
+            output_shape=mask1.shape[:2],
+            rigid_transform=affine_transform,
+            regularization=float(tps_regularization),
+            n_boundary_per_side=4,
+            add_boundary_anchors_flag=True,
+        )
+        img2_warped = warp_image_with_tps(img2, tps, mask1.shape[:2], order=1)
+        img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
+        mask2_warped = warp_image_with_tps(
+            mask2.astype(np.int32), tps, mask1.shape[:2], order=0
+        )
+    else:
+        # --- Fallback: global rigid affine warp ---
+        if use_tps:
+            show_info("  Too few matches for TPS – falling back to rigid affine warp.")
+        img2_warped = warp_image_with_transform(img2, affine_transform, mask1.shape[:2], order=1)
+        img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
+        mask2_warped = warp_image_with_transform(mask2.astype(np.int32), affine_transform, mask1.shape[:2], order=0)
+
+    mask2_registered = np.rint(mask2_warped).astype(np.int32)
+
+    # Full Fusion: Where the registered moving mask has no data (background 0), retain the fixed mask.
+    # This naturally handles both the out-of-bounds boundaries and the spaces between moving cells.
+    mask2_registered = np.where(mask2_registered == 0, mask1, mask2_registered)
+
+    # For the image, fuse using maximum intensity projection (keeps signals from both)
+    if img1.shape == img2_registered.shape:
+        img2_registered = np.maximum(img1, img2_registered)
+
     image_kwargs = {"name": "Registered Image Round 2", "opacity": 0.5, "blending": "additive"}
     if img2_registered.ndim == 2:
         image_kwargs["colormap"] = "green"
     viewer.add_image(img2_registered, **image_kwargs)
-
-    mask2_warped = warp_image_with_transform(mask2.astype(np.int32), affine_transform, mask1.shape[:2], order=0)
-    mask2_registered = np.rint(mask2_warped).astype(np.int32)
     viewer.add_labels(mask2_registered, name="Registered Mask Round 2", opacity=0.35)
 
     all_pts_r2_xy = feats2[["centroid_x", "centroid_y"]].to_numpy(dtype=float)

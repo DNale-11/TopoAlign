@@ -839,3 +839,193 @@ if __name__ == "__main__":
         accept_worse=args.accept_worse,
         napari_view=args.napari,
     )
+
+
+# ---------------------------------------------------------------------------
+# Thin Plate Spline (TPS) registration
+# ---------------------------------------------------------------------------
+
+class ThinPlateSpline:
+    # 2D Thin Plate Spline estimated from matched control point pairs.
+    #
+    # The TPS minimises bending energy while interpolating exactly at each
+    # control point (when regularization=0).  In regions far from any control
+    # point the warp smoothly extrapolates from the nearest points.
+    #
+    # Mapping:  f(x) = a0 + a1*x + a2*y + Sum_i [w_i * U(||x - p_i||)]
+    # Kernel:   U(r) = r^2 * log(r),  U(0) = 0
+    #
+    # Parameters
+    # ----------
+    # regularization : float
+    #     Lambda added to the diagonal of K to stabilise the system.
+    #     0 -> exact interpolation at each control point.
+
+    def __init__(self, regularization: float = 1e-3) -> None:
+        self.regularization = float(regularization)
+        self._ctrl: np.ndarray | None = None
+        self._wx: np.ndarray | None = None
+        self._wy: np.ndarray | None = None
+
+    @staticmethod
+    def _kernel(r: np.ndarray) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = r * r * np.log(np.maximum(r, 1e-10))
+        return np.where(r < 1e-10, 0.0, v)
+
+    def _build_K(self, pts: np.ndarray) -> np.ndarray:
+        diff = pts[:, None, :] - pts[None, :, :]
+        return self._kernel(np.linalg.norm(diff, axis=2))
+
+    def _eval_K_row(self, query: np.ndarray) -> np.ndarray:
+        diff = query[:, None, :] - self._ctrl[None, :, :]
+        return self._kernel(np.linalg.norm(diff, axis=2))
+
+    def fit(self, pts_source: np.ndarray, pts_target: np.ndarray) -> "ThinPlateSpline":
+        pts_source = np.asarray(pts_source, dtype=float)
+        pts_target = np.asarray(pts_target, dtype=float)
+        if pts_source.ndim != 2 or pts_source.shape[1] != 2:
+            raise ValueError("pts_source must be (N, 2)")
+        if pts_target.shape != pts_source.shape:
+            raise ValueError("pts_source and pts_target must have the same shape")
+        N = len(pts_source)
+        self._ctrl = pts_source.copy()
+        K = self._build_K(pts_source)
+        if self.regularization > 0:
+            K += np.eye(N) * self.regularization
+        P = np.hstack([np.ones((N, 1)), pts_source])
+        A = np.vstack([
+            np.hstack([K, P]),
+            np.hstack([P.T, np.zeros((3, 3))]),
+        ])
+        rhs_x = np.concatenate([pts_target[:, 0], np.zeros(3)])
+        rhs_y = np.concatenate([pts_target[:, 1], np.zeros(3)])
+        self._wx = np.linalg.solve(A, rhs_x)
+        self._wy = np.linalg.solve(A, rhs_y)
+        return self
+
+    def predict(self, pts_query: np.ndarray) -> np.ndarray:
+        if self._ctrl is None:
+            raise RuntimeError("ThinPlateSpline has not been fitted yet.")
+        pts_query = np.asarray(pts_query, dtype=float)
+        if pts_query.ndim == 1:
+            pts_query = pts_query[None, :]
+        Kq = self._eval_K_row(pts_query)
+        P = np.hstack([np.ones((len(pts_query), 1)), pts_query])
+        basis = np.hstack([Kq, P])
+        return np.stack([basis @ self._wx, basis @ self._wy], axis=1)
+
+
+def _add_boundary_anchors(
+    pts_fixed: np.ndarray,
+    pts_moving: np.ndarray,
+    output_shape: tuple[int, int],
+    rigid_transform: AffineTransform | None = None,
+    n_side: int = 4,
+) -> tuple[np.ndarray, np.ndarray]:
+    # Add virtual anchor points on the image boundary to prevent wild TPS
+    # extrapolation outside the convex hull of real landmarks.
+    H, W = output_shape
+    xs = np.linspace(0, W - 1, n_side)
+    ys = np.linspace(0, H - 1, n_side)
+    border: list[list[float]] = []
+    for x in xs:
+        border.append([x, 0.0])
+        border.append([x, float(H - 1)])
+    for y in ys[1:-1]:
+        border.append([0.0, y])
+        border.append([float(W - 1), y])
+    border_fixed = np.array(border, dtype=float)
+    border_moving = rigid_transform.inverse(border_fixed) if rigid_transform is not None else border_fixed.copy()
+    return np.vstack([pts_fixed, border_fixed]), np.vstack([pts_moving, border_moving])
+
+
+def fit_tps_from_matches(
+    pts_fixed: np.ndarray,
+    pts_moving: np.ndarray,
+    output_shape: tuple[int, int],
+    rigid_transform: AffineTransform | None = None,
+    *,
+    regularization: float = 1e-3,
+    n_boundary_per_side: int = 4,
+    add_boundary_anchors_flag: bool = True,
+) -> ThinPlateSpline:
+    # Build a ThinPlateSpline mapping fixed-image pixel coords to
+    # moving-image pixel coords (the inverse mapping for image warping).
+    #
+    # Parameters
+    # ----------
+    # pts_fixed  : (N, 2) landmark centroids in fixed image (x, y).
+    # pts_moving : (N, 2) corresponding centroids in moving image.
+    # output_shape : (H, W) of the fixed / output image.
+    # rigid_transform : global AffineTransform (moving->fixed); its .inverse
+    #                   predicts moving coords for boundary anchors.
+    # regularization  : TPS lambda; larger = smoother but less exact.
+    # n_boundary_per_side : virtual anchors per image edge (>= 2).
+    # add_boundary_anchors_flag : whether to add stabilising boundary anchors.
+    src = np.asarray(pts_fixed, dtype=float)
+    tgt = np.asarray(pts_moving, dtype=float)
+    if add_boundary_anchors_flag and n_boundary_per_side >= 2:
+        src, tgt = _add_boundary_anchors(
+            src, tgt, output_shape,
+            rigid_transform=rigid_transform,
+            n_side=n_boundary_per_side,
+        )
+    tps = ThinPlateSpline(regularization=regularization)
+    tps.fit(src, tgt)
+    return tps
+
+
+def warp_image_with_tps(
+    moving_image: np.ndarray,
+    tps: ThinPlateSpline,
+    output_shape: tuple[int, int],
+    *,
+    order: int = 1,
+    chunk_size: int = 65536,
+) -> np.ndarray:
+    # Warp moving_image into fixed-image space using a pre-fitted TPS.
+    #
+    # Evaluates the TPS at every output pixel to obtain the source coordinate
+    # in the moving image, then samples with scipy.ndimage.map_coordinates.
+    #
+    # Parameters
+    # ----------
+    # moving_image : 2-D (H_m, W_m) or 3-D array.
+    # tps          : fitted ThinPlateSpline (fixed coords -> moving coords).
+    # output_shape : (H, W) of the desired output.
+    # order        : interpolation order (1=bilinear, 0=nearest for masks).
+    # chunk_size   : pixels per TPS evaluation batch (speed vs memory).
+    from scipy.ndimage import map_coordinates
+
+    H, W = int(output_shape[0]), int(output_shape[1])
+    total = H * W
+
+    gy, gx = np.meshgrid(np.arange(H, dtype=float), np.arange(W, dtype=float), indexing="ij")
+    queries_xy = np.stack([gx.ravel(), gy.ravel()], axis=1)
+
+    src_xy = np.empty_like(queries_xy)
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        src_xy[start:end] = tps.predict(queries_xy[start:end])
+
+    src_row = src_xy[:, 1].reshape(H, W)
+    src_col = src_xy[:, 0].reshape(H, W)
+
+    def _warp_ch(ch: np.ndarray) -> np.ndarray:
+        return map_coordinates(ch.astype(float), [src_row, src_col],
+                               order=order, mode="constant", cval=0.0)
+
+    if moving_image.ndim == 2:
+        return _warp_ch(moving_image)
+    if moving_image.ndim == 3 and moving_image.shape[0] <= 10 and moving_image.shape[1] > 10:
+        warped = np.zeros((moving_image.shape[0], H, W), dtype=float)
+        for c in range(moving_image.shape[0]):
+            warped[c] = _warp_ch(moving_image[c])
+        return warped
+    if moving_image.ndim == 3 and moving_image.shape[2] <= 10:
+        warped = np.zeros((H, W, moving_image.shape[2]), dtype=float)
+        for c in range(moving_image.shape[2]):
+            warped[..., c] = _warp_ch(moving_image[..., c])
+        return warped
+    return _warp_ch(moving_image)

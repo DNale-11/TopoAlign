@@ -14,6 +14,7 @@ from .matching import greedy_match_cells, match_cells_per_cluster, two_stage_mat
 from .registration import estimate_rigid_transform_from_matches
 from .validation import validate_matches, compute_match_quality_stats
 from .robust_alignment import perform_global_registration, apply_transform_to_coordinates
+from .point_registration import ThinPlateSpline, fit_tps_from_matches, warp_image_with_tps
 from .workflow import (
     MAIN_MATCHING_FEATURE_COLUMNS,
     MIN_MATCHES_FOR_REFINEMENT,
@@ -55,4 +56,7 @@ __all__ = [
 
     "validate_matches",
     "compute_match_quality_stats",
+    "ThinPlateSpline",
+    "fit_tps_from_matches",
+    "warp_image_with_tps",
 ]
