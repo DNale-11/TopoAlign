@@ -134,6 +134,7 @@ def registration_workflow_widget(
     max_area: int = 0,
     use_tps: bool = True,
     tps_regularization: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.001}] = 0.001,
+    n_iterations: Annotated[int, {"min": 1, "max": 5, "step": 1}] = 2,
     save_results: bool = False,
     output_dir: str = "./registration_output",
 ):
@@ -208,152 +209,224 @@ def registration_workflow_widget(
         show_info("No cells available after feature extraction.")
         return
 
-    show_info("[3/5] Running morphology-guided matching...")
-    max_dist = max(1, int(max_match_distance_px))
-    match_result = two_stage_match_cells(
-        feats1,
-        feats2,
-        mask1.shape,
-        feature_weight=1.0,
-        topology_weight=0.0,
-        position_weight=position_weight,
-        top_k=max(1, int(top_k)),
-        distance_threshold=None,
-        spatial_window_size=float(max_dist),
-        min_cells_for_two_stage=10,
-        coarse_top_k=max(24, int(top_k)),
-        coarse_distance_threshold=2.0,
-        coarse_matching_mode="morphology_guided",
-        coarse_allow_scale=False,
-        coarse_prefer_affine=False,
-        coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
-        coarse_max_trials=min(max(int(ransac_max_trials), 200), 2000),
-    )
-    matches = match_result.matches.copy()
+    # =====================================================================
+    # Iterative matching + transform estimation
+    # =====================================================================
+    # We keep the ORIGINAL feats2 (feats2_orig) unchanged.  In each
+    # iteration the moving centroids are updated with the cumulative
+    # rigid transform so that the spatial search window becomes
+    # progressively more accurate.
+    # ------------------------------------------------------------------
+    feats2_orig = feats2.copy()          # pristine copy – never modified
+    cumulative_R = np.eye(2)             # cumulative rotation
+    cumulative_t = np.zeros(2)           # cumulative translation
+    all_match_pairs: set = set()         # (idx1, idx2) pairs across iters
+    transform = None                     # latest EuclideanTransform
+    matches = pd.DataFrame()             # latest matches table
+    n_iters = max(1, int(n_iterations))
 
-    if len(match_result.coarse_matches) >= 3:
-        tx, ty = match_result.coarse_offset_xy
-        if match_result.coarse_transform_accepted:
-            show_info(
-                "  Coarse translation accepted: "
-                f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
-                f"median residual={match_result.coarse_median_inlier_residual:.2f}px, "
-                f"shift=({float(tx):.1f}, {float(ty):.1f}) px"
-            )
-        else:
-            show_info(
-                "  Coarse translation rejected: "
-                f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
-                f"median residual={match_result.coarse_median_inlier_residual:.2f}px"
-            )
-    else:
-        show_info("  Coarse translation skipped; insufficient confident candidates.")
+    for it in range(1, n_iters + 1):
+        iter_tag = f"[iter {it}/{n_iters}]" if n_iters > 1 else ""
 
-    if not matches.empty and "distance" in matches.columns:
-        show_info(
-            "  Match distances: "
-            f"min={matches['distance'].min():.2f}, "
-            f"max={matches['distance'].max():.2f}, "
-            f"mean={matches['distance'].mean():.2f}"
-        )
-
-    if matches.empty:
-        show_info("No matches available after matching; registration aborted.")
-        return
-
-    show_info(f"  Selected matches: {len(matches)}")
-
-    show_info("[4/5] Estimating registration transform...")
-    if len(matches) < 3:
-        show_info(f"  Only {len(matches)} matches found; need at least 3 to estimate a transform.")
-        return
-
-    if use_ransac_transform:
-        transform, inlier_mask = estimate_rigid_transform_from_matches_ransac(
+        show_info(f"[3/5] {iter_tag} Running morphology-guided matching...")
+        max_dist = max(1, int(max_match_distance_px))
+        # After iter-1, feats2 centroids are already closer → we can
+        # shrink the spatial window for tighter matching.
+        effective_dist = max_dist if it == 1 else max(max_dist // 2, 20)
+        match_result = two_stage_match_cells(
             feats1,
             feats2,
-            matches,
-            max_trials=int(ransac_max_trials),
-            residual_threshold=float(ransac_residual_threshold),
-            min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+            mask1.shape,
+            feature_weight=1.0,
+            topology_weight=0.0,
+            position_weight=position_weight,
+            top_k=max(1, int(top_k)),
+            distance_threshold=None,
+            spatial_window_size=float(effective_dist),
+            min_cells_for_two_stage=10,
+            coarse_top_k=max(24, int(top_k)),
+            coarse_distance_threshold=2.0,
+            coarse_matching_mode="morphology_guided",
+            coarse_allow_scale=False,
+            coarse_prefer_affine=False,
+            coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
+            coarse_max_trials=min(max(int(ransac_max_trials), 200), 2000),
         )
-        matches = matches.copy()
-        matches["ransac_inlier"] = inlier_mask
-        inlier_count = int(inlier_mask.sum())
-        show_info(f"  RANSAC support: {inlier_count}/{len(matches)} inliers")
-        all_residuals = compute_match_residuals(feats1, feats2, matches, transform)
-        if inlier_count >= MIN_MATCHES_FOR_REFINEMENT:
-            inlier_residuals = all_residuals[inlier_mask]
-            inlier_median = float(np.median(inlier_residuals))
-            inlier_mad = float(np.median(np.abs(inlier_residuals - inlier_median)))
-            robust_scale = max(1.4826 * inlier_mad, 0.5)
-            model_threshold = max(
-                float(ransac_residual_threshold) * 2.0,
-                inlier_median + 3.0 * robust_scale,
+        iter_matches = match_result.matches.copy()
+
+        if it == 1 and len(match_result.coarse_matches) >= 3:
+            tx, ty = match_result.coarse_offset_xy
+            if match_result.coarse_transform_accepted:
+                show_info(
+                    "  Coarse translation accepted: "
+                    f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
+                    f"median residual={match_result.coarse_median_inlier_residual:.2f}px, "
+                    f"shift=({float(tx):.1f}, {float(ty):.1f}) px"
+                )
+            else:
+                show_info(
+                    "  Coarse translation rejected: "
+                    f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
+                    f"median residual={match_result.coarse_median_inlier_residual:.2f}px"
+                )
+
+        if not iter_matches.empty and "distance" in iter_matches.columns:
+            show_info(
+                f"  {iter_tag} Match distances: "
+                f"min={iter_matches['distance'].min():.2f}, "
+                f"max={iter_matches['distance'].max():.2f}, "
+                f"mean={iter_matches['distance'].mean():.2f}"
             )
-            keep_mask = all_residuals <= model_threshold
-            keep_count = int(keep_mask.sum())
-            if MIN_MATCHES_FOR_REFINEMENT <= keep_count < len(matches):
-                matches = matches.loc[keep_mask].reset_index(drop=True)
-                transform, _ = estimate_rigid_transform_from_matches_ransac(
-                    feats1,
-                    feats2,
-                    matches,
-                    max_trials=int(ransac_max_trials),
-                    residual_threshold=float(ransac_residual_threshold),
-                    min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+
+        if iter_matches.empty:
+            if it == 1:
+                show_info("No matches available after matching; registration aborted.")
+                return
+            show_info(f"  {iter_tag} No new matches; stopping iteration early.")
+            break
+
+        show_info(f"  {iter_tag} Selected matches: {len(iter_matches)}")
+
+        # ---- Estimate transform from THIS iteration's matches ----
+        show_info(f"[4/5] {iter_tag} Estimating registration transform...")
+        if len(iter_matches) < 3:
+            if it == 1:
+                show_info(f"  Only {len(iter_matches)} matches found; need at least 3 to estimate a transform.")
+                return
+            show_info(f"  {iter_tag} Too few new matches; stopping iteration early.")
+            break
+
+        if use_ransac_transform:
+            iter_transform, inlier_mask = estimate_rigid_transform_from_matches_ransac(
+                feats1,
+                feats2,
+                iter_matches,
+                max_trials=int(ransac_max_trials),
+                residual_threshold=float(ransac_residual_threshold),
+                min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+            )
+            iter_matches = iter_matches.copy()
+            iter_matches["ransac_inlier"] = inlier_mask
+            inlier_count = int(inlier_mask.sum())
+            show_info(f"  {iter_tag} RANSAC support: {inlier_count}/{len(iter_matches)} inliers")
+            all_residuals = compute_match_residuals(feats1, feats2, iter_matches, iter_transform)
+            if inlier_count >= MIN_MATCHES_FOR_REFINEMENT:
+                inlier_residuals = all_residuals[inlier_mask]
+                inlier_median = float(np.median(inlier_residuals))
+                inlier_mad = float(np.median(np.abs(inlier_residuals - inlier_median)))
+                robust_scale = max(1.4826 * inlier_mad, 0.5)
+                model_threshold = max(
+                    float(ransac_residual_threshold) * 2.0,
+                    inlier_median + 3.0 * robust_scale,
+                )
+                keep_mask = all_residuals <= model_threshold
+                keep_count = int(keep_mask.sum())
+                if MIN_MATCHES_FOR_REFINEMENT <= keep_count < len(iter_matches):
+                    iter_matches = iter_matches.loc[keep_mask].reset_index(drop=True)
+                    iter_transform, _ = estimate_rigid_transform_from_matches_ransac(
+                        feats1,
+                        feats2,
+                        iter_matches,
+                        max_trials=int(ransac_max_trials),
+                        residual_threshold=float(ransac_residual_threshold),
+                        min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+                    )
+                    show_info(
+                        f"  {iter_tag} RANSAC consistency filter: "
+                        f"kept {keep_count}/{len(keep_mask)} matches at <= {model_threshold:.2f}px"
+                    )
+            else:
+                show_info(f"  {iter_tag} Too few RANSAC inliers to filter; keeping all matches")
+        else:
+            iter_transform = estimate_rigid_transform_from_matches(feats1, feats2, iter_matches)
+
+        residuals = compute_match_residuals(feats1, feats2, iter_matches, iter_transform)
+        iter_matches = iter_matches.copy()
+        iter_matches["residual_px"] = residuals
+
+        if (
+            0.0 < float(residual_prune_quantile) < 1.0
+            and len(iter_matches) >= MIN_MATCHES_FOR_REFINEMENT
+        ):
+            threshold = float(np.quantile(residuals, float(residual_prune_quantile)))
+            keep_mask = residuals <= threshold
+            kept = int(keep_mask.sum())
+            if kept >= MIN_MATCHES_FOR_REFINEMENT and kept < len(iter_matches):
+                iter_matches = iter_matches.loc[keep_mask].reset_index(drop=True)
+                iter_transform = estimate_rigid_transform_from_matches(feats1, feats2, iter_matches)
+                iter_matches["residual_px"] = compute_match_residuals(
+                    feats1, feats2, iter_matches, iter_transform
                 )
                 show_info(
-                    "  RANSAC model consistency filter: "
-                    f"kept {keep_count}/{len(keep_mask)} matches at <= {model_threshold:.2f}px"
+                    f"  {iter_tag} Residual pruning: kept {kept}/{len(residuals)} matches at <= {threshold:.2f}px"
                 )
-        else:
-            show_info("  Too few RANSAC inliers to filter matches safely; keeping all matches")
-    else:
-        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
 
-    residuals = compute_match_residuals(feats1, feats2, matches, transform)
-    matches = matches.copy()
-    matches["residual_px"] = residuals
-
-    if (
-        0.0 < float(residual_prune_quantile) < 1.0
-        and len(matches) >= MIN_MATCHES_FOR_REFINEMENT
-    ):
-        threshold = float(np.quantile(residuals, float(residual_prune_quantile)))
-        keep_mask = residuals <= threshold
-        kept = int(keep_mask.sum())
-        if kept >= MIN_MATCHES_FOR_REFINEMENT and kept < len(matches):
-            matches = matches.loc[keep_mask].reset_index(drop=True)
-            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
-            matches["residual_px"] = compute_match_residuals(feats1, feats2, matches, transform)
+        # ---- Accumulate the transform ----
+        transform = iter_transform
+        matches = iter_matches
+        rotation_deg = float(np.degrees(np.arctan2(transform.rotation[1, 0], transform.rotation[0, 0])))
+        show_info(
+            f"  {iter_tag} Transform: "
+            f"rotation={rotation_deg:.2f} deg, "
+            f"translation=({float(transform.translation[0]):.1f}, {float(transform.translation[1]):.1f}) px"
+        )
+        if len(matches) > 0:
             show_info(
-                f"  Residual pruning: kept {kept}/{len(residuals)} matches at <= {threshold:.2f}px"
+                f"  {iter_tag} Residuals: "
+                f"min={matches['residual_px'].min():.2f}px, "
+                f"max={matches['residual_px'].max():.2f}px, "
+                f"mean={matches['residual_px'].mean():.2f}px"
             )
 
-    affine_transform = rigid_transform_to_affine(transform)
-    rotation_deg = float(np.degrees(np.arctan2(transform.rotation[1, 0], transform.rotation[0, 0])))
+        # Collect unique match pairs across all iterations
+        for _, row in iter_matches.iterrows():
+            all_match_pairs.add((int(row["idx1"]), int(row["idx2"])))
+        show_info(f"  {iter_tag} Total unique landmark pairs so far: {len(all_match_pairs)}")
+
+        # Update cumulative rigid transform:  T_cum = T_iter ∘ T_cum_prev
+        R_iter = transform.rotation
+        t_iter = transform.translation
+        cumulative_t = R_iter @ cumulative_t + t_iter
+        cumulative_R = R_iter @ cumulative_R
+
+        # If there is a next iteration, warp feats2 centroids so the
+        # spatial window in the next round is more accurate.
+        if it < n_iters:
+            feats2 = feats2_orig.copy()
+            orig_xy = feats2_orig[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+            # Apply cumulative rigid to ORIGINAL coords → current aligned coords
+            warped_xy = apply_rigid_to_points(orig_xy, cumulative_R, cumulative_t)
+            feats2["centroid_x"] = warped_xy[:, 0]
+            feats2["centroid_y"] = warped_xy[:, 1]
+            show_info(f"  {iter_tag} Updated R2 centroids for next iteration.")
+
+    # After all iterations, build the definitive affine from the cumulative rigid.
+    from skimage.transform import AffineTransform as SkAffine
+    affine_transform = SkAffine(matrix=np.vstack([
+        np.hstack([cumulative_R, cumulative_t.reshape(2, 1)]),
+        [0, 0, 1],
+    ]))
     show_info(
-        "  Final transform: "
-        f"rotation={rotation_deg:.2f} deg, "
-        f"translation=({float(transform.translation[0]):.1f}, {float(transform.translation[1]):.1f}) px"
+        f"  Cumulative transform after {n_iters} iteration(s): "
+        f"rotation={float(np.degrees(np.arctan2(cumulative_R[1,0], cumulative_R[0,0]))):.2f} deg, "
+        f"translation=({cumulative_t[0]:.1f}, {cumulative_t[1]:.1f}) px, "
+        f"total unique landmarks={len(all_match_pairs)}"
     )
-    if len(matches) > 0:
-        show_info(
-            "  Residuals: "
-            f"min={matches['residual_px'].min():.2f}px, "
-            f"max={matches['residual_px'].max():.2f}px, "
-            f"mean={matches['residual_px'].mean():.2f}px"
-        )
 
     show_info("[5/5] Applying transformation and creating overlay...")
     _add_match_layers(matches, feats1, feats2)
 
-    if use_tps and len(matches) >= 3:
+    if use_tps and len(all_match_pairs) >= 3:
         # --- TPS warp: non-rigid, landmark-guided ---
-        show_info("  Using TPS warp (non-rigid, landmark-guided)...")
-        pts_fixed_xy = feats1.loc[matches["idx1"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-        pts_moving_xy = feats2.loc[matches["idx2"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+        # Use ALL unique landmark pairs accumulated across iterations for maximum coverage.
+        # We must use the ORIGINAL feats2 coords (not the iteratively warped ones)
+        # because TPS maps fixed→moving in raw image space.
+        pair_list = sorted(all_match_pairs)
+        idx1_all = [p[0] for p in pair_list]
+        idx2_all = [p[1] for p in pair_list]
+        pts_fixed_xy = feats1.loc[idx1_all, ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+        pts_moving_xy = feats2_orig.loc[idx2_all, ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+        show_info(f"  Using TPS warp with {len(pair_list)} accumulated landmarks (non-rigid)...")
         tps = fit_tps_from_matches(
             pts_fixed_xy,
             pts_moving_xy,
@@ -392,8 +465,8 @@ def registration_workflow_widget(
     viewer.add_image(img2_registered, **image_kwargs)
     viewer.add_labels(mask2_registered, name="Registered Mask Round 2", opacity=0.35)
 
-    all_pts_r2_xy = feats2[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-    all_pts_r2_registered_xy = apply_rigid_to_points(all_pts_r2_xy, transform.rotation, transform.translation)
+    all_pts_r2_xy = feats2_orig[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    all_pts_r2_registered_xy = apply_rigid_to_points(all_pts_r2_xy, cumulative_R, cumulative_t)
     viewer.add_points(
         all_pts_r2_registered_xy[:, ::-1],
         name="Registered Points Round 2",
