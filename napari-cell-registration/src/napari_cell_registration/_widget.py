@@ -134,7 +134,6 @@ def registration_workflow_widget(
     max_area: int = 0,
     use_tps: bool = True,
     tps_regularization: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.001}] = 0.001,
-    n_iterations: Annotated[int, {"min": 1, "max": 5, "step": 1}] = 2,
     save_results: bool = False,
     output_dir: str = "./registration_output",
 ):
@@ -212,7 +211,7 @@ def registration_workflow_widget(
     # =====================================================================
     # PASS 1 – Full registration pipeline
     # =====================================================================
-    show_info("[3/6] Running morphology-guided matching (Pass 1)...")
+    show_info("[3/5] Running morphology-guided matching...")
     max_dist = max(1, int(max_match_distance_px))
     match_result = two_stage_match_cells(
         feats1,
@@ -267,7 +266,7 @@ def registration_workflow_widget(
 
     show_info(f"  Selected matches: {len(matches)}")
 
-    show_info("[4/6] Estimating registration transform (Pass 1)...")
+    show_info("[4/5] Estimating registration transform...")
     if len(matches) < 3:
         show_info(f"  Only {len(matches)} matches found; need at least 3.")
         return
@@ -329,135 +328,29 @@ def registration_workflow_widget(
             matches["residual_px"] = compute_match_residuals(feats1, feats2, matches, transform)
             show_info(f"  Residual pruning: kept {kept}/{len(residuals)} matches at <= {threshold:.2f}px")
 
-    pass1_affine = rigid_transform_to_affine(transform)
+    affine_transform = rigid_transform_to_affine(transform)
     rotation_deg = float(np.degrees(np.arctan2(transform.rotation[1, 0], transform.rotation[0, 0])))
     show_info(
-        "  Pass 1 transform: "
+        "  Final transform: "
         f"rotation={rotation_deg:.2f} deg, "
         f"translation=({float(transform.translation[0]):.1f}, {float(transform.translation[1]):.1f}) px"
     )
-
-    # Collect pass-1 landmark pairs (fixed_idx, moving_idx) using ORIGINAL indices
-    pass1_landmarks = set()
-    for _, row in matches.iterrows():
-        pass1_landmarks.add((int(row["idx1"]), int(row["idx2"])))
-    show_info(f"  Pass 1 landmarks: {len(pass1_landmarks)}")
-
-    # =====================================================================
-    # PASS 2 – Lightweight refinement on warped image & mask
-    # =====================================================================
-    all_match_pairs = set(pass1_landmarks)  # start with pass-1 pairs
-    affine_transform = pass1_affine         # current best affine
-
-    if int(n_iterations) >= 2 and len(matches) >= 3:
-        show_info("[5/6] Pass 2: Warping image+mask, re-extracting features...")
-        # Actually warp the moving image and mask with pass-1 transform
-        img2_pass1 = warp_image_with_transform(img2, pass1_affine, mask1.shape[:2], order=1)
-        mask2_pass1_f = warp_image_with_transform(
-            mask2.astype(np.int32), pass1_affine, mask1.shape[:2], order=0
+    if len(matches) > 0:
+        show_info(
+            "  Residuals: "
+            f"min={matches['residual_px'].min():.2f}px, "
+            f"max={matches['residual_px'].max():.2f}px, "
+            f"mean={matches['residual_px'].mean():.2f}px"
         )
-        mask2_pass1 = np.rint(mask2_pass1_f).astype(np.int32)
 
-        # Re-extract features from the WARPED mask
-        feats2_warped = compute_cell_features(mask2_pass1, feat_config)
-        n_cells2_warped = len(feats2_warped)
-        show_info(f"  Warped Round 2: {n_cells2_warped} cells")
-
-        if n_cells2_warped >= 3:
-            # Lightweight matching: smaller spatial window, same morphology matching
-            pass2_dist = max(max_dist // 2, 15)
-            show_info(f"  Pass 2 matching (spatial_window={pass2_dist}px)...")
-            match_result2 = two_stage_match_cells(
-                feats1,
-                feats2_warped,
-                mask1.shape,
-                feature_weight=1.0,
-                topology_weight=0.0,
-                position_weight=position_weight,
-                top_k=max(1, int(top_k)),
-                distance_threshold=None,
-                spatial_window_size=float(pass2_dist),
-                min_cells_for_two_stage=10,
-                coarse_top_k=max(24, int(top_k)),
-                coarse_distance_threshold=2.0,
-                coarse_matching_mode="morphology_guided",
-                coarse_allow_scale=False,
-                coarse_prefer_affine=False,
-                coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
-                coarse_max_trials=min(max(int(ransac_max_trials), 200), 2000),
-            )
-            matches2 = match_result2.matches.copy()
-            show_info(f"  Pass 2 matches: {len(matches2)}")
-
-            if len(matches2) >= 3:
-                # Direct RANSAC – no KNN, no guided rematch, no residual pruning
-                transform2, inlier_mask2 = estimate_rigid_transform_from_matches_ransac(
-                    feats1, feats2_warped, matches2,
-                    max_trials=int(ransac_max_trials),
-                    residual_threshold=float(ransac_residual_threshold),
-                    min_inliers=3,
-                )
-                inlier_count2 = int(inlier_mask2.sum())
-                show_info(f"  Pass 2 RANSAC: {inlier_count2}/{len(matches2)} inliers")
-
-                # Compose transforms: T_final = T2 ∘ T1
-                # pass1_affine maps original R2 → aligned-to-R1 coords
-                # transform2 maps warped-R2 coords → fine-aligned coords
-                pass2_affine = rigid_transform_to_affine(transform2)
-                composed_matrix = pass2_affine.params @ pass1_affine.params
-                from skimage.transform import AffineTransform as SkAffine
-                affine_transform = SkAffine(matrix=composed_matrix)
-
-                rot2 = float(np.degrees(np.arctan2(
-                    transform2.rotation[1, 0], transform2.rotation[0, 0]
-                )))
-                show_info(
-                    f"  Pass 2 residual transform: rotation={rot2:.2f} deg, "
-                    f"translation=({float(transform2.translation[0]):.1f}, "
-                    f"{float(transform2.translation[1]):.1f}) px"
-                )
-
-                # Collect pass-2 landmark pairs.
-                # Pass-2 feats2_warped has its own cell IDs (from re-segmented warped mask).
-                # The warped centroids are already in fixed-image coordspace,
-                # so these pairs can be used directly for TPS.
-                # We store them as (idx1_fixed, idx2_warped) with a prefix to avoid
-                # collision with pass-1 indices. For TPS we'll build separate arrays.
-                pass2_inlier_matches = matches2.loc[inlier_mask2].copy()
-                pass2_landmark_pts_fixed = feats1.loc[
-                    pass2_inlier_matches["idx1"], ["centroid_x", "centroid_y"]
-                ].to_numpy(dtype=float)
-                pass2_landmark_pts_moving = feats2_warped.loc[
-                    pass2_inlier_matches["idx2"], ["centroid_x", "centroid_y"]
-                ].to_numpy(dtype=float)
-                # The warped centroids approximate fixed coords; the "moving"
-                # originals can be recovered via inverse of pass1_affine.
-                # But for simplicity, we only accumulate pass-1 landmarks in
-                # ORIGINAL R2 space. Pass-2 contributes to the composed affine
-                # which is already more accurate.
-                show_info(
-                    f"  Pass 2 inlier landmarks: {len(pass2_inlier_matches)}, "
-                    f"total combined: {len(pass1_landmarks)} (pass1) + "
-                    f"{len(pass2_inlier_matches)} (pass2)"
-                )
-                matches = matches2  # use pass-2 matches for visualization
-        else:
-            show_info("  Pass 2: too few cells after warping; skipping refinement.")
-    else:
-        show_info("[5/6] Pass 2: skipped (n_iterations=1 or too few matches).")
-
-    show_info("[6/6] Applying transformation and creating overlay...")
+    show_info("[5/5] Applying transformation and creating overlay...")
     _add_match_layers(matches, feats1, feats2)
 
-    if use_tps and len(pass1_landmarks) >= 3:
+    if use_tps and len(matches) >= 3:
         # --- TPS warp: non-rigid, landmark-guided ---
-        # Use pass-1 landmark pairs with ORIGINAL feats2 coordinates.
-        pair_list = sorted(pass1_landmarks)
-        idx1_all = [p[0] for p in pair_list]
-        idx2_all = [p[1] for p in pair_list]
-        pts_fixed_xy = feats1.loc[idx1_all, ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-        pts_moving_xy = feats2.loc[idx2_all, ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-        show_info(f"  Using TPS warp with {len(pair_list)} landmarks (non-rigid)...")
+        show_info("  Using TPS warp (non-rigid, landmark-guided)...")
+        pts_fixed_xy = feats1.loc[matches["idx1"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+        pts_moving_xy = feats2.loc[matches["idx2"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
         tps = fit_tps_from_matches(
             pts_fixed_xy,
             pts_moving_xy,
