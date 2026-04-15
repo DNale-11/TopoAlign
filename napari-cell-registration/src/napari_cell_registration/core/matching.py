@@ -668,7 +668,7 @@ def two_stage_match_cells(
         distance_threshold=distance_threshold,
         spatial_window_size=fine_spatial_window_size,
     )
-    matches = greedy_match_cells(df1, aligned_df2, fine_config)
+    matches = greedy_match_cells(df1, aligned_df2, fine_config, image_shape=image_shape)
 
     return TwoStageMatchResult(
         matches=matches,
@@ -684,15 +684,176 @@ def two_stage_match_cells(
     )
 
 
-def greedy_match_cells(df1: pd.DataFrame, df2: pd.DataFrame, config: MatchingConfig) -> pd.DataFrame:
+def _assign_patch_labels(
+    df: pd.DataFrame,
+    image_shape: Sequence[int],
+    grid: int,
+) -> np.ndarray:
+    """Return integer patch labels (row-major) for each cell based on centroid."""
+    h, w = image_shape[:2]
+    x = df["centroid_x"].to_numpy(dtype=float)
+    y = df["centroid_y"].to_numpy(dtype=float)
+    px = np.clip(np.floor(x * float(grid) / float(max(w, 1))).astype(int), 0, grid - 1)
+    py = np.clip(np.floor(y * float(grid) / float(max(h, 1))).astype(int), 0, grid - 1)
+    return py * grid + px
+
+
+def _ensure_patch_coverage(
+    match_df: pd.DataFrame,
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    dist_matrix: np.ndarray,
+    config: MatchingConfig,
+    image_shape: Sequence[int],
+    coverage_patch_grid: int = 2,
+    min_per_patch: int = 1,
+) -> pd.DataFrame:
+    """Re-select matches to **guarantee** every patch has landmarks.
+
+    Strategy (aggressive):
+    1. **Phase 1 – Forced guarantee**: For each patch, force-select at least
+       ``min_per_patch`` matches using the best morphological pair available,
+       **ignoring** the distance_threshold.  Only requires a finite distance.
+       This ensures no patch is left without landmarks.
+    2. **Phase 2 – Quota fill**: Continue filling each patch up to its full
+       quota (``top_k // n_patches``) with the normal distance_threshold.
+    3. **Phase 3 – Global fill**: Fill remaining ``top_k`` slots from the
+       best unused pairs globally (with distance_threshold).
+    """
+    n_patches = coverage_patch_grid * coverage_patch_grid
+    top_k = int(config.top_k)
+    per_patch_quota = max(min_per_patch, top_k // n_patches)
+
+    patch_labels_1 = _assign_patch_labels(df1, image_shape, coverage_patch_grid)
+
+    # Pre-sort all candidate pairs by distance (ascending)
+    n1, n2 = dist_matrix.shape
+    flat_idx = np.argsort(dist_matrix, axis=None)
+    rows_flat = flat_idx // n2
+    cols_flat = flat_idx % n2
+
+    used_1: set[int] = set()
+    used_2: set[int] = set()
+    patch_counts: dict[int, int] = {p: 0 for p in range(n_patches)}
+    selected: list[tuple[int, int, float]] = []
+
+    # Phase 1: Force at least min_per_patch matches per patch (NO distance_threshold)
+    for idx in range(len(flat_idx)):
+        if all(c >= min_per_patch for c in patch_counts.values()):
+            break  # every patch has its guaranteed minimum
+        i = int(rows_flat[idx])
+        j = int(cols_flat[idx])
+        d = float(dist_matrix[i, j])
+        if not np.isfinite(d):
+            continue  # skip inf but don't break — other patches may still need pairs
+        if i in used_1 or j in used_2:
+            continue
+        patch_id = int(patch_labels_1[i])
+        if patch_counts[patch_id] >= min_per_patch:
+            continue  # this patch already has its guaranteed minimum
+        selected.append((i, j, d))
+        used_1.add(i)
+        used_2.add(j)
+        patch_counts[patch_id] += 1
+
+    # Phase 2: Fill each patch up to its full quota (with distance_threshold)
+    if len(selected) < top_k:
+        for idx in range(len(flat_idx)):
+            if len(selected) >= top_k:
+                break
+            i = int(rows_flat[idx])
+            j = int(cols_flat[idx])
+            d = float(dist_matrix[i, j])
+            if not np.isfinite(d):
+                break
+            if config.distance_threshold is not None and d > float(config.distance_threshold):
+                break
+            if i in used_1 or j in used_2:
+                continue
+            patch_id = int(patch_labels_1[i])
+            if patch_counts[patch_id] >= per_patch_quota:
+                continue
+            selected.append((i, j, d))
+            used_1.add(i)
+            used_2.add(j)
+            patch_counts[patch_id] += 1
+
+    # Phase 3: Fill remaining global slots with best pairs (with distance_threshold)
+    if len(selected) < top_k:
+        for idx in range(len(flat_idx)):
+            if len(selected) >= top_k:
+                break
+            i = int(rows_flat[idx])
+            j = int(cols_flat[idx])
+            d = float(dist_matrix[i, j])
+            if not np.isfinite(d):
+                break
+            if config.distance_threshold is not None and d > float(config.distance_threshold):
+                break
+            if i in used_1 or j in used_2:
+                continue
+            selected.append((i, j, d))
+            used_1.add(i)
+            used_2.add(j)
+
+    if not selected:
+        return match_df
+
+    # Log patch distribution
+    final_patch_counts = {p: 0 for p in range(n_patches)}
+    for i, _, _ in selected:
+        final_patch_counts[int(patch_labels_1[i])] += 1
+    grid = coverage_patch_grid
+    dist_lines = []
+    for py in range(grid):
+        row_counts = [str(final_patch_counts[py * grid + px]) for px in range(grid)]
+        dist_lines.append(" | ".join(row_counts))
+    dist_str = "\n    ".join(dist_lines)
+    print(
+        f"  Patch coverage ({grid}x{grid}): {len(selected)} matches distributed as:\n"
+        f"    {dist_str}"
+    )
+
+    return pd.DataFrame(selected, columns=["idx1", "idx2", "distance"])
+
+
+def greedy_match_cells(
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    config: MatchingConfig,
+    image_shape: Sequence[int] | None = None,
+    coverage_patch_grid: int = 4,
+) -> pd.DataFrame:
     """
     Greedy 1-to-1 matching between two sets of cells using feature similarity.
+
+    When *image_shape* is provided, matches are distributed across a
+    ``coverage_patch_grid x coverage_patch_grid`` spatial grid so that each
+    patch receives at least ``top_k // n_patches`` matches before filling the
+    remaining quota globally.  This prevents all landmarks from clustering in
+    a single image region.
     """
     report_cols = _all_feature_columns(config)
     _ensure_columns(df1, report_cols)
     _ensure_columns(df2, report_cols)
     dist_matrix = compute_match_distance_matrix(df1, df2, config)
 
+    # --- patch-balanced matching when image_shape is available ---------------
+    if image_shape is not None and coverage_patch_grid >= 2:
+        match_df = _ensure_patch_coverage(
+            pd.DataFrame(),  # placeholder, not used inside
+            df1,
+            df2,
+            dist_matrix,
+            config,
+            image_shape,
+            coverage_patch_grid=coverage_patch_grid,
+        )
+        if match_df.empty:
+            return pd.DataFrame(columns=["idx1", "idx2", "distance", "cell_id_1", "cell_id_2"])
+        return _append_match_report_columns(match_df, df1, df2, report_cols)
+
+    # --- original global greedy matching ------------------------------------
     pairs = []
     for i in range(dist_matrix.shape[0]):
         for j in range(dist_matrix.shape[1]):

@@ -22,6 +22,7 @@ BASE_PROPS: List[str] = [
     "minor_axis_length",
     "orientation",
     "centroid",
+    "moments_hu",
 ]
 
 
@@ -150,6 +151,15 @@ def compute_cell_features(mask: np.ndarray, config: CellFeaturesConfig) -> pd.Da
     df["orientation"] = df["orientation"].astype(float)
     df["axis_vec_x"] = np.cos(df["orientation"])
     df["axis_vec_y"] = np.sin(df["orientation"])
+
+    # Hu moments: log-transform for numerical stability (values span many orders of magnitude)
+    for i in range(7):
+        raw_col = f"moments_hu-{i}"
+        if raw_col in df.columns:
+            vals = df[raw_col].to_numpy(dtype=float)
+            # -sign(h) * log10(|h| + 1e-30) — standard Hu moment normalization
+            df[f"hu_{i}"] = -np.sign(vals) * np.log10(np.abs(vals) + 1e-30)
+            df = df.drop(columns=[raw_col])
 
     if config.min_area is not None:
         df = df[df["area"] >= config.min_area]

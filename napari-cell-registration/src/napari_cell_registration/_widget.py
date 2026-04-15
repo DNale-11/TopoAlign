@@ -15,6 +15,7 @@ from .core import (
     CellFeaturesConfig,
     CellposeConfig,
     CellposeSegmenter,
+    MatchingConfig,
     MIN_MATCHES_FOR_REFINEMENT,
     apply_rigid_to_points,
     assign_patches,
@@ -23,14 +24,16 @@ from .core import (
     compute_match_residuals,
     estimate_rigid_transform_from_matches,
     estimate_rigid_transform_from_matches_ransac,
+    greedy_match_cells,
     rigid_transform_to_affine,
     two_stage_match_cells,
 )
+from .core.matching import apply_transform_to_features, _filter_candidate_matches_by_hard_constraints
 from .core.point_registration import (
-    warp_image_with_transform,
-    compute_valid_overlap_mask,
     fit_tps_from_matches,
+    warp_image_with_transform,
     warp_image_with_tps,
+    compute_valid_overlap_mask,
 )
 
 
@@ -123,17 +126,15 @@ def registration_workflow_widget(
     image_round2: ImageData,
     mask_round1: LabelsData,
     mask_round2: LabelsData,
-    top_k: int = 50,
+    top_k: int = 320,
     max_match_distance_px: int = 100,
     position_weight: float = 1.0,
     residual_prune_quantile: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.05}] = 0.0,
-    use_ransac_transform: bool = False,
+    use_ransac_transform: bool = True,
     ransac_max_trials: int = 1000,
     ransac_residual_threshold: float = 2.0,
     min_area: int = 0,
     max_area: int = 0,
-    use_tps: bool = True,
-    tps_regularization: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.001}] = 0.001,
     save_results: bool = False,
     output_dir: str = "./registration_output",
 ):
@@ -185,7 +186,7 @@ def registration_workflow_widget(
     feat_config = CellFeaturesConfig(
         min_area=min_area if min_area > 0 else None,
         max_area=max_area if max_area > 0 else None,
-        topology_neighbor_k=3,
+        topology_neighbor_k=5,
     )
     feats1 = compute_cell_features(mask1, feat_config)
     n_cells1 = len(feats1)
@@ -208,9 +209,6 @@ def registration_workflow_widget(
         show_info("No cells available after feature extraction.")
         return
 
-    # =====================================================================
-    # PASS 1 – Full registration pipeline
-    # =====================================================================
     show_info("[3/5] Running morphology-guided matching...")
     max_dist = max(1, int(max_match_distance_px))
     match_result = two_stage_match_cells(
@@ -268,12 +266,14 @@ def registration_workflow_widget(
 
     show_info("[4/5] Estimating registration transform...")
     if len(matches) < 3:
-        show_info(f"  Only {len(matches)} matches found; need at least 3.")
+        show_info(f"  Only {len(matches)} matches found; need at least 3 to estimate a transform.")
         return
 
     if use_ransac_transform:
         transform, inlier_mask = estimate_rigid_transform_from_matches_ransac(
-            feats1, feats2, matches,
+            feats1,
+            feats2,
+            matches,
             max_trials=int(ransac_max_trials),
             residual_threshold=float(ransac_residual_threshold),
             min_inliers=MIN_MATCHES_FOR_REFINEMENT,
@@ -297,17 +297,19 @@ def registration_workflow_widget(
             if MIN_MATCHES_FOR_REFINEMENT <= keep_count < len(matches):
                 matches = matches.loc[keep_mask].reset_index(drop=True)
                 transform, _ = estimate_rigid_transform_from_matches_ransac(
-                    feats1, feats2, matches,
+                    feats1,
+                    feats2,
+                    matches,
                     max_trials=int(ransac_max_trials),
                     residual_threshold=float(ransac_residual_threshold),
                     min_inliers=MIN_MATCHES_FOR_REFINEMENT,
                 )
                 show_info(
-                    "  RANSAC consistency filter: "
+                    "  RANSAC model consistency filter: "
                     f"kept {keep_count}/{len(keep_mask)} matches at <= {model_threshold:.2f}px"
                 )
         else:
-            show_info("  Too few RANSAC inliers to filter; keeping all matches")
+            show_info("  Too few RANSAC inliers to filter matches safely; keeping all matches")
     else:
         transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
 
@@ -326,80 +328,246 @@ def registration_workflow_widget(
             matches = matches.loc[keep_mask].reset_index(drop=True)
             transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
             matches["residual_px"] = compute_match_residuals(feats1, feats2, matches, transform)
-            show_info(f"  Residual pruning: kept {kept}/{len(residuals)} matches at <= {threshold:.2f}px")
+            show_info(
+                f"  Residual pruning: kept {kept}/{len(residuals)} matches at <= {threshold:.2f}px"
+            )
+
+    # --- Guided rematch: re-match on transform-aligned data with patch coverage ---
+    # This ensures every 2x2 patch contributes feature points even if RANSAC
+    # concentrated inliers in one region.
+    if len(matches) >= MIN_MATCHES_FOR_REFINEMENT:
+        show_info("  Guided rematch: re-matching under estimated transform...")
+        initial_affine = rigid_transform_to_affine(transform)
+        aligned_feats2 = apply_transform_to_features(feats2, initial_affine, mask1.shape)
+        rematch_window = max(10.0, float(max_dist) * 0.6)
+        rematch_config = MatchingConfig(
+            feature_weight=1.0,
+            topology_weight=0.0,
+            position_weight=position_weight,
+            top_k=max(1, int(top_k)),
+            distance_threshold=None,
+            spatial_window_size=rematch_window,
+        )
+        rematch_matches = greedy_match_cells(
+            feats1, aligned_feats2, rematch_config, image_shape=mask1.shape,
+            coverage_patch_grid=4,
+        )
+        if len(rematch_matches) >= MIN_MATCHES_FOR_REFINEMENT:
+            # Re-estimate transform from ORIGINAL (unaligned) positions
+            transform = estimate_rigid_transform_from_matches(
+                feats1, feats2, rematch_matches,
+            )
+            rematch_residuals = compute_match_residuals(
+                feats1, feats2, rematch_matches, transform,
+            )
+            rematch_matches = rematch_matches.copy()
+            rematch_matches["residual_px"] = rematch_residuals
+            show_info(
+                f"  Guided rematch: {len(rematch_matches)} matches, "
+                f"mean residual={float(rematch_residuals.mean()):.2f}px"
+            )
+            matches = rematch_matches
+        else:
+            show_info("  Guided rematch: too few matches; keeping original.")
 
     affine_transform = rigid_transform_to_affine(transform)
     rotation_deg = float(np.degrees(np.arctan2(transform.rotation[1, 0], transform.rotation[0, 0])))
     show_info(
-        "  Final transform: "
+        "  Final rigid baseline: "
         f"rotation={rotation_deg:.2f} deg, "
         f"translation=({float(transform.translation[0]):.1f}, {float(transform.translation[1]):.1f}) px"
     )
-    if len(matches) > 0:
+    if len(matches) > 0 and "residual_px" in matches.columns:
         show_info(
-            "  Residuals: "
+            "  Rigid residuals: "
             f"min={matches['residual_px'].min():.2f}px, "
             f"max={matches['residual_px'].max():.2f}px, "
             f"mean={matches['residual_px'].mean():.2f}px"
         )
 
-    show_info("[5/5] Applying transformation and creating overlay...")
+    # --- Orientation filter: remove matches with >5° orientation difference ---
+    n_before_orient = len(matches)
+    if n_before_orient >= MIN_MATCHES_FOR_REFINEMENT:
+        matches = _filter_candidate_matches_by_hard_constraints(
+            matches,
+            max_area_ratio=None,
+            max_aspect_ratio_ratio=None,
+            max_orientation_diff_deg=5.0,
+            min_orientation_eccentricity=0.15,
+        )
+        n_after_orient = len(matches)
+        if n_after_orient < n_before_orient:
+            show_info(
+                f"  Orientation filter (<=5°): kept {n_after_orient}/{n_before_orient} matches"
+            )
+            if n_after_orient >= MIN_MATCHES_FOR_REFINEMENT:
+                transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+
+    # --- Local displacement consistency filter (per-patch) ---
+    # Within each patch, match displacement vectors should be roughly parallel
+    # and similar length. Remove outliers that deviate from local consensus.
+    n_before_disp = len(matches)
+    if n_before_disp >= MIN_MATCHES_FOR_REFINEMENT:
+        pts_f = feats1.iloc[matches["idx1"].to_numpy(dtype=int)][
+            ["centroid_x", "centroid_y"]
+        ].to_numpy(dtype=float)
+        pts_m = feats2.iloc[matches["idx2"].to_numpy(dtype=int)][
+            ["centroid_x", "centroid_y"]
+        ].to_numpy(dtype=float)
+        disp_vectors = pts_f - pts_m  # displacement from moving to fixed
+
+        # Assign each match to a patch based on fixed cell position
+        h, w = mask1.shape[:2]
+        grid = 4
+        px = np.clip(np.floor(pts_f[:, 0] * grid / max(w, 1)).astype(int), 0, grid - 1)
+        py = np.clip(np.floor(pts_f[:, 1] * grid / max(h, 1)).astype(int), 0, grid - 1)
+        patch_ids = py * grid + px
+
+        keep_mask = np.ones(n_before_disp, dtype=bool)
+        angle_threshold_deg = 5.0
+        for pid in range(grid * grid):
+            in_patch = patch_ids == pid
+            n_in = int(in_patch.sum())
+            if n_in < 3:
+                continue
+            patch_disp = disp_vectors[in_patch]
+            patch_indices = np.where(in_patch)[0]
+            patch_norms = np.linalg.norm(patch_disp, axis=1)
+
+            # Pairwise angle matrix within this patch
+            # For each pair (a, b), compute angle between their displacement vectors
+            cos_thresh = np.cos(np.radians(angle_threshold_deg))
+            # Vote: for each match i, count how many others have angle < threshold
+            votes = np.zeros(n_in, dtype=int)
+            for a in range(n_in):
+                if patch_norms[a] < 1.0:
+                    continue
+                for b in range(n_in):
+                    if patch_norms[b] < 1.0:
+                        continue
+                    cos_ab = np.dot(patch_disp[a], patch_disp[b]) / (
+                        patch_norms[a] * patch_norms[b] + 1e-8
+                    )
+                    if cos_ab >= cos_thresh:
+                        votes[a] += 1
+
+            # The match with most votes defines the consensus direction
+            if votes.max() < 2:
+                continue  # no consensus found
+            consensus_idx = int(np.argmax(votes))
+            consensus_disp = patch_disp[consensus_idx]
+            consensus_norm = patch_norms[consensus_idx]
+
+            # Keep only matches within angle_threshold of the consensus
+            # AND with consistent displacement length
+            consensus_members = []
+            for k in range(n_in):
+                if patch_norms[k] < 1.0:
+                    keep_mask[patch_indices[k]] = False
+                    continue
+                cos_val = np.dot(patch_disp[k], consensus_disp) / (
+                    patch_norms[k] * consensus_norm + 1e-8
+                )
+                if cos_val < cos_thresh:
+                    keep_mask[patch_indices[k]] = False
+                else:
+                    consensus_members.append(k)
+
+            # Length filter: remove matches whose length deviates > 5px from mean
+            if len(consensus_members) >= 3:
+                member_lengths = np.array([patch_norms[k] for k in consensus_members])
+                mean_len = float(np.mean(member_lengths))
+                for k in consensus_members:
+                    if abs(patch_norms[k] - mean_len) > 5.0:
+                        keep_mask[patch_indices[k]] = False
+
+        n_after_disp = int(keep_mask.sum())
+        if n_after_disp >= MIN_MATCHES_FOR_REFINEMENT and n_after_disp < n_before_disp:
+            matches = matches.loc[keep_mask].reset_index(drop=True)
+            show_info(
+                f"  Displacement consensus filter: kept {n_after_disp}/{n_before_disp} matches"
+            )
+            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+
+    # --- Fit TPS (Thin Plate Spline) for non-rigid registration ---
+    show_info("  Fitting TPS non-rigid transform from matched landmarks...")
+    pts_fixed_xy = feats1.iloc[matches["idx1"].to_numpy(dtype=int)][
+        ["centroid_x", "centroid_y"]
+    ].to_numpy(dtype=float)
+    pts_moving_xy = feats2.iloc[matches["idx2"].to_numpy(dtype=int)][
+        ["centroid_x", "centroid_y"]
+    ].to_numpy(dtype=float)
+    tps = fit_tps_from_matches(
+        pts_fixed_xy,
+        pts_moving_xy,
+        output_shape=mask1.shape[:2],
+        rigid_transform=affine_transform,
+        regularization=1e-3,
+        n_boundary_per_side=4,
+        add_boundary_anchors_flag=True,
+    )
+    # Compute TPS residuals at control points
+    tps_predicted = tps.predict(pts_fixed_xy)
+    tps_residuals = np.linalg.norm(
+        tps_predicted - pts_moving_xy, axis=1
+    )[: len(pts_fixed_xy)]  # exclude boundary anchors
+    show_info(
+        f"  TPS fitted with {len(pts_fixed_xy)} control points + boundary anchors, "
+        f"control-point residual: mean={float(tps_residuals.mean()):.3f}px"
+    )
+
+    show_info("[5/5] Applying TPS transformation and creating overlay...")
     _add_match_layers(matches, feats1, feats2)
 
-    if use_tps and len(matches) >= 3:
-        # --- TPS warp: non-rigid, landmark-guided ---
-        show_info("  Using TPS warp (non-rigid, landmark-guided)...")
-        pts_fixed_xy = feats1.loc[matches["idx1"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-        pts_moving_xy = feats2.loc[matches["idx2"], ["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-        tps = fit_tps_from_matches(
-            pts_fixed_xy,
-            pts_moving_xy,
-            output_shape=mask1.shape[:2],
-            rigid_transform=affine_transform,
-            regularization=float(tps_regularization),
-            n_boundary_per_side=4,
-            add_boundary_anchors_flag=True,
-        )
-        img2_warped = warp_image_with_tps(img2, tps, mask1.shape[:2], order=1)
-        img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
-        mask2_warped = warp_image_with_tps(
-            mask2.astype(np.int32), tps, mask1.shape[:2], order=0
-        )
-    else:
-        # --- Fallback: global rigid affine warp ---
-        if use_tps:
-            show_info("  Too few matches for TPS – falling back to rigid affine warp.")
-        img2_warped = warp_image_with_transform(img2, affine_transform, mask1.shape[:2], order=1)
-        img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
-        mask2_warped = warp_image_with_transform(mask2.astype(np.int32), affine_transform, mask1.shape[:2], order=0)
+    # Warp image with TPS (non-rigid)
+    show_info("  Warping image with TPS (this may take a moment)...")
+    img2_warped = warp_image_with_tps(img2, tps, mask1.shape[:2], order=1)
+    img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
+    image_kwargs = {"name": "Registered Image Round 2 (TPS)", "opacity": 0.5, "blending": "additive"}
+    if img2_registered.ndim == 2:
+        image_kwargs["colormap"] = "green"
+    viewer.add_image(img2_registered, **image_kwargs)
 
+    # Warp mask with TPS (nearest-neighbor for labels)
+    mask2_warped = warp_image_with_tps(
+        mask2.astype(np.int32), tps, mask1.shape[:2], order=0,
+    )
     mask2_registered = np.rint(mask2_warped).astype(np.int32)
 
     # Full Fusion: Where the registered moving mask has no data (background 0), retain the fixed mask.
     # This naturally handles both the out-of-bounds boundaries and the spaces between moving cells.
     mask2_registered = np.where(mask2_registered == 0, mask1, mask2_registered)
-
+    
     # For the image, fuse using maximum intensity projection (keeps signals from both)
     if img1.shape == img2_registered.shape:
         img2_registered = np.maximum(img1, img2_registered)
+    viewer.add_labels(mask2_registered, name="Registered Mask Round 2 (TPS)", opacity=0.35)
 
-    image_kwargs = {"name": "Registered Image Round 2", "opacity": 0.5, "blending": "additive"}
-    if img2_registered.ndim == 2:
-        image_kwargs["colormap"] = "green"
-    viewer.add_image(img2_registered, **image_kwargs)
-    viewer.add_labels(mask2_registered, name="Registered Mask Round 2", opacity=0.35)
-
+    # Warp ALL round2 centroids through TPS
     all_pts_r2_xy = feats2[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-    all_pts_r2_registered_xy = np.column_stack([
-        affine_transform(all_pts_r2_xy)[:, 0],
-        affine_transform(all_pts_r2_xy)[:, 1],
-    ])
+    all_pts_r2_registered_xy = tps.predict(all_pts_r2_xy)
     viewer.add_points(
         all_pts_r2_registered_xy[:, ::-1],
-        name="Registered Points Round 2",
+        name="Registered Points Round 2 (TPS)",
         size=5,
         face_color="red",
         opacity=0.7,
+    )
+
+    # Draw patch grid lines (4x4)
+    h, w = mask1.shape[:2]
+    grid = 4
+    grid_lines = []
+    for i in range(1, grid):
+        # Vertical lines: x = i * w / grid (in napari coords: col = x, row = y)
+        x = i * w / grid
+        grid_lines.append(np.array([[0, x], [h, x]]))
+        # Horizontal lines: y = i * h / grid
+        y = i * h / grid
+        grid_lines.append(np.array([[y, 0], [y, w]]))
+    viewer.add_shapes(
+        grid_lines, shape_type="line", edge_color="yellow",
+        edge_width=2, name="Patch Grid (4x4)", opacity=0.6,
     )
 
     show_info("  Visualization complete.")
@@ -442,12 +610,17 @@ def registration_workflow_widget(
         pts_r2_reg_df.to_csv(reg_pts_csv, index=False)
         show_info(f"  Saved: {reg_pts_csv.name}")
 
-        transform_file = output_path / "transform_matrix.txt"
+        transform_file = output_path / "transform_info.txt"
         with open(transform_file, "w", encoding="utf-8") as handle:
-            handle.write("Affine Transform Matrix:\n")
+            handle.write("Registration Method: TPS (Thin Plate Spline)\n")
+            handle.write(f"Control Points: {len(pts_fixed_xy)}\n")
+            handle.write(f"TPS Regularization: 1e-3\n\n")
+            handle.write("Rigid Baseline (Affine Transform Matrix):\n")
             handle.write(f"{affine_transform.params}\n\n")
-            handle.write(f"Rotation: {float(np.degrees(affine_transform.rotation)):.4f} deg\n")
-            handle.write(f"Translation: ({affine_transform.translation[0]:.2f}, {affine_transform.translation[1]:.2f})\n")
+            handle.write("Rotation Matrix:\n")
+            handle.write(f"{transform.rotation}\n\n")
+            handle.write("Translation Vector:\n")
+            handle.write(f"{transform.translation}\n")
         show_info(f"  Saved: {transform_file.name}")
 
     show_info("=== Registration Complete! ===")

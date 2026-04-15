@@ -51,6 +51,13 @@ class MatchingConfig:
         "aspect_ratio",
         "elongation",
         "equivalent_diameter",
+        "hu_0",
+        "hu_1",
+        "hu_2",
+        "hu_3",
+        "hu_4",
+        "hu_5",
+        "hu_6",
     )
     # Weight for morphology/feature similarity in the combined distance.
     # Lower values make matching rely more on spatial consistency.
