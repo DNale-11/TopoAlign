@@ -1,6 +1,8 @@
 README.md
 pyproject.toml
+test_plugin.py
 src/napari_cell_registration/__init__.py
+src/napari_cell_registration/_manual_seg_widget.py
 src/napari_cell_registration/_widget.py
 src/napari_cell_registration/napari.yaml
 src/napari_cell_registration.egg-info/PKG-INFO
@@ -16,5 +18,8 @@ src/napari_cell_registration/core/io_utils.py
 src/napari_cell_registration/core/matching.py
 src/napari_cell_registration/core/point_registration.py
 src/napari_cell_registration/core/registration.py
+src/napari_cell_registration/core/robust_alignment.py
 src/napari_cell_registration/core/segmentation.py
+src/napari_cell_registration/core/validation.py
 src/napari_cell_registration/core/visualization.py
+src/napari_cell_registration/core/workflow.py

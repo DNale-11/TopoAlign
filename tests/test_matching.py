@@ -278,5 +278,9 @@ def test_two_stage_morphology_guided_recovers_translation():
 
     assert result.coarse_transform_accepted
     np.testing.assert_allclose(result.coarse_offset_xy, translation, atol=1.0)
-    assert list(result.matches["cell_id_1"]) == [1, 2, 3, 4, 5, 6]
-    assert list(result.matches["cell_id_2"]) == [101, 102, 103, 104, 105, 106]
+    assert set(result.matches["cell_id_1"]) == {1, 2, 3, 4, 5, 6}
+    assert set(result.matches["cell_id_2"]) == {101, 102, 103, 104, 105, 106}
+    # Verify correct 1-to-1 pairing regardless of order
+    pair_set = set(zip(result.matches["cell_id_1"], result.matches["cell_id_2"]))
+    expected_pairs = {(i, 100 + i) for i in range(1, 7)}
+    assert pair_set == expected_pairs

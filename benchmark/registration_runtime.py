@@ -746,6 +746,25 @@ def _build_final_match_table(
     table["inlier"] = inlier_flags
     table["residual_px"] = residuals
     table["match_stage"] = match_stage
+
+    # ---- Per-feature residual columns ----
+    # For each morphological feature that has _1 and _2 columns,
+    # compute absolute residual and ratio.
+    _RESIDUAL_FEATURES = (
+        "area", "perimeter", "roundness", "eccentricity", "solidity",
+        "major_axis_length", "minor_axis_length", "aspect_ratio",
+        "elongation", "equivalent_diameter",
+    )
+    for feat in _RESIDUAL_FEATURES:
+        col1 = f"{feat}_1"
+        col2 = f"{feat}_2"
+        if col1 in table.columns and col2 in table.columns:
+            v1 = table[col1].to_numpy(dtype=float)
+            v2 = table[col2].to_numpy(dtype=float)
+            table[f"{feat}_residual"] = np.abs(v1 - v2)
+            denom = np.maximum(np.minimum(np.abs(v1), np.abs(v2)), 1e-6)
+            table[f"{feat}_ratio"] = np.maximum(np.abs(v1), np.abs(v2)) / denom
+
     return table
 
 

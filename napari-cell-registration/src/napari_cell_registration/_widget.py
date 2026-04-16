@@ -211,283 +211,287 @@ def registration_workflow_widget(
 
     show_info("[3/5] Running morphology-guided matching...")
     max_dist = max(1, int(max_match_distance_px))
-    match_result = two_stage_match_cells(
-        feats1,
-        feats2,
-        mask1.shape,
-        feature_weight=1.0,
-        topology_weight=0.0,
-        position_weight=position_weight,
-        top_k=max(1, int(top_k)),
-        distance_threshold=None,
-        spatial_window_size=float(max_dist),
-        min_cells_for_two_stage=10,
-        coarse_top_k=max(24, int(top_k)),
-        coarse_distance_threshold=2.0,
-        coarse_matching_mode="morphology_guided",
-        coarse_allow_scale=False,
-        coarse_prefer_affine=False,
-        coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
-        coarse_max_trials=min(max(int(ransac_max_trials), 200), 2000),
-    )
-    matches = match_result.matches.copy()
+    MIN_CONSENSUS_FOR_TPS = 50  # retry with wider window if fewer
 
-    if len(match_result.coarse_matches) >= 3:
-        tx, ty = match_result.coarse_offset_xy
-        if match_result.coarse_transform_accepted:
+    for _window_scale in (1.0, 2.0):
+        effective_max_dist = max_dist * _window_scale
+        if _window_scale > 1.0:
             show_info(
-                "  Coarse translation accepted: "
-                f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
-                f"median residual={match_result.coarse_median_inlier_residual:.2f}px, "
-                f"shift=({float(tx):.1f}, {float(ty):.1f}) px"
+                f"  Retrying with wider window: {effective_max_dist:.0f}px "
+                f"(consensus had too few control points)"
             )
-        else:
-            show_info(
-                "  Coarse translation rejected: "
-                f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
-                f"median residual={match_result.coarse_median_inlier_residual:.2f}px"
-            )
-    else:
-        show_info("  Coarse translation skipped; insufficient confident candidates.")
-
-    if not matches.empty and "distance" in matches.columns:
-        show_info(
-            "  Match distances: "
-            f"min={matches['distance'].min():.2f}, "
-            f"max={matches['distance'].max():.2f}, "
-            f"mean={matches['distance'].mean():.2f}"
-        )
-
-    if matches.empty:
-        show_info("No matches available after matching; registration aborted.")
-        return
-
-    show_info(f"  Selected matches: {len(matches)}")
-
-    show_info("[4/5] Estimating registration transform...")
-    if len(matches) < 3:
-        show_info(f"  Only {len(matches)} matches found; need at least 3 to estimate a transform.")
-        return
-
-    if use_ransac_transform:
-        transform, inlier_mask = estimate_rigid_transform_from_matches_ransac(
+        match_result = two_stage_match_cells(
             feats1,
             feats2,
-            matches,
-            max_trials=int(ransac_max_trials),
-            residual_threshold=float(ransac_residual_threshold),
-            min_inliers=MIN_MATCHES_FOR_REFINEMENT,
-        )
-        matches = matches.copy()
-        matches["ransac_inlier"] = inlier_mask
-        inlier_count = int(inlier_mask.sum())
-        show_info(f"  RANSAC support: {inlier_count}/{len(matches)} inliers")
-        all_residuals = compute_match_residuals(feats1, feats2, matches, transform)
-        if inlier_count >= MIN_MATCHES_FOR_REFINEMENT:
-            inlier_residuals = all_residuals[inlier_mask]
-            inlier_median = float(np.median(inlier_residuals))
-            inlier_mad = float(np.median(np.abs(inlier_residuals - inlier_median)))
-            robust_scale = max(1.4826 * inlier_mad, 0.5)
-            model_threshold = max(
-                float(ransac_residual_threshold) * 2.0,
-                inlier_median + 3.0 * robust_scale,
-            )
-            keep_mask = all_residuals <= model_threshold
-            keep_count = int(keep_mask.sum())
-            if MIN_MATCHES_FOR_REFINEMENT <= keep_count < len(matches):
-                matches = matches.loc[keep_mask].reset_index(drop=True)
-                transform, _ = estimate_rigid_transform_from_matches_ransac(
-                    feats1,
-                    feats2,
-                    matches,
-                    max_trials=int(ransac_max_trials),
-                    residual_threshold=float(ransac_residual_threshold),
-                    min_inliers=MIN_MATCHES_FOR_REFINEMENT,
-                )
-                show_info(
-                    "  RANSAC model consistency filter: "
-                    f"kept {keep_count}/{len(keep_mask)} matches at <= {model_threshold:.2f}px"
-                )
-        else:
-            show_info("  Too few RANSAC inliers to filter matches safely; keeping all matches")
-    else:
-        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
-
-    residuals = compute_match_residuals(feats1, feats2, matches, transform)
-    matches = matches.copy()
-    matches["residual_px"] = residuals
-
-    if (
-        0.0 < float(residual_prune_quantile) < 1.0
-        and len(matches) >= MIN_MATCHES_FOR_REFINEMENT
-    ):
-        threshold = float(np.quantile(residuals, float(residual_prune_quantile)))
-        keep_mask = residuals <= threshold
-        kept = int(keep_mask.sum())
-        if kept >= MIN_MATCHES_FOR_REFINEMENT and kept < len(matches):
-            matches = matches.loc[keep_mask].reset_index(drop=True)
-            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
-            matches["residual_px"] = compute_match_residuals(feats1, feats2, matches, transform)
-            show_info(
-                f"  Residual pruning: kept {kept}/{len(residuals)} matches at <= {threshold:.2f}px"
-            )
-
-    # --- Guided rematch: re-match on transform-aligned data with patch coverage ---
-    # This ensures every 2x2 patch contributes feature points even if RANSAC
-    # concentrated inliers in one region.
-    if len(matches) >= MIN_MATCHES_FOR_REFINEMENT:
-        show_info("  Guided rematch: re-matching under estimated transform...")
-        initial_affine = rigid_transform_to_affine(transform)
-        aligned_feats2 = apply_transform_to_features(feats2, initial_affine, mask1.shape)
-        rematch_window = max(10.0, float(max_dist) * 0.6)
-        rematch_config = MatchingConfig(
+            mask1.shape,
             feature_weight=1.0,
             topology_weight=0.0,
             position_weight=position_weight,
             top_k=max(1, int(top_k)),
             distance_threshold=None,
-            spatial_window_size=rematch_window,
+            spatial_window_size=float(effective_max_dist),
+            min_cells_for_two_stage=10,
+            coarse_top_k=max(24, int(top_k)),
+            coarse_distance_threshold=2.0,
+            coarse_matching_mode="morphology_guided",
+            coarse_allow_scale=False,
+            coarse_prefer_affine=False,
+            coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
+            coarse_max_trials=min(max(int(ransac_max_trials), 200), 2000),
         )
-        rematch_matches = greedy_match_cells(
-            feats1, aligned_feats2, rematch_config, image_shape=mask1.shape,
-            coverage_patch_grid=4,
-        )
-        if len(rematch_matches) >= MIN_MATCHES_FOR_REFINEMENT:
-            # Re-estimate transform from ORIGINAL (unaligned) positions
-            transform = estimate_rigid_transform_from_matches(
-                feats1, feats2, rematch_matches,
-            )
-            rematch_residuals = compute_match_residuals(
-                feats1, feats2, rematch_matches, transform,
-            )
-            rematch_matches = rematch_matches.copy()
-            rematch_matches["residual_px"] = rematch_residuals
-            show_info(
-                f"  Guided rematch: {len(rematch_matches)} matches, "
-                f"mean residual={float(rematch_residuals.mean()):.2f}px"
-            )
-            matches = rematch_matches
+        matches = match_result.matches.copy()
+
+        if len(match_result.coarse_matches) >= 3:
+            tx, ty = match_result.coarse_offset_xy
+            if match_result.coarse_transform_accepted:
+                show_info(
+                    "  Coarse translation accepted: "
+                    f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
+                    f"median residual={match_result.coarse_median_inlier_residual:.2f}px, "
+                    f"shift=({float(tx):.1f}, {float(ty):.1f}) px"
+                )
+            else:
+                show_info(
+                    "  Coarse translation rejected: "
+                    f"{match_result.coarse_inlier_count}/{len(match_result.coarse_matches)} inliers, "
+                    f"median residual={match_result.coarse_median_inlier_residual:.2f}px"
+                )
         else:
-            show_info("  Guided rematch: too few matches; keeping original.")
+            show_info("  Coarse translation skipped; insufficient confident candidates.")
 
-    affine_transform = rigid_transform_to_affine(transform)
-    rotation_deg = float(np.degrees(np.arctan2(transform.rotation[1, 0], transform.rotation[0, 0])))
-    show_info(
-        "  Final rigid baseline: "
-        f"rotation={rotation_deg:.2f} deg, "
-        f"translation=({float(transform.translation[0]):.1f}, {float(transform.translation[1]):.1f}) px"
-    )
-    if len(matches) > 0 and "residual_px" in matches.columns:
-        show_info(
-            "  Rigid residuals: "
-            f"min={matches['residual_px'].min():.2f}px, "
-            f"max={matches['residual_px'].max():.2f}px, "
-            f"mean={matches['residual_px'].mean():.2f}px"
-        )
-
-    # --- Orientation filter: remove matches with >5° orientation difference ---
-    n_before_orient = len(matches)
-    if n_before_orient >= MIN_MATCHES_FOR_REFINEMENT:
-        matches = _filter_candidate_matches_by_hard_constraints(
-            matches,
-            max_area_ratio=None,
-            max_aspect_ratio_ratio=None,
-            max_orientation_diff_deg=5.0,
-            min_orientation_eccentricity=0.15,
-        )
-        n_after_orient = len(matches)
-        if n_after_orient < n_before_orient:
+        if not matches.empty and "distance" in matches.columns:
             show_info(
-                f"  Orientation filter (<=5°): kept {n_after_orient}/{n_before_orient} matches"
+                "  Match distances: "
+                f"min={matches['distance'].min():.2f}, "
+                f"max={matches['distance'].max():.2f}, "
+                f"mean={matches['distance'].mean():.2f}"
             )
-            if n_after_orient >= MIN_MATCHES_FOR_REFINEMENT:
+
+        if matches.empty:
+            show_info("No matches available after matching; registration aborted.")
+            return
+
+        show_info(f"  Selected matches: {len(matches)}")
+
+        show_info("[4/5] Estimating registration transform...")
+        if len(matches) < 3:
+            show_info(f"  Only {len(matches)} matches found; need at least 3 to estimate a transform.")
+            return
+
+        if use_ransac_transform:
+            transform, inlier_mask = estimate_rigid_transform_from_matches_ransac(
+                feats1,
+                feats2,
+                matches,
+                max_trials=int(ransac_max_trials),
+                residual_threshold=float(ransac_residual_threshold),
+                min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+            )
+            matches = matches.copy()
+            matches["ransac_inlier"] = inlier_mask
+            inlier_count = int(inlier_mask.sum())
+            show_info(f"  RANSAC support: {inlier_count}/{len(matches)} inliers")
+            all_residuals = compute_match_residuals(feats1, feats2, matches, transform)
+            if inlier_count >= MIN_MATCHES_FOR_REFINEMENT:
+                inlier_residuals = all_residuals[inlier_mask]
+                inlier_median = float(np.median(inlier_residuals))
+                inlier_mad = float(np.median(np.abs(inlier_residuals - inlier_median)))
+                robust_scale = max(1.4826 * inlier_mad, 0.5)
+                model_threshold = max(
+                    float(ransac_residual_threshold) * 2.0,
+                    inlier_median + 3.0 * robust_scale,
+                )
+                keep_mask = all_residuals <= model_threshold
+                keep_count = int(keep_mask.sum())
+                if MIN_MATCHES_FOR_REFINEMENT <= keep_count < len(matches):
+                    matches = matches.loc[keep_mask].reset_index(drop=True)
+                    transform, _ = estimate_rigid_transform_from_matches_ransac(
+                        feats1,
+                        feats2,
+                        matches,
+                        max_trials=int(ransac_max_trials),
+                        residual_threshold=float(ransac_residual_threshold),
+                        min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+                    )
+                    show_info(
+                        "  RANSAC model consistency filter: "
+                        f"kept {keep_count}/{len(keep_mask)} matches at <= {model_threshold:.2f}px"
+                    )
+            else:
+                show_info("  Too few RANSAC inliers to filter matches safely; keeping all matches")
+        else:
+            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+
+        residuals = compute_match_residuals(feats1, feats2, matches, transform)
+        matches = matches.copy()
+        matches["residual_px"] = residuals
+
+        if (
+            0.0 < float(residual_prune_quantile) < 1.0
+            and len(matches) >= MIN_MATCHES_FOR_REFINEMENT
+        ):
+            threshold = float(np.quantile(residuals, float(residual_prune_quantile)))
+            keep_mask = residuals <= threshold
+            kept = int(keep_mask.sum())
+            if kept >= MIN_MATCHES_FOR_REFINEMENT and kept < len(matches):
+                matches = matches.loc[keep_mask].reset_index(drop=True)
+                transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+                matches["residual_px"] = compute_match_residuals(feats1, feats2, matches, transform)
+                show_info(
+                    f"  Residual pruning: kept {kept}/{len(residuals)} matches at <= {threshold:.2f}px"
+                )
+
+        # --- Guided rematch: re-match on transform-aligned data with patch coverage ---
+        if len(matches) >= MIN_MATCHES_FOR_REFINEMENT:
+            show_info("  Guided rematch: re-matching under estimated transform...")
+            initial_affine = rigid_transform_to_affine(transform)
+            aligned_feats2 = apply_transform_to_features(feats2, initial_affine, mask1.shape)
+            rematch_window = max(10.0, float(effective_max_dist) * 0.6)
+            rematch_config = MatchingConfig(
+                feature_weight=1.0,
+                topology_weight=0.0,
+                position_weight=position_weight,
+                top_k=max(1, int(top_k)),
+                distance_threshold=None,
+                spatial_window_size=rematch_window,
+            )
+            rematch_matches = greedy_match_cells(
+                feats1, aligned_feats2, rematch_config, image_shape=mask1.shape,
+                coverage_patch_grid=4,
+            )
+            if len(rematch_matches) >= MIN_MATCHES_FOR_REFINEMENT:
+                transform = estimate_rigid_transform_from_matches(
+                    feats1, feats2, rematch_matches,
+                )
+                rematch_residuals = compute_match_residuals(
+                    feats1, feats2, rematch_matches, transform,
+                )
+                rematch_matches = rematch_matches.copy()
+                rematch_matches["residual_px"] = rematch_residuals
+                show_info(
+                    f"  Guided rematch: {len(rematch_matches)} matches, "
+                    f"mean residual={float(rematch_residuals.mean()):.2f}px"
+                )
+                matches = rematch_matches
+            else:
+                show_info("  Guided rematch: too few matches; keeping original.")
+
+        affine_transform = rigid_transform_to_affine(transform)
+        rotation_deg = float(np.degrees(np.arctan2(transform.rotation[1, 0], transform.rotation[0, 0])))
+        show_info(
+            "  Final rigid baseline: "
+            f"rotation={rotation_deg:.2f} deg, "
+            f"translation=({float(transform.translation[0]):.1f}, {float(transform.translation[1]):.1f}) px"
+        )
+        if len(matches) > 0 and "residual_px" in matches.columns:
+            show_info(
+                "  Rigid residuals: "
+                f"min={matches['residual_px'].min():.2f}px, "
+                f"max={matches['residual_px'].max():.2f}px, "
+                f"mean={matches['residual_px'].mean():.2f}px"
+            )
+
+        # --- Orientation filter ---
+        n_before_orient = len(matches)
+        if n_before_orient >= MIN_MATCHES_FOR_REFINEMENT:
+            matches = _filter_candidate_matches_by_hard_constraints(
+                matches,
+                max_area_ratio=None,
+                max_aspect_ratio_ratio=None,
+                max_orientation_diff_deg=5.0,
+                min_orientation_eccentricity=0.15,
+            )
+            n_after_orient = len(matches)
+            if n_after_orient < n_before_orient:
+                show_info(
+                    f"  Orientation filter (<=5°): kept {n_after_orient}/{n_before_orient} matches"
+                )
+                if n_after_orient >= MIN_MATCHES_FOR_REFINEMENT:
+                    transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+
+        # --- Local displacement consistency filter (per-patch) ---
+        n_before_disp = len(matches)
+        if n_before_disp >= MIN_MATCHES_FOR_REFINEMENT:
+            pts_f = feats1.iloc[matches["idx1"].to_numpy(dtype=int)][
+                ["centroid_x", "centroid_y"]
+            ].to_numpy(dtype=float)
+            pts_m = feats2.iloc[matches["idx2"].to_numpy(dtype=int)][
+                ["centroid_x", "centroid_y"]
+            ].to_numpy(dtype=float)
+            disp_vectors = pts_f - pts_m
+
+            h, w = mask1.shape[:2]
+            grid = 4
+            px = np.clip(np.floor(pts_f[:, 0] * grid / max(w, 1)).astype(int), 0, grid - 1)
+            py = np.clip(np.floor(pts_f[:, 1] * grid / max(h, 1)).astype(int), 0, grid - 1)
+            patch_ids = py * grid + px
+
+            keep_mask = np.ones(n_before_disp, dtype=bool)
+            angle_threshold_deg = 5.0
+            for pid in range(grid * grid):
+                in_patch = patch_ids == pid
+                n_in = int(in_patch.sum())
+                if n_in < 3:
+                    continue
+                patch_disp = disp_vectors[in_patch]
+                patch_indices = np.where(in_patch)[0]
+                patch_norms = np.linalg.norm(patch_disp, axis=1)
+
+                cos_thresh = np.cos(np.radians(angle_threshold_deg))
+                votes = np.zeros(n_in, dtype=int)
+                for a in range(n_in):
+                    if patch_norms[a] < 1.0:
+                        continue
+                    for b in range(n_in):
+                        if patch_norms[b] < 1.0:
+                            continue
+                        cos_ab = np.dot(patch_disp[a], patch_disp[b]) / (
+                            patch_norms[a] * patch_norms[b] + 1e-8
+                        )
+                        if cos_ab >= cos_thresh:
+                            votes[a] += 1
+
+                if votes.max() < 2:
+                    continue
+                consensus_idx = int(np.argmax(votes))
+                consensus_disp = patch_disp[consensus_idx]
+                consensus_norm = patch_norms[consensus_idx]
+
+                consensus_members = []
+                for k in range(n_in):
+                    if patch_norms[k] < 1.0:
+                        keep_mask[patch_indices[k]] = False
+                        continue
+                    cos_val = np.dot(patch_disp[k], consensus_disp) / (
+                        patch_norms[k] * consensus_norm + 1e-8
+                    )
+                    if cos_val < cos_thresh:
+                        keep_mask[patch_indices[k]] = False
+                    else:
+                        consensus_members.append(k)
+
+                if len(consensus_members) >= 3:
+                    member_lengths = np.array([patch_norms[k] for k in consensus_members])
+                    mean_len = float(np.mean(member_lengths))
+                    for k in consensus_members:
+                        if abs(patch_norms[k] - mean_len) > 5.0:
+                            keep_mask[patch_indices[k]] = False
+
+            n_after_disp = int(keep_mask.sum())
+            if n_after_disp >= MIN_MATCHES_FOR_REFINEMENT and n_after_disp < n_before_disp:
+                matches = matches.loc[keep_mask].reset_index(drop=True)
+                show_info(
+                    f"  Displacement consensus filter: kept {n_after_disp}/{n_before_disp} matches"
+                )
                 transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
 
-    # --- Local displacement consistency filter (per-patch) ---
-    # Within each patch, match displacement vectors should be roughly parallel
-    # and similar length. Remove outliers that deviate from local consensus.
-    n_before_disp = len(matches)
-    if n_before_disp >= MIN_MATCHES_FOR_REFINEMENT:
-        pts_f = feats1.iloc[matches["idx1"].to_numpy(dtype=int)][
-            ["centroid_x", "centroid_y"]
-        ].to_numpy(dtype=float)
-        pts_m = feats2.iloc[matches["idx2"].to_numpy(dtype=int)][
-            ["centroid_x", "centroid_y"]
-        ].to_numpy(dtype=float)
-        disp_vectors = pts_f - pts_m  # displacement from moving to fixed
-
-        # Assign each match to a patch based on fixed cell position
-        h, w = mask1.shape[:2]
-        grid = 4
-        px = np.clip(np.floor(pts_f[:, 0] * grid / max(w, 1)).astype(int), 0, grid - 1)
-        py = np.clip(np.floor(pts_f[:, 1] * grid / max(h, 1)).astype(int), 0, grid - 1)
-        patch_ids = py * grid + px
-
-        keep_mask = np.ones(n_before_disp, dtype=bool)
-        angle_threshold_deg = 5.0
-        for pid in range(grid * grid):
-            in_patch = patch_ids == pid
-            n_in = int(in_patch.sum())
-            if n_in < 3:
-                continue
-            patch_disp = disp_vectors[in_patch]
-            patch_indices = np.where(in_patch)[0]
-            patch_norms = np.linalg.norm(patch_disp, axis=1)
-
-            # Pairwise angle matrix within this patch
-            # For each pair (a, b), compute angle between their displacement vectors
-            cos_thresh = np.cos(np.radians(angle_threshold_deg))
-            # Vote: for each match i, count how many others have angle < threshold
-            votes = np.zeros(n_in, dtype=int)
-            for a in range(n_in):
-                if patch_norms[a] < 1.0:
-                    continue
-                for b in range(n_in):
-                    if patch_norms[b] < 1.0:
-                        continue
-                    cos_ab = np.dot(patch_disp[a], patch_disp[b]) / (
-                        patch_norms[a] * patch_norms[b] + 1e-8
-                    )
-                    if cos_ab >= cos_thresh:
-                        votes[a] += 1
-
-            # The match with most votes defines the consensus direction
-            if votes.max() < 2:
-                continue  # no consensus found
-            consensus_idx = int(np.argmax(votes))
-            consensus_disp = patch_disp[consensus_idx]
-            consensus_norm = patch_norms[consensus_idx]
-
-            # Keep only matches within angle_threshold of the consensus
-            # AND with consistent displacement length
-            consensus_members = []
-            for k in range(n_in):
-                if patch_norms[k] < 1.0:
-                    keep_mask[patch_indices[k]] = False
-                    continue
-                cos_val = np.dot(patch_disp[k], consensus_disp) / (
-                    patch_norms[k] * consensus_norm + 1e-8
-                )
-                if cos_val < cos_thresh:
-                    keep_mask[patch_indices[k]] = False
-                else:
-                    consensus_members.append(k)
-
-            # Length filter: remove matches whose length deviates > 5px from mean
-            if len(consensus_members) >= 3:
-                member_lengths = np.array([patch_norms[k] for k in consensus_members])
-                mean_len = float(np.mean(member_lengths))
-                for k in consensus_members:
-                    if abs(patch_norms[k] - mean_len) > 5.0:
-                        keep_mask[patch_indices[k]] = False
-
-        n_after_disp = int(keep_mask.sum())
-        if n_after_disp >= MIN_MATCHES_FOR_REFINEMENT and n_after_disp < n_before_disp:
-            matches = matches.loc[keep_mask].reset_index(drop=True)
-            show_info(
-                f"  Displacement consensus filter: kept {n_after_disp}/{n_before_disp} matches"
-            )
-            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+        # Check if enough control points for TPS; if not, retry with wider window
+        if len(matches) >= MIN_CONSENSUS_FOR_TPS:
+            break  # enough points, no retry needed
+        show_info(
+            f"  Only {len(matches)} control points after filtering "
+            f"(need {MIN_CONSENSUS_FOR_TPS})"
+        )
 
     # --- Fit TPS (Thin Plate Spline) for non-rigid registration ---
     show_info("  Fitting TPS non-rigid transform from matched landmarks...")
