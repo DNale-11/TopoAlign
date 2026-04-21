@@ -910,6 +910,12 @@ class ThinPlateSpline:
         pts_query = np.asarray(pts_query, dtype=float)
         if pts_query.ndim == 1:
             pts_query = pts_query[None, :]
+        # Try GPU-accelerated evaluation first
+        from .gpu_ops import tps_predict_gpu
+        result = tps_predict_gpu(self._ctrl, self._wx, self._wy, pts_query)
+        if result is not None:
+            return result
+        # CPU fallback
         Kq = self._eval_K_row(pts_query)
         P = np.hstack([np.ones((len(pts_query), 1)), pts_query])
         basis = np.hstack([Kq, P])

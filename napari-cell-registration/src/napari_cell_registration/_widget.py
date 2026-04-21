@@ -135,6 +135,7 @@ def registration_workflow_widget(
     ransac_residual_threshold: float = 2.0,
     min_area: int = 0,
     max_area: int = 0,
+    use_gpu: bool = True,
     save_results: bool = False,
     output_dir: str = "./registration_output",
 ):
@@ -171,6 +172,17 @@ def registration_workflow_widget(
         )
 
     show_info("=== Starting Cell Registration Workflow ===")
+    from .core import gpu_ops as _gpu_ops
+    if use_gpu:
+        _torch = _gpu_ops._get_torch_cuda()
+        if _torch is not None:
+            show_info(f"  GPU accelerated: {_torch.cuda.get_device_name(0)}")
+        else:
+            show_info("  GPU: not available (using CPU)")
+    else:
+        show_info("  GPU: disabled by user")
+        _gpu_ops.tps_predict_gpu = lambda *a, **k: None
+        _gpu_ops.pairwise_cdist_gpu = lambda *a, **k: None
 
     if save_results:
         output_path = Path(output_dir)
@@ -347,6 +359,8 @@ def registration_workflow_widget(
             initial_affine = rigid_transform_to_affine(transform)
             aligned_feats2 = apply_transform_to_features(feats2, initial_affine, mask1.shape)
             rematch_window = max(10.0, float(effective_max_dist) * 0.6)
+            if _window_scale > 1.0:
+                rematch_window = max(rematch_window, 150.0)
             rematch_config = MatchingConfig(
                 feature_weight=1.0,
                 topology_weight=0.0,
@@ -493,66 +507,170 @@ def registration_workflow_widget(
             f"(need {MIN_CONSENSUS_FOR_TPS})"
         )
 
-    # --- Fit TPS (Thin Plate Spline) for non-rigid registration ---
-    show_info("  Fitting TPS non-rigid transform from matched landmarks...")
-    pts_fixed_xy = feats1.iloc[matches["idx1"].to_numpy(dtype=int)][
-        ["centroid_x", "centroid_y"]
-    ].to_numpy(dtype=float)
-    pts_moving_xy = feats2.iloc[matches["idx2"].to_numpy(dtype=int)][
-        ["centroid_x", "centroid_y"]
-    ].to_numpy(dtype=float)
-    tps = fit_tps_from_matches(
-        pts_fixed_xy,
-        pts_moving_xy,
-        output_shape=mask1.shape[:2],
-        rigid_transform=affine_transform,
-        regularization=1e-3,
-        n_boundary_per_side=4,
-        add_boundary_anchors_flag=True,
-    )
-    # Compute TPS residuals at control points
-    tps_predicted = tps.predict(pts_fixed_xy)
-    tps_residuals = np.linalg.norm(
-        tps_predicted - pts_moving_xy, axis=1
-    )[: len(pts_fixed_xy)]  # exclude boundary anchors
-    show_info(
-        f"  TPS fitted with {len(pts_fixed_xy)} control points + boundary anchors, "
-        f"control-point residual: mean={float(tps_residuals.mean()):.3f}px"
-    )
+    # --- Rigid fallback: relaxed matching + dominant direction ---
+    if len(matches) < MIN_CONSENSUS_FOR_TPS:
+        show_info("  Rigid fallback: relaxed matching at 100px, finding dominant direction...")
+        fb_result = two_stage_match_cells(
+            feats1, feats2, mask1.shape,
+            feature_weight=1.0, topology_weight=0.0, position_weight=position_weight,
+            top_k=max(1, int(top_k)), distance_threshold=None,
+            spatial_window_size=float(max_dist),
+            min_cells_for_two_stage=10, coarse_top_k=max(24, int(top_k)),
+            coarse_distance_threshold=2.0, coarse_matching_mode="morphology_guided",
+            coarse_allow_scale=False, coarse_prefer_affine=False,
+            coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
+            coarse_max_trials=min(max(int(ransac_max_trials), 200), 2000),
+        )
+        fb_matches = fb_result.matches.copy()
+
+        # RANSAC
+        fb_transform, _ = estimate_rigid_transform_from_matches_ransac(
+            feats1, feats2, fb_matches,
+            max_trials=int(ransac_max_trials), residual_threshold=float(ransac_residual_threshold),
+            min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+        )
+
+        # Guided rematch
+        if len(fb_matches) >= MIN_MATCHES_FOR_REFINEMENT:
+            fb_affine = rigid_transform_to_affine(fb_transform)
+            fb_aligned = apply_transform_to_features(feats2, fb_affine, mask1.shape)
+            fb_cfg = MatchingConfig(
+                feature_weight=1.0, topology_weight=0.0, position_weight=position_weight,
+                top_k=max(1, int(top_k)), distance_threshold=None,
+                spatial_window_size=max(10.0, float(max_dist) * 0.6),
+            )
+            fb_rematch = greedy_match_cells(feats1, fb_aligned, fb_cfg, image_shape=mask1.shape, coverage_patch_grid=4)
+            if len(fb_rematch) >= MIN_MATCHES_FOR_REFINEMENT:
+                fb_transform = estimate_rigid_transform_from_matches(feats1, feats2, fb_rematch)
+                fb_matches = fb_rematch
+
+        # Orientation filter only (no consensus)
+        fb_matches = _filter_candidate_matches_by_hard_constraints(
+            fb_matches, max_area_ratio=None, max_aspect_ratio_ratio=None,
+            max_orientation_diff_deg=5.0, min_orientation_eccentricity=0.15,
+        )
+        if len(fb_matches) >= MIN_MATCHES_FOR_REFINEMENT:
+            fb_transform = estimate_rigid_transform_from_matches(feats1, feats2, fb_matches)
+
+        # Find dominant displacement group (angle≤5°, length≤5px)
+        if len(fb_matches) >= MIN_MATCHES_FOR_REFINEMENT:
+            pts_f = feats1.iloc[fb_matches["idx1"].to_numpy(dtype=int)][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+            pts_m = feats2.iloc[fb_matches["idx2"].to_numpy(dtype=int)][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+            disps = pts_f - pts_m
+            norms = np.linalg.norm(disps, axis=1)
+            angles = np.arctan2(disps[:, 1], disps[:, 0])
+            angle_tol = np.radians(5.0)
+            length_tol = 5.0
+            n_fb = len(fb_matches)
+            best_group = []
+            for i in range(n_fb):
+                group = []
+                for j in range(n_fb):
+                    a_diff = abs(angles[i] - angles[j])
+                    a_diff = min(a_diff, 2 * np.pi - a_diff)
+                    if a_diff <= angle_tol and abs(norms[i] - norms[j]) <= length_tol:
+                        group.append(j)
+                if len(group) > len(best_group):
+                    best_group = group
+            show_info(f"  Dominant direction group: {len(best_group)}/{n_fb} matches")
+            if len(best_group) >= MIN_MATCHES_FOR_REFINEMENT:
+                fb_matches = fb_matches.iloc[best_group].reset_index(drop=True)
+                transform = estimate_rigid_transform_from_matches(feats1, feats2, fb_matches)
+                matches = fb_matches
+
+    affine_transform = rigid_transform_to_affine(transform)
+    use_tps = len(matches) >= MIN_CONSENSUS_FOR_TPS
+
+    if use_tps:
+        # --- Fit TPS (Thin Plate Spline) for non-rigid registration ---
+        show_info("  Fitting TPS non-rigid transform from matched landmarks...")
+        pts_fixed_xy = feats1.iloc[matches["idx1"].to_numpy(dtype=int)][
+            ["centroid_x", "centroid_y"]
+        ].to_numpy(dtype=float)
+        pts_moving_xy = feats2.iloc[matches["idx2"].to_numpy(dtype=int)][
+            ["centroid_x", "centroid_y"]
+        ].to_numpy(dtype=float)
+        tps = fit_tps_from_matches(
+            pts_fixed_xy,
+            pts_moving_xy,
+            output_shape=mask1.shape[:2],
+            rigid_transform=affine_transform,
+            regularization=1e-3,
+            n_boundary_per_side=4,
+            add_boundary_anchors_flag=True,
+        )
+        tps_predicted = tps.predict(pts_fixed_xy)
+        tps_residuals = np.linalg.norm(
+            tps_predicted - pts_moving_xy, axis=1
+        )[: len(pts_fixed_xy)]
+        show_info(
+            f"  TPS fitted with {len(pts_fixed_xy)} control points + boundary anchors, "
+            f"control-point residual: mean={float(tps_residuals.mean()):.3f}px"
+        )
 
     show_info("[5/5] Applying TPS transformation and creating overlay...")
     _add_match_layers(matches, feats1, feats2)
 
-    # Warp image with TPS (non-rigid)
-    show_info("  Warping image with TPS (this may take a moment)...")
-    img2_warped = warp_image_with_tps(img2, tps, mask1.shape[:2], order=1)
-    img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
-    image_kwargs = {"name": "Registered Image Round 2 (TPS)", "opacity": 0.5, "blending": "additive"}
-    if img2_registered.ndim == 2:
-        image_kwargs["colormap"] = "green"
-    viewer.add_image(img2_registered, **image_kwargs)
+    import time as _time
 
-    # Warp mask with TPS (nearest-neighbor for labels)
-    mask2_warped = warp_image_with_tps(
-        mask2.astype(np.int32), tps, mask1.shape[:2], order=0,
-    )
-    mask2_registered = np.rint(mask2_warped).astype(np.int32)
+    if use_tps:
+        # Warp image with TPS (non-rigid)
+        show_info("  Warping image with TPS...")
+        _t0 = _time.perf_counter()
+        img2_warped = warp_image_with_tps(img2, tps, mask1.shape[:2], order=1)
+        _warp_sec = _time.perf_counter() - _t0
+        show_info(f"  TPS image warp completed in {_warp_sec:.2f}s")
+        img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
+        image_kwargs = {"name": "Registered Image Round 2 (TPS)", "opacity": 0.5, "blending": "additive"}
+        if img2_registered.ndim == 2:
+            image_kwargs["colormap"] = "green"
+        viewer.add_image(img2_registered, **image_kwargs)
 
-    # Full Fusion: Where the registered moving mask has no data (background 0), retain the fixed mask.
-    # This naturally handles both the out-of-bounds boundaries and the spaces between moving cells.
+        mask2_warped = warp_image_with_tps(mask2.astype(np.int32), tps, mask1.shape[:2], order=0)
+        mask2_registered = np.rint(mask2_warped).astype(np.int32)
+    else:
+        # Rigid fallback warp
+        from scipy.ndimage import map_coordinates
+        show_info(f"  Rigid fallback warp: {len(matches)} matches, using affine")
+        _t0 = _time.perf_counter()
+        H, W = mask1.shape[:2]
+        gy, gx = np.meshgrid(np.arange(H, dtype=float), np.arange(W, dtype=float), indexing="ij")
+        queries_xy = np.stack([gx.ravel(), gy.ravel()], axis=1)
+        inv_affine = np.linalg.inv(affine_transform)
+        ones = np.ones((len(queries_xy), 1))
+        src_xy = (inv_affine @ np.hstack([queries_xy, ones]).T).T[:, :2]
+        src_row = src_xy[:, 1].reshape(H, W)
+        src_col = src_xy[:, 0].reshape(H, W)
+
+        img2_warped = map_coordinates(img2.astype(float), [src_row, src_col], order=1, mode="constant", cval=0.0)
+        img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
+        image_kwargs = {"name": "Registered Image Round 2 (Rigid)", "opacity": 0.5, "blending": "additive"}
+        if img2_registered.ndim == 2:
+            image_kwargs["colormap"] = "green"
+        viewer.add_image(img2_registered, **image_kwargs)
+
+        mask2_warped = map_coordinates(mask2.astype(float), [src_row, src_col], order=0, mode="constant", cval=0.0)
+        mask2_registered = np.rint(mask2_warped).astype(np.int32)
+        _warp_sec = _time.perf_counter() - _t0
+        show_info(f"  Rigid warp completed in {_warp_sec:.2f}s")
+
+    # Full Fusion
     mask2_registered = np.where(mask2_registered == 0, mask1, mask2_registered)
-    
-    # For the image, fuse using maximum intensity projection (keeps signals from both)
+
     if img1.shape == img2_registered.shape:
         img2_registered = np.maximum(img1, img2_registered)
-    viewer.add_labels(mask2_registered, name="Registered Mask Round 2 (TPS)", opacity=0.35)
+    viewer.add_labels(mask2_registered, name="Registered Mask Round 2", opacity=0.35)
 
-    # Warp ALL round2 centroids through TPS
+    # Warp ALL round2 centroids
     all_pts_r2_xy = feats2[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-    all_pts_r2_registered_xy = tps.predict(all_pts_r2_xy)
+    if use_tps:
+        all_pts_r2_registered_xy = tps.predict(all_pts_r2_xy)
+    else:
+        ones_all = np.ones((len(all_pts_r2_xy), 1))
+        all_pts_r2_registered_xy = (affine_transform @ np.hstack([all_pts_r2_xy, ones_all]).T).T[:, :2]
     viewer.add_points(
         all_pts_r2_registered_xy[:, ::-1],
-        name="Registered Points Round 2 (TPS)",
+        name="Registered Points Round 2",
         size=5,
         face_color="red",
         opacity=0.7,

@@ -68,6 +68,12 @@ def _pairwise_feature_distance(
     f1, f2 = _standardize_features(df1, df2, feature_columns)
     if f1.shape[1] == 0:
         return np.zeros((len(df1), len(df2)), dtype=float)
+    # Try GPU-accelerated pairwise distance
+    from .gpu_ops import pairwise_cdist_gpu
+    result = pairwise_cdist_gpu(f1, f2)
+    if result is not None:
+        return result
+    # CPU fallback
     return np.linalg.norm(f1[:, None, :] - f2[None, :, :], axis=2)
 
 

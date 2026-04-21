@@ -1,10 +1,10 @@
 """
-Batch benchmark: runs the CURRENT widget pipeline (TPS + consensus filter + Hu moments)
-on all image pairs in the unregistration directory.
+Batch benchmark on synthetic dataset (100 deform + 100 rigid pairs).
+Exports all registered masks and features into flat directories.
 
 Usage:
     conda activate cell_registration
-    python benchmark/run_tps_batch.py
+    python benchmark/run_tps_synthetic.py
 """
 from __future__ import annotations
 
@@ -61,13 +61,13 @@ from napari_cell_registration.core.point_registration import (
 from cell_registration.evaluation import compute_prewarped_registration_metrics
 
 # ── Paths ──
-UNREG_ROOT = PROJECT_ROOT / "benchmark" / "unregistration"
-OUTPUT_ROOT = PROJECT_ROOT / "benchmark" / "results" / "tps+rigid"
+SYNTHETIC_ROOT = PROJECT_ROOT / "synthetic_dataset"
+OUTPUT_ROOT = PROJECT_ROOT / "benchmark" / "results" / "synthetic_tps_pw20"
 
-# ── Widget parameters (exact copy from _widget.py) ──
+# ── Widget parameters (same as run_tps_batch.py) ──
 TOP_K = 320
 MAX_DIST = 100
-POSITION_WEIGHT = 1.0
+POSITION_WEIGHT = 20.0
 RANSAC_RESIDUAL_THRESHOLD = 2.0
 RANSAC_MAX_TRIALS = 1000
 PATCH_GRID = 4
@@ -85,25 +85,33 @@ CELLPOSE_CFG = CellposeConfig(
 FEATURE_CFG = CellFeaturesConfig(topology_neighbor_k=5)
 
 
-def discover_pairs():
-    """Return list of (case_id, fixed_path, moving_path) for all pairs."""
+def discover_synthetic_pairs():
+    """Return list of (case_id, target_path, moving_path) from synthetic dataset.
+
+    Dataset structure:
+        synthetic_dataset/{deform,rigid}/target/XXXX_target.tif
+        synthetic_dataset/{deform,rigid}/moving/XXXX_moving.tif
+    """
     pairs = []
-    for case_dir in sorted(UNREG_ROOT.iterdir()):
-        if not case_dir.is_dir():
+    for subset in ("deform", "rigid"):
+        target_dir = SYNTHETIC_ROOT / subset / "target"
+        moving_dir = SYNTHETIC_ROOT / subset / "moving"
+        if not target_dir.exists() or not moving_dir.exists():
+            print(f"Warning: missing {subset} directory, skipping")
             continue
-        fixed_dir = case_dir / "fixed"
-        moving_dir = case_dir / "moving"
-        if not fixed_dir.exists() or not moving_dir.exists():
-            continue
-        fixed_files = sorted(fixed_dir.glob("*.tif"))
-        moving_files = sorted(moving_dir.glob("*.tif"))
-        if len(fixed_files) != 1:
-            continue
-        fixed_path = fixed_files[0]
-        for mov_path in moving_files:
-            pairs.append((case_dir.name, fixed_path, mov_path))
+        target_files = sorted(target_dir.glob("*_target.tif"))
+        for tgt in target_files:
+            idx = tgt.stem.replace("_target", "")
+            mov = moving_dir / f"{idx}_moving.tif"
+            if mov.exists():
+                case_id = f"{subset}_{idx}"
+                pairs.append((case_id, tgt, mov))
+            else:
+                print(f"Warning: no moving file for {tgt.name}")
     return pairs
 
+
+# ── Pipeline (identical to run_tps_batch.py) ──
 
 def run_widget_pipeline(img1, mask1, feats1, img2, mask2, feats2):
     """Run the exact widget pipeline. Returns (registered_mask, matches, diagnostics)."""
@@ -375,32 +383,32 @@ def run_widget_pipeline(img1, mask1, feats1, img2, mask2, feats2):
 
 
 def main():
-    pairs = discover_pairs()
-    print(f"Discovered {len(pairs)} pairs across {len(set(p[0] for p in pairs))} cases")
+    pairs = discover_synthetic_pairs()
+    print(f"Discovered {len(pairs)} synthetic pairs")
 
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    # Flat output directories
+    mask_dir = OUTPUT_ROOT / "registered_mask"
+    feat_dir = OUTPUT_ROOT / "features"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    feat_dir.mkdir(parents=True, exist_ok=True)
+
     segmenter = CellposeSegmenter(CELLPOSE_CFG)
 
-    # Cache segmentation per image path
     seg_cache = {}
     all_results = []
     failures = []
 
-    for i, (case_id, fixed_path, moving_path) in enumerate(pairs):
-        pair_name = f"{moving_path.stem}_to_{fixed_path.stem}"
-        pair_dir = OUTPUT_ROOT / case_id / pair_name
-        pair_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n[{i+1}/{len(pairs)}] {case_id}: {moving_path.name} → {fixed_path.name}")
+    for i, (case_id, target_path, moving_path) in enumerate(pairs):
+        print(f"\n[{i+1}/{len(pairs)}] {case_id}: {moving_path.name} → {target_path.name}")
 
         try:
-            # Segment (with cache) -- not timed
-            if str(fixed_path) not in seg_cache:
-                img1 = imread(str(fixed_path))
+            # Segment (with cache)
+            if str(target_path) not in seg_cache:
+                img1 = imread(str(target_path))
                 mask1, _, _ = segmenter.segment_array(np.asarray(img1))
                 feats1 = compute_cell_features(mask1, FEATURE_CFG)
-                seg_cache[str(fixed_path)] = (img1, mask1, feats1)
-            img1, mask1, feats1 = seg_cache[str(fixed_path)]
+                seg_cache[str(target_path)] = (img1, mask1, feats1)
+            img1, mask1, feats1 = seg_cache[str(target_path)]
 
             if str(moving_path) not in seg_cache:
                 img2 = imread(str(moving_path))
@@ -409,9 +417,9 @@ def main():
                 seg_cache[str(moving_path)] = (img2, mask2, feats2)
             img2, mask2, feats2 = seg_cache[str(moving_path)]
 
-            print(f"  Fixed: {len(feats1)} cells, Moving: {len(feats2)} cells")
+            print(f"  Target: {len(feats1)} cells, Moving: {len(feats2)} cells")
 
-            # Run pipeline -- only this is timed
+            # Run pipeline
             t0 = time.perf_counter()
             mask2_reg, matches, diag = run_widget_pipeline(img1, mask1, feats1, img2, mask2, feats2)
 
@@ -424,31 +432,31 @@ def main():
                   f"Recall={metrics['match_recall']:.4f}  Matched={metrics['matched_cells']}/{metrics['eligible_fixed_cells']}  "
                   f"TPS pts={diag['tps_control_points']}  reg_time={elapsed_reg:.1f}s")
 
-            # Save artifacts
-            imwrite(str(pair_dir / "registered_mask.tif"), mask2_reg, compression="zlib")
-            matches.to_csv(str(pair_dir / "registration_matches.csv"), index=False)
-            feats1.to_csv(str(pair_dir / "fixed_features.csv"), index=False)
-            feats2.to_csv(str(pair_dir / "moving_features.csv"), index=False)
+            # Save artifacts to flat directories
+            imwrite(str(mask_dir / f"{case_id}_registered_mask.tif"), mask2_reg, compression="zlib")
+            feats1.to_csv(str(feat_dir / f"{case_id}_target_features.csv"), index=False)
+            feats2.to_csv(str(feat_dir / f"{case_id}_moving_features.csv"), index=False)
+            matches.to_csv(str(feat_dir / f"{case_id}_matches.csv"), index=False)
 
             diag_full = {
                 "case_id": case_id,
-                "fixed_name": fixed_path.name,
+                "target_name": target_path.name,
                 "moving_name": moving_path.name,
-                "fixed_cells": len(feats1),
+                "target_cells": len(feats1),
                 "moving_cells": len(feats2),
                 "pipeline": diag,
                 "metrics": {k: (v if not isinstance(v, float) or np.isfinite(v) else None) for k, v in metrics.items()},
                 "registration_time_sec": round(elapsed_reg, 2),
             }
-            with open(pair_dir / "diagnostics.json", "w") as f:
+            with open(feat_dir / f"{case_id}_diagnostics.json", "w") as f:
                 json.dump(diag_full, f, indent=2, default=str)
 
             row = {
                 "case_id": case_id,
-                "fixed_name": fixed_path.name,
+                "target_name": target_path.name,
                 "moving_name": moving_path.name,
                 "status": "success",
-                "fixed_cells": len(feats1),
+                "target_cells": len(feats1),
                 "moving_cells": len(feats2),
                 "initial_matches": diag["initial_matches"],
                 "ransac_inliers": diag["ransac_inliers"],
@@ -465,10 +473,11 @@ def main():
 
         except Exception as e:
             print(f"  FAILED: {e}")
-            failures.append({"case_id": case_id, "pair": pair_name, "error": str(e)})
+            import traceback; traceback.print_exc()
+            failures.append({"case_id": case_id, "error": str(e)})
             all_results.append({
                 "case_id": case_id,
-                "fixed_name": fixed_path.name,
+                "target_name": target_path.name,
                 "moving_name": moving_path.name,
                 "status": "failed",
                 "error": str(e),
@@ -497,14 +506,16 @@ def main():
         print(f"  Max F1:      {success_df['match_f1'].max():.4f}")
         avg_reg = success_df['registration_time_sec'].mean()
         print(f"  Mean registration time: {avg_reg:.2f}s")
-        print(f"  Median registration time: {success_df['registration_time_sec'].median():.2f}s")
 
-    # Per-case F1
-    case_f1 = success_df.groupby("case_id")["match_f1"].mean().sort_values()
-    case_f1.to_csv(OUTPUT_ROOT / "f1_by_case.csv")
-    print("\nPer-case mean F1:")
-    for cid, f1 in case_f1.items():
-        print(f"  {cid}: {f1:.4f}")
+    # Per-subset summary
+    for subset in ("deform", "rigid"):
+        sub_df = success_df[success_df["case_id"].str.startswith(subset)]
+        if len(sub_df) > 0:
+            print(f"\n  [{subset.upper()}] n={len(sub_df)}  "
+                  f"Mean F1={sub_df['match_f1'].mean():.4f}  "
+                  f"Median F1={sub_df['match_f1'].median():.4f}  "
+                  f"Min={sub_df['match_f1'].min():.4f}  "
+                  f"Max={sub_df['match_f1'].max():.4f}")
 
     # Save params
     params = {
