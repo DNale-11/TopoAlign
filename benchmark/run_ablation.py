@@ -325,6 +325,12 @@ EXPERIMENTS = {
     "window_050": {"max_dist": 50, "min_consensus_for_tps": 3},
     # window_100 = baseline, skip
     "window_200": {"max_dist": 200, "min_consensus_for_tps": 3},
+    # Patch grid sweep (full pipeline, only change patch coverage)
+    "patch_0":  {"patch_grid": 0},
+    "patch_2":  {"patch_grid": 2},
+    "patch_3":  {"patch_grid": 3},
+    # patch_4 = baseline (4x4=16), skip
+    "patch_5":  {"patch_grid": 5},
 }
 
 

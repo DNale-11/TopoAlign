@@ -1,7 +1,9 @@
 """
-Simple patch-based morphology matching for rigid_0049.
-No spatial window, no consensus, no RANSAC — pure feature similarity per patch.
-Uses the existing matching API with position_weight=0.
+Minimal pipeline for rigid_0049:
+  1. Segment & extract features (existing code)
+  2. Global greedy match (no patches, no spatial window, morphology only)
+  3. RANSAC filter
+  4. TPS warp
 """
 import os, sys
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -15,8 +17,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from tifffile import imread
-from scipy.spatial import cKDTree
-from scipy.optimize import linear_sum_assignment
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -24,10 +24,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "napari-cell-registration" / "src"))
 
 from napari_cell_registration.core import (
     CellFeaturesConfig, CellposeConfig, CellposeSegmenter,
-    MatchingConfig, compute_cell_features, estimate_rigid_transform_from_matches,
-    rigid_transform_to_affine,
+    MatchingConfig, compute_cell_features,
+    estimate_rigid_transform_from_matches,
+    estimate_rigid_transform_from_matches_ransac,
+    rigid_transform_to_affine, greedy_match_cells,
+    MIN_MATCHES_FOR_REFINEMENT,
 )
-from napari_cell_registration.core.matching import compute_match_distance_matrix
 from napari_cell_registration.core.point_registration import (
     fit_tps_from_matches, warp_image_with_tps,
 )
@@ -53,106 +55,66 @@ feats2 = compute_cell_features(mask2, FEATURE_CFG)
 
 pts1 = feats1[["centroid_x", "centroid_y"]].to_numpy()
 pts2 = feats2[["centroid_x", "centroid_y"]].to_numpy()
-H, W = mask1.shape[:2]
 
 print(f"Target: {len(feats1)} cells, Moving: {len(feats2)} cells")
 
-# ── Ground truth (mutual nearest neighbor) ──
-tree1 = cKDTree(pts1)
-tree2 = cKDTree(pts2)
-d12, i12 = tree2.query(pts1, k=1)
-d21, i21 = tree1.query(pts2, k=1)
-gt_pairs = set()
-for i in range(len(pts1)):
-    j = i12[i]
-    if i21[j] == i and d12[i] < 30:
-        gt_pairs.add((i, j))
-print(f"Ground truth mutual NN pairs (<30px): {len(gt_pairs)}")
+# ── Step 1: Global greedy match — morphology only, no spatial window ──
+for top_k in [320, 500]:
+    for ransac_thresh in [2.0, 5.0, 10.0, 20.0]:
+        config = MatchingConfig(
+            feature_weight=1.0,
+            topology_weight=0.0,
+            position_weight=0.0,
+            top_k=top_k,
+            distance_threshold=None,
+            spatial_window_size=None,
+        )
+        matches = greedy_match_cells(feats1, feats2, config)
 
+        # ── Step 2: RANSAC ──
+        transform, inlier_mask = estimate_rigid_transform_from_matches_ransac(
+            feats1, feats2, matches,
+            max_trials=2000,
+            residual_threshold=ransac_thresh,
+            min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+        )
+        inlier_count = int(inlier_mask.sum())
+        matches_filtered = matches.loc[inlier_mask].reset_index(drop=True)
 
-def patch_morphology_match(feats1, feats2, pts1, pts2, grid, H, W):
-    """Match per patch: morphology-only, no spatial window, Hungarian assignment."""
-    config = MatchingConfig(
-        feature_weight=1.0,
-        topology_weight=0.0,
-        position_weight=0.0,  # pure morphology
-        top_k=9999,
-        distance_threshold=None,
-        spatial_window_size=None,  # no window
-    )
+        if len(matches_filtered) < 10:
+            print(f"\ntop_k={top_k}, ransac_thresh={ransac_thresh}: "
+                  f"Only {len(matches_filtered)} inliers, skipping")
+            continue
 
-    all_matches = []
-    used_2 = set()
+        # Check displacement stats of inliers
+        idx1 = matches_filtered["idx1"].to_numpy(dtype=int)
+        idx2 = matches_filtered["idx2"].to_numpy(dtype=int)
+        pts_f = pts1[idx1]
+        pts_m = pts2[idx2]
+        disps = pts_f - pts_m
+        norms = np.linalg.norm(disps, axis=1)
 
-    for py in range(grid):
-        for px in range(grid):
-            y0, y1 = py * H // grid, (py + 1) * H // grid
-            x0, x1 = px * W // grid, (px + 1) * W // grid
-
-            idx1_in = [i for i in range(len(pts1))
-                       if x0 <= pts1[i, 0] < x1 and y0 <= pts1[i, 1] < y1]
-            idx2_in = [j for j in range(len(pts2))
-                       if x0 <= pts2[j, 0] < x1 and y0 <= pts2[j, 1] < y1]
-
-            if not idx1_in or not idx2_in:
-                continue
-
-            # Build local feature DataFrames
-            local_f1 = feats1.iloc[idx1_in].reset_index(drop=True)
-            local_f2 = feats2.iloc[idx2_in].reset_index(drop=True)
-
-            # Compute distance matrix using existing API
-            dist = compute_match_distance_matrix(local_f1, local_f2, config)
-
-            # Hungarian assignment
-            row_ind, col_ind = linear_sum_assignment(dist)
-
-            for r, c in zip(row_ind, col_ind):
-                if not np.isfinite(dist[r, c]):
-                    continue
-                j_global = idx2_in[c]
-                if j_global not in used_2:
-                    all_matches.append({
-                        "idx1": idx1_in[r],
-                        "idx2": j_global,
-                        "distance": float(dist[r, c]),
-                    })
-                    used_2.add(j_global)
-
-    return pd.DataFrame(all_matches)
-
-
-# ── Try different grid sizes ──
-for grid in [1, 2, 4, 8]:
-    matches = patch_morphology_match(feats1, feats2, pts1, pts2, grid, H, W)
-    matched_pairs = set(zip(matches["idx1"].values, matches["idx2"].values))
-    correct = matched_pairs & gt_pairs
-
-    disps = pts1[matches["idx1"].values] - pts2[matches["idx2"].values]
-    norms = np.linalg.norm(disps, axis=1)
-
-    print(f"\n=== Grid {grid}x{grid}: {len(matches)} matches, "
-          f"{len(correct)} correct ({len(correct)/max(len(matches),1)*100:.1f}%) ===")
-    print(f"  Displacement: mean={norms.mean():.1f}, median={np.median(norms):.1f}, "
-          f"std={norms.std():.1f}")
-
-    if len(matches) >= 20:
-        # TPS warp & evaluate
+        # ── Step 3: TPS warp ──
         try:
-            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
             affine = rigid_transform_to_affine(transform)
-            pts_f = pts1[matches["idx1"].values]
-            pts_m = pts2[matches["idx2"].values]
             tps = fit_tps_from_matches(
                 pts_f, pts_m, output_shape=mask1.shape[:2],
                 rigid_transform=affine, regularization=1e-3,
                 n_boundary_per_side=4, add_boundary_anchors_flag=True,
             )
-            mask2_warped = warp_image_with_tps(mask2.astype(np.int32), tps, mask1.shape[:2], order=0)
+            mask2_warped = warp_image_with_tps(
+                mask2.astype(np.int32), tps, mask1.shape[:2], order=0)
             mask2_reg = np.rint(mask2_warped).astype(np.int32)
-            metrics = compute_prewarped_registration_metrics(mask2_reg, mask1, instance_iou_threshold=0.3)
-            print(f"  → F1={metrics['match_f1']:.4f}  Prec={metrics['match_precision']:.4f}  "
+
+            metrics = compute_prewarped_registration_metrics(
+                mask2_reg, mask1, instance_iou_threshold=0.3)
+
+            print(f"\ntop_k={top_k}, ransac_thresh={ransac_thresh}: "
+                  f"{inlier_count} inliers, "
+                  f"disp mean={norms.mean():.1f} std={norms.std():.1f}")
+            print(f"  F1={metrics['match_f1']:.4f}  "
+                  f"Prec={metrics['match_precision']:.4f}  "
                   f"Recall={metrics['match_recall']:.4f}  "
                   f"Matched={metrics['matched_cells']}/{metrics['eligible_fixed_cells']}")
         except Exception as e:
-            print(f"  → TPS failed: {e}")
+            print(f"\ntop_k={top_k}, ransac_thresh={ransac_thresh}: TPS failed: {e}")

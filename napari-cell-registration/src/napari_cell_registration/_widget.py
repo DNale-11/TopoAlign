@@ -108,6 +108,18 @@ def segment_cells_widget(
         show_info(f"{progress} Processing {layer_name}...")
         mask, flows, styles = segmenter.segment_array(img_array)
         n_cells = len(np.unique(mask)) - 1
+
+        # Truncate long layer names for cleaner UI
+        MAX_NAME_LEN = 30
+        if len(layer_name) > MAX_NAME_LEN:
+            short_name = layer_name[:MAX_NAME_LEN - 3] + "..."
+            # Rename the source image layer too
+            try:
+                viewer.layers[layer_name].name = short_name
+            except (KeyError, ValueError):
+                pass
+            layer_name = short_name
+
         mask_name = f"{layer_name}_mask"
         viewer.add_labels(mask, name=mask_name, opacity=0.5)
         show_info(f"{progress} {mask_name}: Found {n_cells} cells")

@@ -1,5 +1,9 @@
 # Cell Registration (DAPI-based)
 
+<p align="center">
+  <img src="logo.png" alt="Cell Registration Logo" width="600">
+</p>
+
 Python package for nuclear segmentation, feature extraction, cell matching, and rigid alignment using Cellpose-SAM.
 
 ## Requirements
