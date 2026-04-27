@@ -4,80 +4,87 @@
   <img src="logo.png" alt="Cell Registration Logo" width="600">
 </p>
 
-Python package for nuclear segmentation, feature extraction, cell matching, and rigid alignment using Cellpose-SAM.
+A professional Python package for robust nuclear segmentation, feature extraction, and precise cellular alignment across multiplexed imaging rounds using a landmark-based registration pipeline.
 
-## Requirements
-- Python 3.10 (tested)
-- See `requirements.txt` for exact pins. Install with:
+## Overview
+
+Unlike traditional patch-based or heuristic (RANSAC/ICP) approaches, this pipeline employs a **rigorous multi-stage landmark-based registration algorithm**. It aims to find highly reliable, one-to-one cellular matches based on robust local topologies before estimating the global transformation.
+
+### Architecture Workflow
+
+1. **Segmentation & Feature Extraction**
+   - Automatically segments cells using Cellpose-SAM.
+   - Extracts morphological features (`area`, `perimeter`, `eccentricity`, `shape_ratio`) and centroid coordinates. (Orientation is explicitly excluded to maintain rotation invariance).
+
+2. **Stage 1: Loose Candidate Generation**
+   - Uses KD-Tree radius queries to efficiently generate a broad set of candidate matching pairs between the fixed and moving images.
+
+3. **Stage 2: Morphological & Positional Scoring**
+   - Computes robust normalized differences (using Median and IQR/MAD) for morphological features.
+   - Combines the morphological score with positional differences to filter out structurally dissimilar candidates.
+
+4. **Stage 3: Local Topology Validation**
+   - Validates the local spatial neighborhood of candidate pairs.
+   - Employs scale-normalized kNN distance vectors, rotation-invariant angle histograms, and local density checks.
+   - Relaxes topology constraints adaptively for border cells.
+
+5. **Stage 4: Maximum Cardinality Min-Cost Landmark Selection**
+   - Formulates the final matching as a bipartite graph problem.
+   - First maximizes the total number of preserved landmark pairs (Maximum Cardinality Matching).
+   - Then minimizes the overall mismatch cost to ensure strict one-to-one mapping without forcing full assignment.
+
+6. **Stage 5: Global Transformation Estimation**
+   - Utilizes all rigorously validated landmarks to estimate the final `rigid` or `similarity` transformation matrix.
+
+## Installation
+
+- **Python**: 3.10
+- **Dependencies**: See `requirements.txt`.
+
 ```bash
 pip install -r requirements.txt
 ```
 
-> Note: Cellpose requires PyTorch. The `torch` pin in `requirements.txt` targets CPU by default; if you want CUDA, install the matching CUDA wheel (e.g., `torch==2.3.1+cu121`) from the official PyTorch index before installing Cellpose.
+> **Note:** Cellpose requires PyTorch. Install the appropriate CUDA wheel (e.g., `torch==2.3.1+cu121`) from the official PyTorch index before running the pipeline if you want GPU acceleration.
 
-## Project structure
-```
-cell_registration/
-  __init__.py
-  config.py          # global configs
-  io_utils.py        # image I/O
-  segmentation.py    # Cellpose-SAM wrapper
-  features.py        # regionprops-based features
-  matching.py        # greedy feature-space matching
-  registration.py    # rigid/similarity transform
-  visualization.py   # napari viewer & overlays
-  main.py            # CLI demo pipeline
-requirements.txt
-```
+## Usage
 
-## Running the demo
-Run the full pipeline on two images (DAPI last channel if multichannel):
+Run the primary pipeline to register two images (DAPI or nuclear channel):
+
 ```bash
-python -m cell_registration.main path/to/img1.tif path/to/img2.tif --top-k 10
+python -m cell_registration.main path/to/fixed.tif path/to/moving.tif
 ```
 
-Optional flags:
-- `--napari` to open interactive viewers (requires `napari` installed).
-- `--save-match-table matches.csv` to export the match pairs.
-- `--save-match-overlay overlay.png` to save a side-by-side overlay with matched centroids/lines.
-- `--save-segmentation-prefix outputs/segmentation` to save TIF plots of each segmentation.
-- `--save-match-plot outputs/match_plot` to save a matplotlib match plot (TIF).
-- `--save-registration-overlay outputs/registration_overlay` to save mask1 warped onto image2 (TIF) for visual registration check.
-- `--save-features-dir outputs` to save per-cell feature tables as `round1_cells.csv` / `round2_cells.csv` (with x,y aliases for centroids).
-- `--position-weight 1.0` to control spatial proximity weight in matching (0 disables position).
+### Key Parameters
 
-Example (PowerShell one-line, TIF outputs):
-pretest:
-python -m cell_registration.main ".\B.tif" ".\C.tif" --top-k 10 --position-weight 1 --save-segmentation-prefix .\outputs\segmentation --save-match-overlay .\outputs\match_overlay --save-match-plot .\outputs\match_plot
+**General**:
+- `--segmentation-only`: Only perform Cellpose segmentation and exit.
+- `--napari`: Launch the interactive napari viewer for debugging and visualization.
+
+**Algorithm Tuning**:
+- `--candidate-radius-px`: Radius for initial loose spatial candidates (default: `25`).
+- `--position-weight`: Weight of spatial proximity in candidate scoring.
+- `--feature-score-threshold` / `--candidate-score-threshold`: Thresholds for morphology and combined position filtering.
+- `--topology-radius-px` / `--topology-k`: Neighborhood radius and neighbor count for topology validation.
+- `--topology-score-threshold`: Strictness of topology matching.
+- `--allow-scale`: Allows similarity transform (scale + rotation + translation) instead of just rigid.
+
+**Outputs**:
+- `--save-match-table <path.csv>`: Export final landmark pairs.
+- `--save-match-overlay <path.tif>`: Save a side-by-side visualization of landmark connections.
+- `--save-match-plot <path.tif>`: Save a matplotlib match plot.
+- `--save-registration-overlay <path.tif>`: Save the final overlay of moving image warped onto fixed image.
+- `--save-features-dir <dir>`: Save extracted cell morphology tables (`round1_cells.csv` and `round2_cells.csv`).
+- `--save-debug-dir <dir>`: Export detailed QA metrics (e.g., transform residuals, topology rejections).
+
+### Example (PowerShell)
+
 ```powershell
-python -m cell_registration.main ".\B.tif" ".\C.tif" --top-k 10 --position-weight 1 `
+python -m cell_registration.main ".\fixed.tif" ".\moving.tif" `
+  --candidate-radius-px 25 `
+  --position-weight 1.0 `
   --save-segmentation-prefix .\outputs\segmentation `
   --save-match-overlay .\outputs\match_overlay `
-  --save-match-plot .\outputs\match_plot
+  --save-registration-overlay .\outputs\registration_overlay `
+  --save-features-dir .\outputs
 ```
-start:
-python -m cell_registration.main ".\B.tif" ".\C.tif" --top-k 10 --position-weight 1 --save-segmentation-prefix .\outputs\segmentation --save-match-overlay .\outputs\match_overlay --save-match-plot .\outputs\match_plot --save-registration-overlay .\outputs\registration_overlay --napari
-
-
-
-The script prints Top-K matches and the estimated rotation matrix and translation vector. Overlay/CSV are written if paths are provided. Remove `--napari` if you do not need the interactive viewer.
-
-python -m cell_registration.main ".\B.tif" ".\C.tif" --top-k 10 --position-weight 1 `
-  --save-match-table .\outputs\top_matches.csv `
-  --save-segmentation-prefix .\outputs\segmentation `
-  --save-match-overlay .\outputs\match_overlay `
-  --save-match-plot .\outputs\match_plot `
-  --save-registration-overlay .\outputs\registration_overlay
-
-
-python -m cell_registration.point_registration `
-  .\outputs\round1_cells.csv `
-  .\outputs\round2_cells.csv `
-  .\outputs\top_matches.csv `
-  --output-registered-csv .\outputs\round2_cells_registered.csv `
-  --plot-path .\outputs\registration_plot.png `
-  --method translation `
-  --napari
-
-
-python -m cell_registration.main B.tif C.tif --position-weight 20 --top-per-patch 6 --top-k 200 --use-ransac-transform
