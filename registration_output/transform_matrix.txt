@@ -1,0 +1,11 @@
+Affine Transform Matrix:
+[[  1.           0.         -46.06990317]
+ [  0.           1.          23.78889155]
+ [  0.           0.           1.        ]]
+
+Rotation Matrix:
+[[1. 0.]
+ [0. 1.]]
+
+Translation Vector:
+[-46.06990317  23.78889155]

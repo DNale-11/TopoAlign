@@ -11,5 +11,6 @@ llvmlite>=0.39,<0.46        # Pin with numba for Py3.10 wheels
 natsort>=8.0,<9.0           # Cellpose dependency
 tqdm>=4.65,<5.0             # Cellpose dependency
 cellpose>=4.0,<5.0          # Cellpose-SAM support
+networkx>=2.6,<4.0          # Required: Stage 4 min-weight max-cardinality matching
 napari[all]>=0.4.18         # Optional: interactive visualization
 matplotlib>=3.7,<3.10       # For static visualization

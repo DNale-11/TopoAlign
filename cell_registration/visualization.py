@@ -10,10 +10,8 @@ import pandas as pd
 import imageio.v3 as iio
 from skimage import draw
 import matplotlib.pyplot as plt
-from skimage.transform import warp
+from skimage.transform import AffineTransform, warp
 from scipy.ndimage import binary_dilation
-
-from .registration import build_inverse_affine_transform
 
 
 def _select_channel(img: np.ndarray) -> np.ndarray:
@@ -185,9 +183,24 @@ def warp_mask_to_image2(
     translation: np.ndarray,
 ) -> np.ndarray:
     """
-    Warp mask1 into image2 coordinates using the estimated rigid transform.
+    Warp mask1 into image2 coordinates using the estimated transform mapping image2 -> image1.
     """
-    affine = build_inverse_affine_transform(rotation, translation)
+    R = np.asarray(rotation, dtype=float)
+    t = np.asarray(translation, dtype=float)
+    R_inv = R.T  # orthonormal assumption
+    t_inv = -R_inv @ t
+
+    affine = AffineTransform(
+        matrix=np.array(
+            [
+                [R_inv[0, 0], R_inv[0, 1], t_inv[0]],
+                [R_inv[1, 0], R_inv[1, 1], t_inv[1]],
+                [0, 0, 1],
+            ],
+            dtype=float,
+        )
+    )
+
     warped_mask = warp(
         mask1.astype(float),
         inverse_map=affine,
@@ -242,3 +255,40 @@ def save_match_plot(
     plt.close(fig)
 
 
+def save_aligned_match_plot(
+    image1: np.ndarray,
+    image2: np.ndarray,
+    feats1: pd.DataFrame,
+    feats2_aligned: pd.DataFrame,
+    match_df: pd.DataFrame,
+    path: str | Path,
+    marker_size: int = 6,
+) -> None:
+    """
+    Save a plot in the fixed-image coordinate system.
+
+    Image2 is shown only as a faint background reference; matched points are drawn
+    using aligned coordinates so line length reflects post-alignment error.
+    """
+    img1 = _normalize_for_overlay(_select_channel(image1))
+    img2 = _normalize_for_overlay(_select_channel(image2))
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(img1, cmap="gray")
+    if img2.shape == img1.shape:
+        ax.imshow(img2, cmap="magma", alpha=0.15)
+
+    colors = _color_palette(len(match_df))
+    for color, (_, row) in zip(colors, match_df.iterrows()):
+        y1, x1 = feats1.loc[row["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
+        y2, x2 = feats2_aligned.loc[row["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
+        ax.plot([x1, x2], [y1, y2], color=color, linewidth=0.8, alpha=0.8)
+        ax.scatter([x1, x2], [y1, y2], c=[color], s=marker_size * 5, edgecolors="k", linewidths=0.4)
+
+    ax.axis("off")
+    ax.set_title("Matched centroids in aligned coordinates")
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)

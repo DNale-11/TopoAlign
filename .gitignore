@@ -1,8 +1,10 @@
-@"
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # VS Code
 .vscode/
@@ -11,10 +13,15 @@ __pycache__/
 *.tif
 *.tiff
 
-# Outputs
-outputs/
+# Generated outputs
+outputs*/
+segmentation_output/
+benchmark/results_tune/
+benchmark/results/*
+!benchmark/results/
+!benchmark/results/benchmark_params.json
+!benchmark/results/benchmark_results.csv
 
 # OS
 .DS_Store
 Thumbs.db
-"@ | Out-File -Encoding utf8 .gitignore

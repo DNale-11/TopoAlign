@@ -1,0 +1,63 @@
+{
+  "case_id": "C3-3",
+  "fixed_path": "F:\\programme\\nxy\\Cell registration\\benchmark\\unregistration\\C3-3\\fixed\\C3-B-3.tif",
+  "moving_path": "F:\\programme\\nxy\\Cell registration\\benchmark\\unregistration\\C3-3\\moving\\C3-D-3.tif",
+  "icp_config": {
+    "max_iterations": 80,
+    "strict_match_threshold": 10.0,
+    "w_spatial_init": 0.3,
+    "w_spatial_final": 1.0,
+    "w_feature_init": 1.0,
+    "w_feature_final": 0.3,
+    "transform_type": "rigid"
+  },
+  "cellpose_config": {
+    "diameter": 15,
+    "flow_threshold": -2,
+    "cellprob_threshold": 1,
+    "min_size": 5
+  },
+  "transform_matrix": [
+    [
+      0.999999974746013,
+      0.00022473976266040245,
+      -13.67794156884792
+    ],
+    [
+      -0.00022473976266016105,
+      0.9999999747460165,
+      25.94961870694549
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "metrics": {
+    "case": "C3-3",
+    "fixed": "C3-B-3",
+    "moving": "C3-D-3",
+    "pair": "C3-D-3_to_C3-B-3",
+    "n_cells_fixed": 1246,
+    "n_cells_moving": 1224,
+    "icp_matched_pairs": 531,
+    "time_seconds": 8.8,
+    "icp_mean_L2": 2.4,
+    "icp_median_L2": 1.98,
+    "icp_p95_L2": 5.94,
+    "F1": 0.7356,
+    "precision": 0.7477,
+    "recall": 0.7239,
+    "matched_cells": 886,
+    "eligible_moving": 1185,
+    "eligible_fixed": 1224,
+    "matched_mean_iou": 0.6212,
+    "TRE_mean_px": 3.36,
+    "TRE_median_px": 2.47,
+    "TRE_p95_px": 9.13,
+    "mask_dice": 0.7235,
+    "mask_iou": 0.5668
+  },
+  "timestamp": "2026-04-01T10:33:37.612043+08:00"
+}

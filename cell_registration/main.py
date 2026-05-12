@@ -9,13 +9,13 @@ from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
 from .config import DEFAULT_CELLPOSE_CONFIG, DEFAULT_FEATURE_CONFIG
 from .features import compute_cell_features
-from .matching import MatchingConfig, greedy_match_cells, match_cells_per_patch, match_cells_per_cluster
-from .registration import (
-    RigidTransform,
-    estimate_rigid_transform_from_matches,
-    estimate_rigid_transform_from_matches_ransac,
+from .matching import (
+    MatchingConfig,
+    match_cells_per_cluster,
+    two_stage_match_cells,
 )
-from .robust_alignment import perform_global_registration, apply_transform_to_coordinates
+from .point_registration import estimate_robust_transform
+from .registration import RigidTransform, estimate_rigid_transform_from_matches
 from .segmentation import CellposeSegmenter
 from .io_utils import infer_image_mode, load_image, project_intensity_max
 
@@ -28,16 +28,19 @@ if __name__ == "__main__" and __package__ is None:  # pragma: no cover
 DEFAULT_IMG1_PATH = Path("1_ch5.tif")
 DEFAULT_IMG2_PATH = Path("2_ch5.tif")
 DEFAULT_TOP_K = 50
-DEFAULT_POSITION_WEIGHT = 1.0
+DEFAULT_FEATURE_WEIGHT = 1.0
+DEFAULT_TOPOLOGY_WEIGHT = 0.35
+DEFAULT_POSITION_WEIGHT = 4.0
+DEFAULT_DISTANCE_THRESHOLD = 2.0
+DEFAULT_SPATIAL_WINDOW_SIZE = 100.0
 DEFAULT_SAVE_MATCH_TABLE = Path("outputs/top_matches.csv")
-DEFAULT_SAVE_MATCH_OVERLAY = Path("outputs/match_overlay")
+DEFAULT_SAVE_MATCH_OVERLAY = Path("outputs/match _overlay")
 DEFAULT_SAVE_SEGMENTATION_PREFIX = Path("outputs/segmentation")
 DEFAULT_SAVE_MATCH_PLOT = Path("outputs/match_plot")
 DEFAULT_SAVE_REGISTRATION_OVERLAY = Path("outputs/registration_overlay")
 DEFAULT_SAVE_FEATURES_DIR = Path("outputs")
-DEFAULT_RESIDUAL_PRUNE_QUANTILE = 0.9
+DEFAULT_RESIDUAL_PRUNE_QUANTILE = None
 MIN_MATCHES_FOR_REFINEMENT = 3
-TOP_K_PER_PATCH = 6  # default 6 per patch -> 54 for 3x3 grid
 
 PATCH_GRID = 3  # 3x3 patches across the image
 PATCH_W = 1.0 / PATCH_GRID
@@ -438,6 +441,161 @@ def run_topology_matching_df(
     return trusted_pairs, neighbor_matches
 
 
+def enforce_one_to_one_pairs(
+    pairs: pd.DataFrame,
+    id_r1_col: str = "cell_id_r1",
+    id_r2_col: str = "cell_id_r2",
+) -> pd.DataFrame:
+    """
+    Keep only a global 1-to-1 subset of candidate pairs.
+
+    Trusted anchor pairs are preferred over propagated neighbor pairs, and within
+    each stage lower scores are preferred.
+    """
+    if pairs.empty:
+        return pairs.copy()
+
+    out = pairs.copy()
+    if "pair_stage" not in out.columns:
+        out["pair_stage"] = 0
+    if "pair_score" not in out.columns:
+        out["pair_score"] = np.inf
+
+    out["pair_stage"] = out["pair_stage"].fillna(1).astype(int)
+    out["pair_score"] = pd.to_numeric(out["pair_score"], errors="coerce").fillna(np.inf)
+    out = out.drop_duplicates(subset=[id_r1_col, id_r2_col])
+    out = out.sort_values(
+        by=["pair_stage", "pair_score", id_r1_col, id_r2_col],
+        ascending=[True, True, True, True],
+    )
+
+    used_r1: set = set()
+    used_r2: set = set()
+    kept_rows: list[pd.Series] = []
+    for _, row in out.iterrows():
+        cid1 = row[id_r1_col]
+        cid2 = row[id_r2_col]
+        if cid1 in used_r1 or cid2 in used_r2:
+            continue
+        kept_rows.append(row)
+        used_r1.add(cid1)
+        used_r2.add(cid2)
+
+    if not kept_rows:
+        return out.iloc[0:0].copy()
+    return pd.DataFrame(kept_rows).reset_index(drop=True)
+
+
+def rebuild_matches_from_topology_pairs(
+    base_matches: pd.DataFrame,
+    fixed_feats: pd.DataFrame,
+    moving_feats: pd.DataFrame,
+    *,
+    image_width: float,
+    image_height: float,
+    k_pos_nei: int,
+    k_neighbor: int,
+    tau_pos: float,
+    tau_nei: float,
+    tau_map: float,
+) -> pd.DataFrame:
+    """
+    Rebuild the final match table from topology-filtered pairs.
+
+    Trusted anchor pairs are preferred over propagated neighbors and the final
+    result is forced to be a global 1-to-1 matching.
+    """
+    if base_matches.empty:
+        return pd.DataFrame(columns=["idx1", "idx2", "cell_id_1", "cell_id_2"])
+
+    candidate_matches = pd.DataFrame(
+        {
+            "cell_id_r1": fixed_feats.loc[base_matches["idx1"], "cell_id"].to_numpy(),
+            "cell_id_r2": moving_feats.loc[base_matches["idx2"], "cell_id"].to_numpy(),
+        }
+    )
+    trusted_pairs, neighbor_matches = run_topology_matching_df(
+        fixed_feats,
+        moving_feats,
+        candidate_matches,
+        image_width=image_width,
+        image_height=image_height,
+        k_pos_nei=k_pos_nei,
+        k_neighbor=k_neighbor,
+        tau_pos=tau_pos,
+        tau_nei=tau_nei,
+        tau_map=tau_map,
+        id_r1_col="cell_id_r1",
+        id_r2_col="cell_id_r2",
+        cell_id_col="cell_id",
+        x_col="centroid_x",
+        y_col="centroid_y",
+    )
+
+    combined_pairs = trusted_pairs.copy()
+    if not combined_pairs.empty:
+        combined_pairs["pair_stage"] = 0
+        combined_pairs["pair_score"] = (
+            pd.to_numeric(combined_pairs.get("L_pos"), errors="coerce").fillna(np.inf)
+            + pd.to_numeric(combined_pairs.get("L_nei"), errors="coerce").fillna(np.inf)
+        )
+
+    neighbor_filtered = neighbor_matches
+    if not neighbor_matches.empty and "within_threshold" in neighbor_matches.columns:
+        neighbor_filtered = neighbor_matches[neighbor_matches["within_threshold"] == True]
+    if not neighbor_filtered.empty:
+        neighbor_filtered = neighbor_filtered.copy()
+        neighbor_filtered["pair_stage"] = 1
+        neighbor_filtered["pair_score"] = pd.to_numeric(
+            neighbor_filtered.get("dist_norm"),
+            errors="coerce",
+        ).fillna(np.inf)
+        combined_pairs = pd.concat([combined_pairs, neighbor_filtered], ignore_index=True)
+
+    if combined_pairs.empty:
+        print("Topology filtering removed all candidate matches.")
+        return pd.DataFrame(columns=["idx1", "idx2", "cell_id_1", "cell_id_2"])
+
+    combined_pairs = enforce_one_to_one_pairs(combined_pairs)
+    id_to_idx1 = {fixed_feats.loc[idx, "cell_id"]: idx for idx in fixed_feats.index}
+    id_to_idx2 = {moving_feats.loc[idx, "cell_id"]: idx for idx in moving_feats.index}
+
+    base_lookup: dict[tuple[object, object], pd.Series] = {}
+    for _, base_row in base_matches.iterrows():
+        key = (
+            fixed_feats.loc[base_row["idx1"], "cell_id"],
+            moving_feats.loc[base_row["idx2"], "cell_id"],
+        )
+        base_lookup[key] = base_row
+
+    rows: list[dict] = []
+    for _, pair in combined_pairs.iterrows():
+        cid1 = pair["cell_id_r1"]
+        cid2 = pair["cell_id_r2"]
+        idx1 = id_to_idx1.get(cid1)
+        idx2 = id_to_idx2.get(cid2)
+        if idx1 is None or idx2 is None:
+            continue
+
+        row = {"idx1": idx1, "idx2": idx2, "cell_id_1": cid1, "cell_id_2": cid2}
+        base_row = base_lookup.get((cid1, cid2))
+        if base_row is not None:
+            for extra in ("distance",):
+                if extra in base_row and not pd.isna(base_row[extra]):
+                    row[extra] = base_row[extra]
+        for extra in ("L_pos", "L_nei", "dist_norm", "within_threshold", "patch_x", "patch_y"):
+            if extra in pair and not pd.isna(pair[extra]):
+                row[extra] = pair[extra]
+        rows.append(row)
+
+    print(
+        "Topology filtering kept "
+        f"{len(trusted_pairs)} trusted anchors and {len(neighbor_filtered)} propagated neighbors "
+        f"before 1-to-1 pruning; final matches={len(rows)}."
+    )
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
 def run_topology_matching(
     round1_csv: Path | str,
     round2_csv: Path | str,
@@ -492,12 +650,50 @@ def compute_match_residuals(
     pts2_warp = (transform.rotation @ pts2.T).T + transform.translation
     return np.linalg.norm(pts1 - pts2_warp, axis=1)
 
+
+def estimate_rigid_transform_from_matches_ransac(
+    feats1: pd.DataFrame,
+    feats2: pd.DataFrame,
+    matches: pd.DataFrame,
+    max_trials: int = 1000,
+    residual_threshold: float = 2.0,
+    min_inliers: int = 3,
+) -> tuple[RigidTransform, np.ndarray]:
+    """
+    Estimate a robust rigid transform using RANSAC on matched pairs.
+    """
+    n_matches = len(matches)
+    if n_matches == 0:
+        raise ValueError("No matches provided to estimate transform.")
+    if n_matches < min_inliers:
+        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+        inlier_mask = np.ones(n_matches, dtype=bool)
+        return transform, inlier_mask
+    pts_fixed = feats1.iloc[matches["idx1"]][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    pts_moving = feats2.iloc[matches["idx2"]][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    robust = estimate_robust_transform(
+        pts_fixed,
+        pts_moving,
+        allow_scale=False,
+        prefer_affine=False,
+        residual_threshold=residual_threshold,
+        max_trials=max_trials,
+        min_inliers=min_inliers,
+    )
+    params = np.asarray(robust.transform.params, dtype=float)
+    transform = RigidTransform(rotation=params[:2, :2], translation=params[:2, 2])
+    return transform, np.asarray(robust.inliers, dtype=bool)
+
+
 def run_pipeline(
     img1_path: Path = DEFAULT_IMG1_PATH,
     img2_path: Path = DEFAULT_IMG2_PATH,
     top_k: int = DEFAULT_TOP_K,
-    top_k_per_patch: int | None = TOP_K_PER_PATCH,
+    feature_weight: float = DEFAULT_FEATURE_WEIGHT,
+    topology_weight: float = DEFAULT_TOPOLOGY_WEIGHT,
     position_weight: float = DEFAULT_POSITION_WEIGHT,
+    distance_threshold: float | None = DEFAULT_DISTANCE_THRESHOLD,
+    spatial_window_size: float | None = DEFAULT_SPATIAL_WINDOW_SIZE,
     napari_view: bool = False,
     segmentation_only: bool = False,
     save_match_table: Path = DEFAULT_SAVE_MATCH_TABLE,
@@ -518,53 +714,10 @@ def run_pipeline(
     use_ransac_transform: bool = False,
     ransac_max_trials: int = 1000,
     ransac_residual_threshold: float = 2.0,
-    save_npy: bool = False,
 ) -> None:
     segmenter = CellposeSegmenter(DEFAULT_CELLPOSE_CONFIG)
 
-    # Detect single-image mode (when same path is provided for both images)
-    single_image_mode = (img1_path == img2_path) and segmentation_only
-    
     img1 = load_image(img1_path)
-    
-    if single_image_mode:
-        # Only process one image in single-image segmentation mode
-        mode1 = infer_image_mode(img1)
-        use_zstack = mode1 == "3d_zstack"
-        
-        if use_zstack:
-            _masks1_3d, masks1, _, _ = segmenter.segment_zstack(img1)
-            overlay_img1 = project_intensity_max(img1)
-        else:
-            masks1, _, _ = segmenter.segment_array(img1)
-            overlay_img1 = img1
-        
-        # Save and/or display the single segmentation
-        if save_segmentation_prefix is not None:
-            import imageio.v3 as iio
-            
-            out1 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + ".tif")
-            iio.imwrite(out1, masks1.astype(np.uint16))
-            print(f"Saved segmentation mask to {out1}")
-
-            if save_npy:
-                npy_out = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + ".npy")
-                np.save(npy_out, masks1)
-                print(f"Saved segmentation npy to {npy_out}")
-        
-        if napari_view:
-            try:
-                import napari  # type: ignore
-                from .visualization import launch_napari_viewer
-            except ImportError:
-                print("napari not installed; skipping interactive viewer.")
-            else:
-                viewer = launch_napari_viewer(overlay_img1, masks1, title=f"{img1_path.name} segmentation")
-                viewer.window._qt_window.raise_()
-                napari.run()
-        return
-    
-    # Two-image mode (original behavior)
     img2 = load_image(img2_path)
 
     mode1 = infer_image_mode(img1)
@@ -587,20 +740,13 @@ def run_pipeline(
 
     if segmentation_only:
         if save_segmentation_prefix is not None:
-            import imageio.v3 as iio
+            from .visualization import save_segmentation_plot
 
             out1 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img1.tif")
             out2 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img2.tif")
-            iio.imwrite(out1, masks1.astype(np.uint16))
-            iio.imwrite(out2, masks2.astype(np.uint16))
-            print(f"Saved segmentation masks to {out1} and {out2}")
-
-            if save_npy:
-                npy_out1 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img1.npy")
-                npy_out2 = save_segmentation_prefix.with_name(save_segmentation_prefix.stem + "_img2.npy")
-                np.save(npy_out1, masks1)
-                np.save(npy_out2, masks2)
-                print(f"Saved segmentation npy to {npy_out1} and {npy_out2}")
+            save_segmentation_plot(overlay_img1, masks1, out1, title="Segmentation image1")
+            save_segmentation_plot(overlay_img2, masks2, out2, title="Segmentation image2")
+            print(f"Saved segmentation plots to {out1} and {out2}")
 
         if napari_view:
             try:
@@ -619,36 +765,56 @@ def run_pipeline(
     feats1 = compute_cell_features(masks1, DEFAULT_FEATURE_CONFIG).reset_index(drop=True)
     feats2 = compute_cell_features(masks2, DEFAULT_FEATURE_CONFIG).reset_index(drop=True)
     h1, w1 = masks1.shape
-    h2, w2 = masks2.shape
+    two_stage = two_stage_match_cells(
+        feats1,
+        feats2,
+        masks1.shape,
+        feature_weight=feature_weight,
+        topology_weight=topology_weight,
+        position_weight=position_weight,
+        top_k=top_k,
+        distance_threshold=distance_threshold,
+        spatial_window_size=spatial_window_size,
+        coarse_top_k=max(24, top_k),
+        coarse_distance_threshold=2.0,
+        coarse_matching_mode="morphology_guided",
+        coarse_allow_scale=False,
+        coarse_prefer_affine=False,
+        coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
+        coarse_max_trials=min(max(ransac_max_trials, 200), 2000),
+    )
+    feats2_aligned = two_stage.aligned_df2
 
-    # --- Global Registration Step ---
-    print("Running robust global alignment...")
-    global_transform = perform_global_registration(feats1, feats2)
-
-    if global_transform is not None:
-        rot = getattr(global_transform, "rotation", np.nan)
-        trans = getattr(global_transform, "translation", np.array([np.nan, np.nan]))
-        if not (np.isfinite(rot) and np.all(np.isfinite(trans))):
-            print("Global alignment returned non-finite parameters; skipping global transform.")
-            global_transform = None
-
-    if global_transform is not None:
-        print("Global alignment successful.")
-        print(f"Initial rotation: {global_transform.rotation}")
-        print(f"Initial translation: {global_transform.translation}")
-        # Apply transform to create a temporary aligned dataframe for matching
-        feats2_aligned = apply_transform_to_coordinates(feats2, global_transform)
+    if len(two_stage.coarse_matches) >= 3:
+        tx, ty = two_stage.coarse_offset_xy
+        if two_stage.coarse_transform_accepted:
+            print(
+                "Coarse alignment accepted: "
+                f"method={two_stage.coarse_transform_method}, "
+                f"inliers={two_stage.coarse_inlier_count}/{len(two_stage.coarse_matches)} "
+                f"({two_stage.coarse_inlier_ratio:.2f}), "
+                f"median_inlier_residual={two_stage.coarse_median_inlier_residual:.2f}px, "
+                f"translation=({tx:.2f}, {ty:.2f}) px"
+            )
+        else:
+            print(
+                "Coarse alignment rejected: "
+                f"method={two_stage.coarse_transform_method}, "
+                f"inliers={two_stage.coarse_inlier_count}/{len(two_stage.coarse_matches)} "
+                f"({two_stage.coarse_inlier_ratio:.2f}), "
+                f"median_inlier_residual={two_stage.coarse_median_inlier_residual:.2f}px. "
+                "Fine matching kept original coordinates."
+            )
     else:
-        print("Global alignment failed or insufficient matches. Proceeding with raw coordinates.")
-        feats2_aligned = feats2.copy()
+        print("Coarse alignment skipped; insufficient confident coarse matches.")
 
-    feats1 = assign_patches(feats1, w1, h1, x_col="centroid_x", y_col="centroid_y")
-    feats2_aligned = assign_patches(feats2_aligned, w1, h1, x_col="centroid_x", y_col="centroid_y")
+    feats1_work = feats1.copy()
+    feats2_work = feats2_aligned.copy()
 
     if use_spatial_clusters:
-        feats1, feats2_aligned = assign_clusters_from_round1(
-            feats1,
-            feats2_aligned,
+        feats1_work, feats2_work = assign_clusters_from_round1(
+            feats1_work,
+            feats2_work,
             n_clusters=n_clusters,
             x_col="centroid_x",
             y_col="centroid_y",
@@ -670,37 +836,36 @@ def run_pipeline(
         feats2_to_save.to_csv(out2, index=False)
         print(f"Saved feature tables to {out1} and {out2}")
 
-    match_cfg = MatchingConfig(top_k=top_k, position_weight=position_weight)
+    matches = two_stage.matches.copy()
 
     if use_spatial_clusters:
-        matches = match_cells_per_cluster(
-            feats1, feats2_aligned, match_cfg, cluster_col="cluster_id", top_k_per_cluster=top_k_per_patch
+        match_cfg = MatchingConfig(
+            feature_weight=feature_weight,
+            topology_weight=topology_weight,
+            position_weight=position_weight,
+            top_k=top_k,
+            distance_threshold=distance_threshold,
+            spatial_window_size=spatial_window_size,
         )
-    else:
-        if top_k_per_patch is not None:
-            matches = match_cells_per_patch(feats1, feats2_aligned, match_cfg, top_k_per_patch=top_k_per_patch)
-        else:
-            matches = greedy_match_cells(feats1, feats2_aligned, match_cfg)
+        matches = match_cells_per_cluster(
+            feats1_work,
+            feats2_work,
+            match_cfg,
+            cluster_col="cluster_id",
+        )
 
     if use_topology_filtering:
-        if "cell_id" not in feats1.columns:
-            feats1 = feats1.copy()
-            feats1["cell_id"] = feats1.index
-        if "cell_id" not in feats2.columns:
-            feats2 = feats2.copy()
-            feats2["cell_id"] = feats2.index
-
-        candidate_matches = pd.DataFrame(
-            {
-                "cell_id_r1": feats1.loc[matches["idx1"], "cell_id"].to_numpy() if not matches.empty else [],
-                "cell_id_r2": feats2_aligned.loc[matches["idx2"], "cell_id"].to_numpy() if not matches.empty else [],
-            }
-        )
-
-        trusted_pairs, neighbor_matches = run_topology_matching_df(
-            feats1,
-            feats2_aligned,
-            candidate_matches,
+        # Topology filtering requires patch assignments internally
+        feats1_topo = assign_patches(feats1_work, w1, h1, x_col="centroid_x", y_col="centroid_y")
+        feats2_topo = assign_patches(feats2_work, w1, h1, x_col="centroid_x", y_col="centroid_y")
+        if "cell_id" not in feats1_topo.columns:
+            feats1_topo["cell_id"] = feats1_topo.index
+        if "cell_id" not in feats2_topo.columns:
+            feats2_topo["cell_id"] = feats2_topo.index
+        matches = rebuild_matches_from_topology_pairs(
+            matches,
+            feats1_topo,
+            feats2_topo,
             image_width=w1,
             image_height=h1,
             k_pos_nei=k_pos_nei,
@@ -708,41 +873,7 @@ def run_pipeline(
             tau_pos=tau_pos,
             tau_nei=tau_nei,
             tau_map=tau_map,
-            id_r1_col="cell_id_r1",
-            id_r2_col="cell_id_r2",
-            cell_id_col="cell_id",
-            x_col="centroid_x",
-            y_col="centroid_y",
         )
-
-        combined_pairs = trusted_pairs.copy()
-        neighbor_filtered = neighbor_matches
-        if not neighbor_matches.empty and "within_threshold" in neighbor_matches.columns:
-            neighbor_filtered = neighbor_matches[neighbor_matches["within_threshold"] == True]
-        if not neighbor_filtered.empty:
-            combined_pairs = pd.concat([combined_pairs, neighbor_filtered], ignore_index=True)
-
-        if combined_pairs.empty:
-            matches = pd.DataFrame(columns=["idx1", "idx2", "cell_id_1", "cell_id_2"])
-        else:
-            combined_pairs = combined_pairs.drop_duplicates(subset=["cell_id_r1", "cell_id_r2"])
-            id_to_idx1 = {feats1.loc[i, "cell_id"]: i for i in feats1.index}
-            id_to_idx2 = {feats2_aligned.loc[i, "cell_id"]: i for i in feats2_aligned.index}
-            rows = []
-            for _, pair in combined_pairs.iterrows():
-                cid1 = pair["cell_id_r1"]
-                cid2 = pair["cell_id_r2"]
-                idx1 = id_to_idx1.get(cid1)
-                idx2 = id_to_idx2.get(cid2)
-                if idx1 is None or idx2 is None:
-                    continue
-                row = {"idx1": idx1, "idx2": idx2, "cell_id_1": cid1, "cell_id_2": cid2}
-                for extra in ("L_pos", "L_nei", "dist_norm", "within_threshold", "patch_x", "patch_y"):
-                    if extra in pair and not pd.isna(pair[extra]):
-                        row[extra] = pair[extra]
-                rows.append(row)
-            matches = pd.DataFrame(rows)
-        matches = matches.reset_index(drop=True)
 
     print("Top matches:")
     print(matches.head(top_k))
@@ -760,12 +891,45 @@ def run_pipeline(
             residual_threshold=ransac_residual_threshold,
             min_inliers=MIN_MATCHES_FOR_REFINEMENT,
         )
+        matches = matches.copy()
+        matches["ransac_inlier"] = inlier_mask
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        all_residuals = compute_match_residuals(feats1, feats2, matches, transform)
+        if inlier_count >= MIN_MATCHES_FOR_REFINEMENT:
+            inlier_residuals = all_residuals[inlier_mask]
+            inlier_median = float(np.median(inlier_residuals))
+            inlier_mad = float(np.median(np.abs(inlier_residuals - inlier_median)))
+            robust_scale = max(1.4826 * inlier_mad, 0.5)
+            model_threshold = max(
+                float(ransac_residual_threshold) * 2.0,
+                inlier_median + 3.0 * robust_scale,
+            )
+            keep_mask = all_residuals <= model_threshold
+            keep_count = int(np.count_nonzero(keep_mask))
+            if MIN_MATCHES_FOR_REFINEMENT <= keep_count < len(matches):
+                matches = matches.loc[keep_mask].reset_index(drop=True)
+                transform, _ = estimate_rigid_transform_from_matches_ransac(
+                    feats1,
+                    feats2,
+                    matches,
+                    max_trials=ransac_max_trials,
+                    residual_threshold=ransac_residual_threshold,
+                    min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+                )
+                print(
+                    "Filtered matches by RANSAC model consistency: "
+                    f"kept {keep_count} / {len(keep_mask)} at <= {model_threshold:.2f}px."
+                )
+        else:
+            print(
+                "RANSAC found too few inliers to filter matches safely; "
+                "keeping the pre-filtered match set."
+            )
         residuals = compute_match_residuals(feats1, feats2, matches, transform)
-        matches["residual_px"] = residuals
     else:
-        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches, use_scale=True)
+        transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
         residuals = compute_match_residuals(feats1, feats2, matches, transform)
-        matches["residual_px"] = residuals
+    matches["residual_px"] = residuals
 
     # Prune high-residual matches and re-estimate transform for tighter alignment.
     if (
@@ -778,7 +942,17 @@ def run_pipeline(
         kept = int(keep_mask.sum())
         if kept >= MIN_MATCHES_FOR_REFINEMENT and kept < len(matches):
             matches = matches.loc[keep_mask].reset_index(drop=True)
-            transform = estimate_rigid_transform_from_matches(feats1, feats2, matches, use_scale=True)
+            if use_ransac_transform:
+                transform, _ = estimate_rigid_transform_from_matches_ransac(
+                    feats1,
+                    feats2,
+                    matches,
+                    max_trials=ransac_max_trials,
+                    residual_threshold=ransac_residual_threshold,
+                    min_inliers=MIN_MATCHES_FOR_REFINEMENT,
+                )
+            else:
+                transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
             refined_residuals = compute_match_residuals(feats1, feats2, matches, transform)
             matches["residual_px"] = refined_residuals
             print(
@@ -793,6 +967,15 @@ def run_pipeline(
     print(transform.rotation)
     print("Estimated translation vector:")
     print(transform.translation)
+
+    feats2_registered = feats2.copy()
+    coords2_registered = _apply_rigid_to_points(
+        feats2_registered[["centroid_x", "centroid_y"]].to_numpy(dtype=float),
+        transform.rotation,
+        transform.translation,
+    )
+    feats2_registered["centroid_x"] = coords2_registered[:, 0]
+    feats2_registered["centroid_y"] = coords2_registered[:, 1]
 
     if save_match_table is not None:
         from .visualization import export_match_table
@@ -817,11 +1000,14 @@ def run_pipeline(
         print(f"Saved match overlay image to {overlay_path}")
 
     if save_match_plot_path is not None:
-        from .visualization import save_match_plot
+        from .visualization import save_match_plot, save_aligned_match_plot
 
         match_plot_path = save_match_plot_path.with_suffix(".tif")
         save_match_plot(overlay_img1, overlay_img2, feats1, feats2, matches, match_plot_path)
         print(f"Saved match plot to {match_plot_path}")
+        aligned_match_plot_path = save_match_plot_path.with_name(save_match_plot_path.stem + "_aligned").with_suffix(".tif")
+        save_aligned_match_plot(overlay_img1, overlay_img2, feats1, feats2_registered, matches, aligned_match_plot_path)
+        print(f"Saved aligned match plot to {aligned_match_plot_path}")
 
     if save_registration_overlay_path is not None:
         from .visualization import save_registration_overlay
@@ -840,49 +1026,53 @@ def run_pipeline(
     if napari_view:
         try:
             import napari  # type: ignore
+            from .visualization import launch_napari_viewer, warp_mask_to_image2
         except ImportError:
             print("napari not installed; skipping interactive viewer.")
         else:
-            if top_k_per_patch is not None:
-                if matches.empty:
-                    print("No top-per-region matches to display in napari.")
-                else:
-                    pts_r1 = feats1.loc[matches["idx1"], ["centroid_y", "centroid_x"]].to_numpy()
-                    pts_r2 = feats2.loc[matches["idx2"], ["centroid_y", "centroid_x"]].to_numpy()
-                    pts_r2_reg = _apply_rigid_to_points(pts_r2, transform.rotation, transform.translation)
-                    title = "Top-per-cluster registration" if use_spatial_clusters else "Top-per-patch registration (54 cells)"
-                    viewer = napari.Viewer(title=title)
-                    viewer.add_points(pts_r1, name="round1 top", face_color="cyan", size=12, opacity=0.9)
-                    viewer.add_points(pts_r2, name="round2 top (pre)", face_color="orange", size=10, opacity=0.6)
-                    viewer.add_points(pts_r2_reg, name="round2 top (reg)", face_color="magenta", size=12, opacity=0.9)
-                    viewer.window._qt_window.raise_()
-                    napari.run()
+            if matches.empty:
+                print("No matches to display in napari.")
             else:
-                try:
-                    from .visualization import launch_napari_viewer, warp_mask_to_image2
-                except ImportError:
-                    print("napari not installed; skipping interactive viewer.")
-                else:
-                    viewer1 = launch_napari_viewer(overlay_img1, masks1, feats1, title="Image1")
-                    viewer2 = launch_napari_viewer(overlay_img2, masks2, feats2, title="Image2")
-                    warped = warp_mask_to_image2(
-                        masks1, overlay_img2.shape[:2], transform.rotation, transform.translation
-                    )
-                    viewer2.add_labels((warped > 0).astype(int), name="warped_mask1_on_image2", opacity=0.4)
-                    viewer1.window._qt_window.raise_()  # bring windows forward
-                    viewer2.window._qt_window.raise_()
-                    napari.run()
+                viewer1 = launch_napari_viewer(overlay_img1, masks1, feats1, title="Image1")
+                viewer2 = launch_napari_viewer(overlay_img2, masks2, feats2, title="Image2")
+                warped = warp_mask_to_image2(
+                    masks1, overlay_img2.shape[:2], transform.rotation, transform.translation
+                )
+                viewer2.add_labels((warped > 0).astype(int), name="warped_mask1_on_image2", opacity=0.4)
+                viewer1.window._qt_window.raise_()
+                viewer2.window._qt_window.raise_()
+                napari.run()
     
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cell registration demo using Cellpose-SAM.")
     parser.add_argument(
-        "images",
+        "image1",
         type=Path,
-        nargs="+",
-        help="Path to image(s). For registration, provide exactly 2 images. For --segmentation-only, provide any number of images.",
+        nargs="?",
+        default=DEFAULT_IMG1_PATH,
+        help="Path to first image (target).",
+    )
+    parser.add_argument(
+        "image2",
+        type=Path,
+        nargs="?",
+        default=DEFAULT_IMG2_PATH,
+        help="Path to second image (source).",
     )
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Number of matches to use.")
+    parser.add_argument(
+        "--feature-weight",
+        type=float,
+        default=DEFAULT_FEATURE_WEIGHT,
+        help="Weight for morphology features during matching.",
+    )
+    parser.add_argument(
+        "--topology-weight",
+        type=float,
+        default=DEFAULT_TOPOLOGY_WEIGHT,
+        help="Weight for local topology descriptors during matching.",
+    )
     parser.add_argument(
         "--position-weight",
         type=float,
@@ -890,11 +1080,18 @@ def parse_args() -> argparse.Namespace:
         help="Weight for spatial proximity in matching (0 to disable position).",
     )
     parser.add_argument(
-        "--top-per-patch",
-        type=int,
-        default=TOP_K_PER_PATCH,
-        help="If set, pick this many best matches per 3x3 patch (e.g., 6 -> up to 54 total).",
+        "--distance-threshold",
+        type=float,
+        default=DEFAULT_DISTANCE_THRESHOLD,
+        help="Reject matches whose combined score exceeds this threshold.",
     )
+    parser.add_argument(
+        "--spatial-window-size",
+        type=float,
+        default=DEFAULT_SPATIAL_WINDOW_SIZE,
+        help="Maximum centroid distance in pixels for a feasible fine-stage match.",
+    )
+
     parser.add_argument(
         "--use-spatial-clusters",
         action="store_true",
@@ -990,94 +1187,41 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SAVE_FEATURES_DIR,
         help="Directory to save per-cell feature tables (round1_cells.csv, round2_cells.csv).",
     )
-    parser.add_argument(
-        "--save-npy",
-        action="store_true",
-        help="Save segmentation masks as .npy files.",
-    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    
-    # Handle batch segmentation mode
-    if args.segmentation_only:
-        if len(args.images) == 1:
-            # Single image segmentation
-            print(f"Processing single image: {args.images[0]}")
-            run_pipeline(
-                args.images[0],
-                args.images[0],  # Dummy second image, won't be used in segmentation_only mode
-                napari_view=args.napari,
-                segmentation_only=True,
-                save_segmentation_prefix=args.save_segmentation_prefix,
-                save_npy=args.save_npy,
-            )
-        else:
-            # Batch segmentation for multiple images
-            print(f"Processing {len(args.images)} images in batch mode...")
-            for i, img_path in enumerate(args.images, 1):
-                print(f"\n[{i}/{len(args.images)}] Processing: {img_path}")
-                # Create unique output prefix for each image
-                if args.save_segmentation_prefix:
-                    prefix = args.save_segmentation_prefix.with_name(
-                        f"{args.save_segmentation_prefix.stem}_image{i}"
-                    )
-                else:
-                    prefix = None
-                
-                run_pipeline(
-                    img_path,
-                    img_path,  # Dummy second image
-                    napari_view=False,  # Disable napari in batch mode
-                    segmentation_only=True,
-                    save_segmentation_prefix=prefix,
-                    save_npy=args.save_npy,
-                )
-            
-            # Optionally open napari after all processing if requested
-            if args.napari:
-                print("\nBatch processing complete. Napari viewing not supported for batch mode.")
-                print("Please view individual segmentation outputs in the outputs directory.")
-    else:
-        # Registration mode requires exactly 2 images
-        if len(args.images) != 2:
-            print(f"Error: Registration mode requires exactly 2 images, but {len(args.images)} were provided.")
-            print("For batch segmentation of multiple images, use --segmentation-only flag.")
-            sys.exit(1)
-        
-        run_pipeline(
-            args.images[0],
-            args.images[1],
-            top_k=args.top_k,
-            top_k_per_patch=args.top_per_patch,
-            position_weight=args.position_weight,
-            napari_view=args.napari,
-            segmentation_only=args.segmentation_only,
-            save_match_table=args.save_match_table,
-            save_match_overlay_path=args.save_match_overlay,
-            save_segmentation_prefix=args.save_segmentation_prefix,
-            save_match_plot_path=args.save_match_plot,
-            save_registration_overlay_path=args.save_registration_overlay,
-            save_features_dir=args.save_features_dir,
-            use_spatial_clusters=args.use_spatial_clusters,
-            n_clusters=args.n_clusters,
-            use_topology_filtering=args.use_topology_filtering,
-            k_pos_nei=args.k_pos_nei,
-            k_neighbor=args.k_neighbor,
-            tau_pos=args.tau_pos,
-            tau_nei=args.tau_nei,
-            tau_map=args.tau_map,
-            use_ransac_transform=args.use_ransac_transform,
-            ransac_max_trials=args.ransac_max_trials,
-            ransac_residual_threshold=args.ransac_residual_threshold,
-            save_npy=args.save_npy,
-        )
+    run_pipeline(
+        args.image1,
+        args.image2,
+        top_k=args.top_k,
+        feature_weight=args.feature_weight,
+        topology_weight=args.topology_weight,
+        position_weight=args.position_weight,
+        distance_threshold=args.distance_threshold,
+        spatial_window_size=args.spatial_window_size,
+        napari_view=args.napari,
+        segmentation_only=args.segmentation_only,
+        save_match_table=args.save_match_table,
+        save_match_overlay_path=args.save_match_overlay,
+        save_segmentation_prefix=args.save_segmentation_prefix,
+        save_match_plot_path=args.save_match_plot,
+        save_registration_overlay_path=args.save_registration_overlay,
+        save_features_dir=args.save_features_dir,
+        use_spatial_clusters=args.use_spatial_clusters,
+        n_clusters=args.n_clusters,
+        use_topology_filtering=args.use_topology_filtering,
+        k_pos_nei=args.k_pos_nei,
+        k_neighbor=args.k_neighbor,
+        tau_pos=args.tau_pos,
+        tau_nei=args.tau_nei,
+        tau_map=args.tau_map,
+        use_ransac_transform=args.use_ransac_transform,
+        ransac_max_trials=args.ransac_max_trials,
+        ransac_residual_threshold=args.ransac_residual_threshold,
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
-
