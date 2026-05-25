@@ -7,6 +7,13 @@ DAPI-based cell segmentation, matching, and registration plugin for napari.
 __version__ = "0.1.0"
 
 try:
+    from ._qt_init import configure_qt
+
+    configure_qt()
+except Exception:
+    pass
+
+try:
     from ._widget import segment_cells_widget, registration_workflow_widget
     from ._manual_seg_widget import ManualSegmentationWidget
 except Exception:

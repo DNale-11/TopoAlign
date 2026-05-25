@@ -8,6 +8,7 @@ from enum import Enum
 
 import napari
 import numpy as np
+import pandas as pd
 from napari.types import ImageData, LabelsData
 from napari.utils.notifications import show_info
 
@@ -35,6 +36,7 @@ from .core.point_registration import (
     warp_image_with_tps,
     compute_valid_overlap_mask,
 )
+from ._qt_init import apply_default_font
 
 
 class CellposeModel(Enum):
@@ -47,6 +49,22 @@ class CellposeModel(Enum):
     CYTO3 = "cyto3"
 
 
+class SegmentationMode(Enum):
+    """Segmentation execution modes."""
+
+    AUTO = "auto - chunk only if large"
+    FULL_IMAGE = "full image - ignore chunk settings"
+    CHUNKED = "chunked - use label stitching"
+
+
+class RegistrationMode(Enum):
+    """Registration workflow modes."""
+
+    AUTO = "auto"
+    NORMAL = "normal"
+    WSI = "wsi"
+
+
 def segment_cells_widget(
     viewer: napari.Viewer,
     images: list[ImageData],
@@ -56,15 +74,23 @@ def segment_cells_widget(
     flow_threshold: Annotated[float, {"min": -10.0, "max": 10.0, "step": 0.1}] = -2.0,
     cellprob_threshold: Annotated[float, {"min": -10.0, "max": 10.0, "step": 0.1}] = 1.0,
     min_size: int = 5,
+    mode: SegmentationMode = SegmentationMode.AUTO,
+    large_image_threshold_mp: Annotated[float, {"min": 1.0, "max": 1000.0, "step": 1.0}] = 64.0,
+    chunk_size: Annotated[int, {"min": 256, "max": 8192, "step": 256}] = 2048,
+    chunk_overlap: Annotated[int, {"min": 0, "max": 1024, "step": 32}] = 128,
+    stitch_labels: bool = True,
     save_masks: bool = False,
     output_dir: str = "./segmentation_output",
 ):
     """
     Segment cells using Cellpose.
 
-    Supports batch processing of multiple images.
+    Supports batch processing of multiple images. Large 2D images can be
+    segmented chunk-by-chunk to reduce peak inference memory.
     """
     from tifffile import imwrite
+
+    apply_default_font()
 
     if not images:
         show_info("Please select at least one image layer.")
@@ -83,8 +109,6 @@ def segment_cells_widget(
     )
     segmenter = CellposeSegmenter(config)
 
-    layer_names = [layer.name for layer in viewer.layers if hasattr(layer, "data")]
-
     if save_masks:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -92,22 +116,31 @@ def segment_cells_widget(
 
     for idx, image in enumerate(images):
         progress = f"[{idx + 1}/{len(images)}]"
-        layer_name = f"Image_{idx + 1}"
-        img_array = np.asarray(image)
-        for name in layer_names:
-            layer = viewer.layers[name]
-            if hasattr(layer, "data"):
-                try:
-                    layer_data = np.asarray(layer.data)
-                    if layer_data.shape == img_array.shape and np.array_equal(layer_data, img_array):
-                        layer_name = name
-                        break
-                except Exception:
-                    continue
+        layer_name = _find_layer_name(viewer, image, idx)
 
-        show_info(f"{progress} Processing {layer_name}...")
-        mask, flows, styles = segmenter.segment_array(img_array)
-        n_cells = len(np.unique(mask)) - 1
+        use_chunked, megapixels = _should_use_chunked(
+            segmenter,
+            image,
+            mode,
+            large_image_threshold_mp,
+        )
+        show_info(f"{progress} Processing {layer_name} ({megapixels:.1f} MP)...")
+        if use_chunked:
+            stitch_text = "on" if stitch_labels else "off"
+            show_info(
+                f"{progress} Chunked segmentation: chunk={chunk_size}px "
+                f"overlap={chunk_overlap}px stitch={stitch_text}"
+            )
+            mask, flows, styles = segmenter.segment_array_chunked(
+                image,
+                chunk_size=chunk_size,
+                overlap=chunk_overlap,
+                stitch_labels=stitch_labels,
+            )
+        else:
+            show_info(f"{progress} Full-image segmentation; chunk settings are ignored.")
+            mask, flows, styles = segmenter.segment_array(np.asarray(image))
+        n_cells = int(mask.max())
 
         # Truncate long layer names for cleaner UI
         MAX_NAME_LEN = 30
@@ -126,10 +159,303 @@ def segment_cells_widget(
 
         if save_masks:
             mask_filename = output_path / f"{layer_name}_mask.tif"
-            imwrite(str(mask_filename), mask.astype(np.uint16))
+            imwrite(str(mask_filename), _mask_for_saving(mask))
             show_info(f"{progress} Saved: {mask_filename.name}")
 
     show_info(f"=== Segmentation Complete! Processed {len(images)} image(s) ===")
+
+
+def _find_layer_name(viewer: napari.Viewer, image: ImageData, idx: int) -> str:
+    """Find the selected image layer name without materializing large arrays."""
+    for layer in viewer.layers:
+        if hasattr(layer, "data") and layer.data is image:
+            return layer.name
+    return f"Image_{idx + 1}"
+
+
+def _should_use_chunked(
+    segmenter: CellposeSegmenter,
+    image: ImageData,
+    mode: SegmentationMode,
+    large_image_threshold_mp: float,
+) -> tuple[bool, float]:
+    height, width = segmenter.spatial_shape(image)
+    megapixels = (height * width) / 1_000_000.0
+    mode_value = mode.value if isinstance(mode, SegmentationMode) else str(mode)
+    if mode_value.startswith("chunked"):
+        return True, megapixels
+    if mode_value.startswith("full image"):
+        return False, megapixels
+    return megapixels >= float(large_image_threshold_mp), megapixels
+
+
+def _mask_for_saving(mask: np.ndarray) -> np.ndarray:
+    """Use uint32 when uint16 would truncate labels."""
+    if int(mask.max()) > np.iinfo(np.uint16).max:
+        return mask.astype(np.uint32, copy=False)
+    return mask.astype(np.uint16, copy=False)
+
+
+def _should_use_wsi_registration(
+    image_shape: tuple[int, ...],
+    mode: RegistrationMode,
+    wsi_threshold_mp: float,
+) -> tuple[bool, float]:
+    height, width = int(image_shape[0]), int(image_shape[1])
+    megapixels = (height * width) / 1_000_000.0
+    mode_value = mode.value if isinstance(mode, RegistrationMode) else str(mode)
+    mode_value = mode_value.strip().lower()
+    if mode_value == RegistrationMode.WSI.value:
+        return True, megapixels
+    if mode_value == RegistrationMode.NORMAL.value:
+        return False, megapixels
+    return megapixels >= float(wsi_threshold_mp), megapixels
+
+
+def _run_wsi_registration(
+    viewer: napari.Viewer,
+    img1: np.ndarray,
+    img2: np.ndarray,
+    mask1: np.ndarray,
+    mask2: np.ndarray,
+    feats1: pd.DataFrame,
+    feats2: pd.DataFrame,
+    top_k: int,
+    image_megapixels: float,
+) -> None:
+    show_info(f"[3/5] WSI landmark search from real mask centroids ({image_megapixels:.1f} MP)...")
+    matches = _find_wsi_landmark_matches(feats1, feats2, top_k=top_k)
+    if matches.empty:
+        show_info("  WSI landmark search failed; no registration was applied.")
+        return
+    if len(matches) < 3:
+        show_info(f"  WSI landmark search found only {len(matches)} pairs; need at least 3.")
+        return
+
+    show_info(f"  WSI landmarks selected: {len(matches)} real mask cell pairs")
+    _add_wsi_landmark_layers(viewer, feats1, feats2, matches)
+
+    transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+    residuals = compute_match_residuals(feats1, feats2, matches, transform)
+    matches["residual_px"] = residuals
+    tx, ty = transform.translation
+    show_info(
+        "  WSI translation: "
+        f"dx={float(tx):.1f}px dy={float(ty):.1f}px, "
+        f"residual mean={float(residuals.mean()):.2f}px max={float(residuals.max()):.2f}px"
+    )
+
+    show_info("[4/5] Applying WSI translation registration...")
+    import time as _time
+
+    _t0 = _time.perf_counter()
+    img2_warped = _shift_array_xy(img2, transform.translation, order=1)
+    img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
+    image_kwargs = {"name": "Registered Image Round 2 (WSI Translation)", "opacity": 0.5, "blending": "additive"}
+    if img2_registered.ndim == 2:
+        image_kwargs["colormap"] = "green"
+    viewer.add_image(img2_registered, **image_kwargs)
+
+    mask2_warped = _shift_array_xy(mask2.astype(np.int32, copy=False), transform.translation, order=0)
+    mask2_registered = np.rint(mask2_warped).astype(np.int32)
+    viewer.add_labels(mask2_registered, name="Registered Mask Round 2 (WSI Translation)", opacity=0.35)
+    show_info(f"[5/5] WSI registration complete in {_time.perf_counter() - _t0:.2f}s")
+
+
+def _find_wsi_landmark_matches(
+    feats1: pd.DataFrame,
+    feats2: pd.DataFrame,
+    top_k: int,
+) -> pd.DataFrame:
+    feature_columns = tuple(
+        col for col in MatchingConfig().feature_columns
+        if col in feats1.columns and col in feats2.columns
+    )
+    if not feature_columns:
+        show_info("  WSI: no shared morphology feature columns available.")
+        return _empty_wsi_match_frame()
+
+    f1, f2 = _robust_standardize_feature_tables(feats1, feats2, feature_columns)
+    if len(f1) == 0 or len(f2) == 0:
+        return _empty_wsi_match_frame()
+
+    from scipy.spatial import cKDTree
+
+    neighbors_per_cell = min(20, len(f2))
+    tree = cKDTree(f2)
+    distances, idxs2 = tree.query(f1, k=neighbors_per_cell)
+    distances = np.asarray(distances, dtype=float)
+    idxs2 = np.asarray(idxs2, dtype=int)
+    if distances.ndim == 1:
+        distances = distances[:, None]
+        idxs2 = idxs2[:, None]
+
+    idxs1 = np.repeat(np.arange(len(feats1), dtype=int), neighbors_per_cell)
+    idxs2_flat = idxs2.reshape(-1)
+    distances_flat = distances.reshape(-1)
+    valid = np.isfinite(distances_flat) & (idxs2_flat >= 0)
+    idxs1 = idxs1[valid]
+    idxs2_flat = idxs2_flat[valid]
+    distances_flat = distances_flat[valid]
+    if len(idxs1) < 3:
+        show_info(f"  WSI: only {len(idxs1)} morphology candidates.")
+        return _empty_wsi_match_frame()
+
+    max_candidates = min(len(idxs1), max(200_000, int(top_k) * 500))
+    if len(idxs1) > max_candidates:
+        keep = np.argpartition(distances_flat, max_candidates - 1)[:max_candidates]
+        idxs1 = idxs1[keep]
+        idxs2_flat = idxs2_flat[keep]
+        distances_flat = distances_flat[keep]
+
+    pts1 = feats1.iloc[idxs1][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    pts2 = feats2.iloc[idxs2_flat][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
+    displacements = pts1 - pts2
+    show_info(f"  WSI morphology candidates: {len(displacements)}")
+
+    candidate_mask, median_disp = _select_main_displacement_cluster(displacements)
+    if int(candidate_mask.sum()) < 3:
+        show_info("  WSI: no stable dominant displacement cluster found.")
+        return _empty_wsi_match_frame()
+
+    idxs1 = idxs1[candidate_mask]
+    idxs2_flat = idxs2_flat[candidate_mask]
+    distances_flat = distances_flat[candidate_mask]
+    displacements = displacements[candidate_mask]
+    residuals = np.linalg.norm(displacements - median_disp[None, :], axis=1)
+
+    order = np.lexsort((distances_flat, residuals))
+    used1: set[int] = set()
+    used2: set[int] = set()
+    rows: list[tuple[int, int, float, float, float, float, float, float]] = []
+    for pos in order:
+        i = int(idxs1[pos])
+        j = int(idxs2_flat[pos])
+        if i in used1 or j in used2:
+            continue
+        used1.add(i)
+        used2.add(j)
+        dx, dy = displacements[pos]
+        rows.append((
+            i,
+            j,
+            float(distances_flat[pos]),
+            float(dx),
+            float(dy),
+            float(residuals[pos]),
+            float(feats1.iloc[i]["cell_id"]),
+            float(feats2.iloc[j]["cell_id"]),
+        ))
+        if len(rows) >= int(top_k):
+            break
+
+    if not rows:
+        return _empty_wsi_match_frame()
+
+    matches = pd.DataFrame(
+        rows,
+        columns=[
+            "idx1",
+            "idx2",
+            "distance",
+            "dx",
+            "dy",
+            "displacement_residual_px",
+            "cell_id_1",
+            "cell_id_2",
+        ],
+    )
+    matches["idx1"] = matches["idx1"].astype(int)
+    matches["idx2"] = matches["idx2"].astype(int)
+    show_info(
+        "  WSI dominant displacement: "
+        f"dx={float(median_disp[0]):.1f}px dy={float(median_disp[1]):.1f}px, "
+        f"kept={len(matches)} one-to-one landmarks"
+    )
+    return matches
+
+
+def _empty_wsi_match_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "idx1",
+            "idx2",
+            "distance",
+            "dx",
+            "dy",
+            "displacement_residual_px",
+            "cell_id_1",
+            "cell_id_2",
+        ]
+    )
+
+
+def _robust_standardize_feature_tables(
+    feats1: pd.DataFrame,
+    feats2: pd.DataFrame,
+    feature_columns: tuple[str, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    vals1 = feats1.loc[:, feature_columns].to_numpy(dtype=float)
+    vals2 = feats2.loc[:, feature_columns].to_numpy(dtype=float)
+    combined = np.vstack([vals1, vals2])
+    med = np.nanmedian(combined, axis=0)
+    mad = np.nanmedian(np.abs(combined - med[None, :]), axis=0)
+    scale = np.maximum(1.4826 * mad, 1e-6)
+    vals1 = np.nan_to_num((vals1 - med[None, :]) / scale[None, :])
+    vals2 = np.nan_to_num((vals2 - med[None, :]) / scale[None, :])
+    return vals1, vals2
+
+
+def _select_main_displacement_cluster(displacements: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    bin_size = 512.0
+    bins = np.floor(displacements / bin_size).astype(np.int64)
+    _, inverse, counts = np.unique(bins, axis=0, return_inverse=True, return_counts=True)
+    best_bin_idx = int(np.argmax(counts))
+    seed_mask = inverse == best_bin_idx
+    if int(seed_mask.sum()) < 3:
+        return seed_mask, np.median(displacements[seed_mask], axis=0)
+
+    seed_median = np.median(displacements[seed_mask], axis=0)
+    seed_residuals = np.linalg.norm(displacements - seed_median[None, :], axis=1)
+    broad_mask = seed_residuals <= bin_size * 1.5
+    if int(broad_mask.sum()) < 3:
+        return broad_mask, seed_median
+
+    refined_median = np.median(displacements[broad_mask], axis=0)
+    refined_residuals = np.linalg.norm(displacements - refined_median[None, :], axis=1)
+    inlier_residuals = refined_residuals[broad_mask]
+    med_residual = float(np.median(inlier_residuals))
+    mad_residual = float(np.median(np.abs(inlier_residuals - med_residual)))
+    threshold = max(500.0, med_residual + 3.0 * max(1.4826 * mad_residual, 1.0))
+    return refined_residuals <= threshold, refined_median
+
+
+def _add_wsi_landmark_layers(
+    viewer: napari.Viewer,
+    feats1: pd.DataFrame,
+    feats2: pd.DataFrame,
+    matches: pd.DataFrame,
+) -> None:
+    pts1 = feats1.iloc[matches["idx1"].to_numpy(dtype=int)][["centroid_y", "centroid_x"]].to_numpy(dtype=float)
+    pts2 = feats2.iloc[matches["idx2"].to_numpy(dtype=int)][["centroid_y", "centroid_x"]].to_numpy(dtype=float)
+    viewer.add_points(pts1, name="WSI Landmark Round 1", size=9, face_color="yellow")
+    viewer.add_points(pts2, name="WSI Landmark Round 2", size=9, face_color="orange")
+    lines = [[pts1[idx], pts2[idx]] for idx in range(len(matches))]
+    if lines:
+        viewer.add_shapes(lines, shape_type="line", edge_width=1, edge_color="cyan", name="WSI Landmark Lines")
+
+
+def _shift_array_xy(arr: np.ndarray, translation_xy: np.ndarray, order: int) -> np.ndarray:
+    from scipy.ndimage import shift
+
+    tx, ty = float(translation_xy[0]), float(translation_xy[1])
+    if arr.ndim == 2:
+        shift_values = (ty, tx)
+    elif arr.ndim == 3 and arr.shape[-1] <= 8:
+        shift_values = (ty, tx, 0.0)
+    else:
+        raise ValueError(f"WSI translation warp supports 2D or YXC arrays, got shape {arr.shape}.")
+    return shift(arr, shift=shift_values, order=order, mode="constant", cval=0.0, prefilter=(order > 1))
 
 
 def registration_workflow_widget(
@@ -145,6 +471,8 @@ def registration_workflow_widget(
     use_ransac_transform: bool = True,
     ransac_max_trials: int = 1000,
     ransac_residual_threshold: float = 2.0,
+    registration_mode: RegistrationMode = RegistrationMode.AUTO,
+    wsi_threshold_mp: Annotated[float, {"min": 1.0, "max": 5000.0, "step": 1.0}] = 64.0,
     min_area: int = 0,
     max_area: int = 0,
     use_gpu: bool = True,
@@ -152,8 +480,9 @@ def registration_workflow_widget(
     output_dir: str = "./registration_output",
 ):
     """Run the current cell-registration workflow on pre-segmented masks."""
-    import pandas as pd
     from tifffile import imwrite
+
+    apply_default_font()
 
     def _add_match_layers(current_matches: pd.DataFrame, fixed_feats: pd.DataFrame, moving_feats: pd.DataFrame) -> None:
         if current_matches.empty:
@@ -232,6 +561,22 @@ def registration_workflow_widget(
     if n_cells1 == 0 or n_cells2 == 0:
         show_info("No cells available after feature extraction.")
         return
+
+    use_wsi, registration_mp = _should_use_wsi_registration(mask1.shape, registration_mode, wsi_threshold_mp)
+    if use_wsi:
+        _run_wsi_registration(
+            viewer,
+            img1,
+            img2,
+            mask1,
+            mask2,
+            feats1,
+            feats2,
+            top_k=max(1, int(top_k)),
+            image_megapixels=registration_mp,
+        )
+        return
+    show_info(f"  Normal registration mode ({registration_mp:.1f} MP); using existing workflow.")
 
     show_info("[3/5] Running morphology-guided matching...")
     max_dist = max(1, int(max_match_distance_px))

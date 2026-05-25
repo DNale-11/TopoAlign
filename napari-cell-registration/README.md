@@ -34,6 +34,16 @@ pip install -e ".[dev]"
    - **Cell Segmentation** - for quick segmentation only
    - **Registration Workflow** - for complete registration pipeline
 
+### Large Image Segmentation
+
+The **Cell Segmentation** widget has a `mode` option:
+
+- `auto - chunk only if large`: use chunked segmentation only when the image is larger than `large_image_threshold_mp`.
+- `full image - ignore chunk settings`: keep the previous full-image Cellpose path.
+- `chunked - use label stitching`: always segment with overlapping chunks.
+
+Use `chunk_size` to control each inference tile and `chunk_overlap` to give Cellpose context at tile borders. `stitch_labels` merges labels that touch in overlap regions; keep it enabled unless you need to inspect raw tile boundaries. Registration is unchanged.
+
 ## Requirements
 
 - Python >= 3.10
