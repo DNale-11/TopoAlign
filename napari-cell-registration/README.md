@@ -44,6 +44,20 @@ The **Cell Segmentation** widget has a `mode` option:
 
 Use `chunk_size` to control each inference tile and `chunk_overlap` to give Cellpose context at tile borders. `stitch_labels` merges labels that touch in overlap regions; keep it enabled unless you need to inspect raw tile boundaries. Registration is unchanged.
 
+### WSI CLI Registration
+
+After installation, WSI mask registration can also run without napari:
+
+```bash
+wsi-mask-registration --fixed-mask round1_mask.tif --moving-mask round2_mask.tif --moving-image round2.tif --output-dir wsi_out --top-k 2000
+```
+
+Without reinstalling the package, run the same CLI as a module:
+
+```bash
+python -m napari_cell_registration.wsi_registration --fixed-mask round1_mask.tif --moving-mask round2_mask.tif --moving-image round2.tif --output-dir wsi_out --top-k 2000
+```
+
 ## Requirements
 
 - Python >= 3.10

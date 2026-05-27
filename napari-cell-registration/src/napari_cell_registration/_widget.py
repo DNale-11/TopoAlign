@@ -9,7 +9,8 @@ from enum import Enum
 import napari
 import numpy as np
 import pandas as pd
-from napari.types import ImageData, LabelsData
+from napari.types import ImageData
+from napari.layers import Layer
 from napari.utils.notifications import show_info
 
 from .core import (
@@ -37,6 +38,15 @@ from .core.point_registration import (
     compute_valid_overlap_mask,
 )
 from ._qt_init import apply_default_font
+from .wsi_registration import (
+    estimate_wsi_translation_from_matches,
+    estimate_local_translation_grid,
+    filter_parallel_displacements,
+    find_wsi_landmark_matches,
+    select_main_displacement_cluster,
+    shift_array_xy,
+    warp_array_with_translation_grid,
+)
 
 
 class CellposeModel(Enum):
@@ -235,7 +245,7 @@ def _run_wsi_registration(
     show_info(f"  WSI landmarks selected: {len(matches)} real mask cell pairs")
     _add_wsi_landmark_layers(viewer, feats1, feats2, matches)
 
-    transform = estimate_rigid_transform_from_matches(feats1, feats2, matches)
+    transform = estimate_wsi_translation_from_matches(matches)
     residuals = compute_match_residuals(feats1, feats2, matches, transform)
     matches["residual_px"] = residuals
     tx, ty = transform.translation
@@ -245,20 +255,33 @@ def _run_wsi_registration(
         f"residual mean={float(residuals.mean()):.2f}px max={float(residuals.max()):.2f}px"
     )
 
-    show_info("[4/5] Applying WSI translation registration...")
+    local_grid = estimate_local_translation_grid(
+        matches,
+        mask1.shape[:2],
+        grid=4,
+        fallback_translation=transform.translation,
+    )
+    show_info("  WSI local 4x4 translation grid (dx,dy):\n" + _format_wsi_translation_grid(local_grid))
+
+    show_info("[4/5] Applying WSI local translation registration...")
     import time as _time
 
     _t0 = _time.perf_counter()
-    img2_warped = _shift_array_xy(img2, transform.translation, order=1)
+    img2_warped = warp_array_with_translation_grid(img2, local_grid, output_shape=mask1.shape[:2], order=1)
     img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
-    image_kwargs = {"name": "Registered Image Round 2 (WSI Translation)", "opacity": 0.5, "blending": "additive"}
+    image_kwargs = {"name": "Registered Image Round 2 (WSI Local Translation)", "opacity": 0.5, "blending": "additive"}
     if img2_registered.ndim == 2:
         image_kwargs["colormap"] = "green"
     viewer.add_image(img2_registered, **image_kwargs)
 
-    mask2_warped = _shift_array_xy(mask2.astype(np.int32, copy=False), transform.translation, order=0)
+    mask2_warped = warp_array_with_translation_grid(
+        mask2.astype(np.int32, copy=False),
+        local_grid,
+        output_shape=mask1.shape[:2],
+        order=0,
+    )
     mask2_registered = np.rint(mask2_warped).astype(np.int32)
-    viewer.add_labels(mask2_registered, name="Registered Mask Round 2 (WSI Translation)", opacity=0.35)
+    viewer.add_labels(mask2_registered, name="Registered Mask Round 2 (WSI Local Translation)", opacity=0.35)
     show_info(f"[5/5] WSI registration complete in {_time.perf_counter() - _t0:.2f}s")
 
 
@@ -267,111 +290,25 @@ def _find_wsi_landmark_matches(
     feats2: pd.DataFrame,
     top_k: int,
 ) -> pd.DataFrame:
-    feature_columns = tuple(
-        col for col in MatchingConfig().feature_columns
-        if col in feats1.columns and col in feats2.columns
-    )
-    if not feature_columns:
-        show_info("  WSI: no shared morphology feature columns available.")
-        return _empty_wsi_match_frame()
-
-    f1, f2 = _robust_standardize_feature_tables(feats1, feats2, feature_columns)
-    if len(f1) == 0 or len(f2) == 0:
-        return _empty_wsi_match_frame()
-
-    from scipy.spatial import cKDTree
-
-    neighbors_per_cell = min(20, len(f2))
-    tree = cKDTree(f2)
-    distances, idxs2 = tree.query(f1, k=neighbors_per_cell)
-    distances = np.asarray(distances, dtype=float)
-    idxs2 = np.asarray(idxs2, dtype=int)
-    if distances.ndim == 1:
-        distances = distances[:, None]
-        idxs2 = idxs2[:, None]
-
-    idxs1 = np.repeat(np.arange(len(feats1), dtype=int), neighbors_per_cell)
-    idxs2_flat = idxs2.reshape(-1)
-    distances_flat = distances.reshape(-1)
-    valid = np.isfinite(distances_flat) & (idxs2_flat >= 0)
-    idxs1 = idxs1[valid]
-    idxs2_flat = idxs2_flat[valid]
-    distances_flat = distances_flat[valid]
-    if len(idxs1) < 3:
-        show_info(f"  WSI: only {len(idxs1)} morphology candidates.")
-        return _empty_wsi_match_frame()
-
-    max_candidates = min(len(idxs1), max(200_000, int(top_k) * 500))
-    if len(idxs1) > max_candidates:
-        keep = np.argpartition(distances_flat, max_candidates - 1)[:max_candidates]
-        idxs1 = idxs1[keep]
-        idxs2_flat = idxs2_flat[keep]
-        distances_flat = distances_flat[keep]
-
-    pts1 = feats1.iloc[idxs1][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-    pts2 = feats2.iloc[idxs2_flat][["centroid_x", "centroid_y"]].to_numpy(dtype=float)
-    displacements = pts1 - pts2
-    show_info(f"  WSI morphology candidates: {len(displacements)}")
-
-    candidate_mask, median_disp = _select_main_displacement_cluster(displacements)
-    if int(candidate_mask.sum()) < 3:
-        show_info("  WSI: no stable dominant displacement cluster found.")
-        return _empty_wsi_match_frame()
-
-    idxs1 = idxs1[candidate_mask]
-    idxs2_flat = idxs2_flat[candidate_mask]
-    distances_flat = distances_flat[candidate_mask]
-    displacements = displacements[candidate_mask]
-    residuals = np.linalg.norm(displacements - median_disp[None, :], axis=1)
-
-    order = np.lexsort((distances_flat, residuals))
-    used1: set[int] = set()
-    used2: set[int] = set()
-    rows: list[tuple[int, int, float, float, float, float, float, float]] = []
-    for pos in order:
-        i = int(idxs1[pos])
-        j = int(idxs2_flat[pos])
-        if i in used1 or j in used2:
-            continue
-        used1.add(i)
-        used2.add(j)
-        dx, dy = displacements[pos]
-        rows.append((
-            i,
-            j,
-            float(distances_flat[pos]),
-            float(dx),
-            float(dy),
-            float(residuals[pos]),
-            float(feats1.iloc[i]["cell_id"]),
-            float(feats2.iloc[j]["cell_id"]),
-        ))
-        if len(rows) >= int(top_k):
-            break
-
-    if not rows:
-        return _empty_wsi_match_frame()
-
-    matches = pd.DataFrame(
-        rows,
-        columns=[
-            "idx1",
-            "idx2",
-            "distance",
-            "dx",
-            "dy",
-            "displacement_residual_px",
-            "cell_id_1",
-            "cell_id_2",
-        ],
-    )
-    matches["idx1"] = matches["idx1"].astype(int)
-    matches["idx2"] = matches["idx2"].astype(int)
+    matches = find_wsi_landmark_matches(feats1, feats2, top_k=top_k, max_angle_deg=2.0)
+    if matches.empty:
+        show_info("  WSI: no stable real-cell landmark set found.")
+        return matches
     show_info(
         "  WSI dominant displacement: "
-        f"dx={float(median_disp[0]):.1f}px dy={float(median_disp[1]):.1f}px, "
+        f"dx={float(matches['dx'].median()):.1f}px dy={float(matches['dy'].median()):.1f}px, "
+        f"mean line length={float(matches['match_line_length_px'].mean()):.1f}px, "
+        f"mean neighbor diff={float(matches['neighbor_profile_diff'].mean()):.3f}, "
         f"kept={len(matches)} one-to-one landmarks"
     )
+    if "orientation_diff_deg" in matches.columns:
+        show_info(
+            "  WSI landmark quality: "
+            f"mean orientation diff={float(matches['orientation_diff_deg'].mean()):.2f} deg, "
+            f"mean neighbor vector diff={float(matches['neighbor_vector_diff'].mean()):.3f}"
+        )
+    if {"wsi_grid_x", "wsi_grid_y"}.issubset(matches.columns):
+        show_info("  WSI 4x4 landmark coverage:\n" + _format_wsi_grid_counts(matches, grid=4))
     return matches
 
 
@@ -388,6 +325,27 @@ def _empty_wsi_match_frame() -> pd.DataFrame:
             "cell_id_2",
         ]
     )
+
+
+def _format_wsi_grid_counts(matches: pd.DataFrame, grid: int) -> str:
+    counts = np.zeros((grid, grid), dtype=int)
+    for _, row in matches.iterrows():
+        gx = int(row["wsi_grid_x"])
+        gy = int(row["wsi_grid_y"])
+        if 0 <= gx < grid and 0 <= gy < grid:
+            counts[gy, gx] += 1
+    return "\n".join("    " + " | ".join(f"{counts[y, x]:4d}" for x in range(grid)) for y in range(grid))
+
+
+def _format_wsi_translation_grid(translation_grid: np.ndarray) -> str:
+    rows = []
+    for y in range(translation_grid.shape[0]):
+        row = []
+        for x in range(translation_grid.shape[1]):
+            dx, dy = translation_grid[y, x]
+            row.append(f"({dx:.0f},{dy:.0f})")
+        rows.append("    " + " | ".join(f"{cell:>13s}" for cell in row))
+    return "\n".join(rows)
 
 
 def _robust_standardize_feature_tables(
@@ -407,27 +365,15 @@ def _robust_standardize_feature_tables(
 
 
 def _select_main_displacement_cluster(displacements: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    bin_size = 512.0
-    bins = np.floor(displacements / bin_size).astype(np.int64)
-    _, inverse, counts = np.unique(bins, axis=0, return_inverse=True, return_counts=True)
-    best_bin_idx = int(np.argmax(counts))
-    seed_mask = inverse == best_bin_idx
-    if int(seed_mask.sum()) < 3:
-        return seed_mask, np.median(displacements[seed_mask], axis=0)
+    return select_main_displacement_cluster(displacements)
 
-    seed_median = np.median(displacements[seed_mask], axis=0)
-    seed_residuals = np.linalg.norm(displacements - seed_median[None, :], axis=1)
-    broad_mask = seed_residuals <= bin_size * 1.5
-    if int(broad_mask.sum()) < 3:
-        return broad_mask, seed_median
 
-    refined_median = np.median(displacements[broad_mask], axis=0)
-    refined_residuals = np.linalg.norm(displacements - refined_median[None, :], axis=1)
-    inlier_residuals = refined_residuals[broad_mask]
-    med_residual = float(np.median(inlier_residuals))
-    mad_residual = float(np.median(np.abs(inlier_residuals - med_residual)))
-    threshold = max(500.0, med_residual + 3.0 * max(1.4826 * mad_residual, 1.0))
-    return refined_residuals <= threshold, refined_median
+def _filter_parallel_displacements(
+    displacements: np.ndarray,
+    reference_disp: np.ndarray,
+    max_angle_deg: float,
+) -> np.ndarray:
+    return filter_parallel_displacements(displacements, reference_disp, max_angle_deg)
 
 
 def _add_wsi_landmark_layers(
@@ -446,25 +392,28 @@ def _add_wsi_landmark_layers(
 
 
 def _shift_array_xy(arr: np.ndarray, translation_xy: np.ndarray, order: int) -> np.ndarray:
-    from scipy.ndimage import shift
+    return shift_array_xy(arr, translation_xy, order)
 
-    tx, ty = float(translation_xy[0]), float(translation_xy[1])
-    if arr.ndim == 2:
-        shift_values = (ty, tx)
-    elif arr.ndim == 3 and arr.shape[-1] <= 8:
-        shift_values = (ty, tx, 0.0)
-    else:
-        raise ValueError(f"WSI translation warp supports 2D or YXC arrays, got shape {arr.shape}.")
-    return shift(arr, shift=shift_values, order=order, mode="constant", cval=0.0, prefilter=(order > 1))
+
+def _mask_layer_to_array(layer: Layer, parameter_name: str) -> np.ndarray:
+    """Accept either Labels layers or image-loaded mask layers."""
+    data = np.asarray(layer.data if hasattr(layer, "data") else layer)
+    if data.ndim != 2:
+        raise ValueError(f"{parameter_name} must be a 2D mask layer, got shape {data.shape}.")
+    if not np.issubdtype(data.dtype, np.integer):
+        data = np.rint(data)
+    if np.nanmin(data) < 0:
+        raise ValueError(f"{parameter_name} contains negative labels; expected non-negative mask labels.")
+    return data.astype(np.int32, copy=False)
 
 
 def registration_workflow_widget(
     viewer: napari.Viewer,
     image_round1: ImageData,
     image_round2: ImageData,
-    mask_round1: LabelsData,
-    mask_round2: LabelsData,
-    top_k: int = 320,
+    mask_round1: Layer,
+    mask_round2: Layer,
+    top_k: Annotated[int, {"min": 1, "max": 10000, "step": 100}] = 320,
     max_match_distance_px: int = 100,
     position_weight: float = 1.0,
     residual_prune_quantile: Annotated[float, {"min": 0.0, "max": 1.0, "step": 0.05}] = 0.0,
@@ -530,8 +479,8 @@ def registration_workflow_widget(
         output_path.mkdir(parents=True, exist_ok=True)
         show_info(f"Results will be saved to: {output_path.absolute()}")
 
-    mask1 = np.asarray(mask_round1)
-    mask2 = np.asarray(mask_round2)
+    mask1 = _mask_layer_to_array(mask_round1, "mask_round1")
+    mask2 = _mask_layer_to_array(mask_round2, "mask_round2")
     img1 = np.asarray(image_round1)
     img2 = np.asarray(image_round2)
 

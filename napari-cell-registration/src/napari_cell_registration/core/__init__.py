@@ -8,7 +8,10 @@ from .config import (
     DEFAULT_FEATURE_CONFIG,
     DEFAULT_MATCHING_CONFIG,
 )
-from .segmentation import CellposeSegmenter
+try:
+    from .segmentation import CellposeSegmenter
+except ImportError:
+    CellposeSegmenter = None
 from .features import compute_cell_features
 from .matching import greedy_match_cells, match_cells_per_cluster, two_stage_match_cells
 from .registration import estimate_rigid_transform_from_matches
