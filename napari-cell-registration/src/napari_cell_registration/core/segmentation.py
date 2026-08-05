@@ -67,14 +67,16 @@ class CellposeSegmenter:
         """
         channel_img = self._select_channel(img)
         # cellpose 4.x returns (masks, flows, styles); older versions returned 4 items.
-        result = self.model.eval(
-            channel_img,
+        eval_kwargs = dict(
             diameter=self.config.diameter,
             flow_threshold=self.config.flow_threshold,
             cellprob_threshold=self.config.cellprob_threshold,
             min_size=self.config.min_size,
-            channels=[0, 0],
         )
+        try:
+            result = self.model.eval(channel_img, **eval_kwargs)
+        except TypeError:
+            result = self.model.eval(channel_img, **eval_kwargs, channels=[0, 0])
         if len(result) == 4:
             masks, flows, styles, _ = result
         else:

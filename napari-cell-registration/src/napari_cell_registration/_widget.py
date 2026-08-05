@@ -5,12 +5,14 @@ napari widgets for cell registration workflows.
 from typing import Annotated
 from pathlib import Path
 from enum import Enum
+import re
 
 import napari
 import numpy as np
 import pandas as pd
+from magicgui import magic_factory
 from napari.types import ImageData
-from napari.layers import Layer
+from napari.layers import Labels, Layer
 from napari.utils.notifications import show_info
 
 from .core import (
@@ -39,12 +41,19 @@ from .core.point_registration import (
 )
 from ._qt_init import apply_default_font
 from .wsi_registration import (
+    KnnLocalAffineWarp,
+    WSICentroidMetadata,
     estimate_wsi_translation_from_matches,
     estimate_local_translation_grid,
+    filter_wsi_landmark_residuals,
     filter_parallel_displacements,
     find_wsi_landmark_matches,
+    knn_local_affine_leave_one_out_residuals,
+    run_wsi_centroid_registration,
+    run_wsi_feature_registration,
     select_main_displacement_cluster,
     shift_array_xy,
+    warp_array_with_knn_local_affine,
     warp_array_with_translation_grid,
 )
 
@@ -75,11 +84,376 @@ class RegistrationMode(Enum):
     WSI = "wsi"
 
 
+class WSIRefineModel(Enum):
+    """WSI registration refinement models."""
+
+    KNN_LOCAL_AFFINE = "knn local affine"
+    LOCAL_TRANSLATION_GRID = "4x4 local translation grid"
+
+
+class ImageChannelAxis(Enum):
+    """Channel-axis layout for 2D multichannel images."""
+
+    AUTO = "auto"
+    FIRST = "first (C,Y,X)"
+    LAST = "last (Y,X,C)"
+    NONE = "none (Y,X)"
+
+
+class RegisteredDisplayMode(Enum):
+    """How registered multichannel images are displayed in napari."""
+
+    COLORED_STACK = "colored channel stack"
+    COMPOSITE = "composite RGB preview"
+    BOTH = "composite + colored stack"
+
+
+def _channel_axis_key(channel_axis: ImageChannelAxis | str) -> str:
+    value = channel_axis.value if isinstance(channel_axis, ImageChannelAxis) else str(channel_axis)
+    return value.split()[0].strip().lower()
+
+
+def _resolve_channel_index(channel_count: int, channel: int) -> int:
+    idx = int(channel)
+    if idx < 0 or idx >= int(channel_count):
+        raise ValueError(f"DAPI channel {channel} is out of range for {channel_count} channels.")
+    return idx
+
+
+def _infer_channel_count(
+    image: ImageData | np.ndarray,
+    channel_axis: ImageChannelAxis | str,
+) -> int | None:
+    data = np.asarray(image)
+    axis = _channel_axis_key(channel_axis)
+
+    if data.ndim == 2 or axis == "none":
+        return 1
+    if data.ndim != 3:
+        return None
+    if axis == "first":
+        return int(data.shape[0])
+    if axis == "last":
+        return int(data.shape[-1])
+    if data.shape[0] <= 10 and data.shape[1] > 10 and data.shape[2] > 10:
+        return int(data.shape[0])
+    if data.shape[-1] <= 10:
+        return int(data.shape[-1])
+    return None
+
+
+def _dapi_channel_choices(widget) -> list[tuple[str, int]]:
+    parent = getattr(widget, "parent", None)
+    if parent is None:
+        return [("0", 0)]
+
+    images_value = getattr(parent.images, "value", None)
+    if images_value is None:
+        images = []
+    elif isinstance(images_value, (list, tuple)):
+        images = list(images_value)
+    else:
+        images = [images_value]
+
+    axis_value = getattr(parent.channel_axis, "value", ImageChannelAxis.AUTO)
+    counts = [
+        count
+        for image in images
+        if (count := _infer_channel_count(image, axis_value)) is not None
+    ]
+    channel_count = min(counts) if counts else 1
+    return [(str(idx), idx) for idx in range(max(1, int(channel_count)))]
+
+
+def _segment_cells_widget_init(widget) -> None:
+    def reset_dapi_channel_choices(*_) -> None:
+        current = widget.dapi_channel.value
+        widget.dapi_channel.reset_choices()
+        choices = tuple(widget.dapi_channel.choices)
+        if not choices:
+            return
+        widget.dapi_channel.value = current if current in choices else choices[0]
+
+    widget.images.changed.connect(reset_dapi_channel_choices)
+    widget.channel_axis.changed.connect(reset_dapi_channel_choices)
+    reset_dapi_channel_choices()
+
+
+def _extract_dapi_channel(
+    image: ImageData | np.ndarray,
+    channel_axis: ImageChannelAxis | str,
+    dapi_channel: int,
+) -> np.ndarray:
+    """Return the 2D DAPI image used for segmentation and landmark registration."""
+    data = np.asarray(image)
+    axis = _channel_axis_key(channel_axis)
+
+    if axis == "none":
+        if data.ndim != 2:
+            raise ValueError(f"Channel axis 'none' expects a 2D image, got shape {data.shape}.")
+        return data
+
+    if axis == "first":
+        if data.ndim != 3:
+            raise ValueError(f"Channel axis 'first' expects C,Y,X data, got shape {data.shape}.")
+        ch = _resolve_channel_index(data.shape[0], dapi_channel)
+        return data[ch, :, :]
+
+    if axis == "last":
+        if data.ndim != 3:
+            raise ValueError(f"Channel axis 'last' expects Y,X,C data, got shape {data.shape}.")
+        ch = _resolve_channel_index(data.shape[-1], dapi_channel)
+        return data[..., ch]
+
+    if data.ndim == 2:
+        return data
+    if data.ndim == 3 and data.shape[0] <= 10 and data.shape[1] > 10 and data.shape[2] > 10:
+        ch = _resolve_channel_index(data.shape[0], dapi_channel)
+        return data[ch, :, :]
+    if data.ndim == 3 and data.shape[-1] <= 10:
+        ch = _resolve_channel_index(data.shape[-1], dapi_channel)
+        return data[..., ch]
+    raise ValueError(
+        f"Cannot infer a 2D DAPI channel from image shape {data.shape}; "
+        "set channel_axis to first, last, or none."
+    )
+
+
+def _napari_channel_axis(channel_axis: ImageChannelAxis | str, image: np.ndarray) -> int | None:
+    axis = _channel_axis_key(channel_axis)
+    if image.ndim != 3:
+        return None
+    if axis == "first":
+        return 0
+    if axis == "last":
+        return -1
+    if axis == "auto" and image.shape[0] <= 10 and image.shape[1] > 10 and image.shape[2] > 10:
+        return 0
+    if axis == "auto" and image.shape[-1] <= 10:
+        return -1
+    return None
+
+
+def _add_registered_image_layer(
+    viewer: napari.Viewer,
+    image: np.ndarray,
+    name: str,
+    channel_axis: ImageChannelAxis | str,
+    display_mode: RegisteredDisplayMode | str,
+    opacity: float = 0.5,
+) -> None:
+    mode_value = display_mode.value if isinstance(display_mode, RegisteredDisplayMode) else str(display_mode)
+    show_composite = mode_value.startswith("composite")
+    show_colored_stack = mode_value.startswith("colored") or "colored stack" in mode_value
+    display_image, display_scale = _downsample_registered_image_for_display(image, channel_axis)
+    display_kwargs = {"scale": display_scale} if display_scale is not None else {}
+    rgb_display_scale = _spatial_scale_for_rgb(display_scale)
+    rgb_display_kwargs = {"scale": rgb_display_scale} if rgb_display_scale is not None else {}
+
+    composite = _make_rgb_composite(display_image, channel_axis) if show_composite else None
+    if composite is not None:
+        viewer.add_image(
+            composite,
+            name=f"{name} Composite",
+            opacity=opacity,
+            blending="additive",
+            rgb=True,
+            **rgb_display_kwargs,
+        )
+
+    if show_colored_stack and _add_registered_channels_as_layers(
+        viewer,
+        display_image,
+        name,
+        channel_axis,
+        opacity,
+        rgb_display_kwargs,
+    ):
+        return
+
+    if composite is not None:
+        return
+
+    image_kwargs = {"name": name, "opacity": opacity, "blending": "additive"}
+    if image.ndim == 2:
+        image_kwargs["colormap"] = "green"
+    image_kwargs.update(display_kwargs)
+    viewer.add_image(display_image, **image_kwargs)
+
+
+def _downsample_registered_image_for_display(
+    image: np.ndarray,
+    channel_axis: ImageChannelAxis | str,
+    max_axis: int = 30000,
+) -> tuple[np.ndarray, tuple[float, ...] | None]:
+    data = np.asarray(image)
+    spatial_shape = _spatial_shape_for_display(data, channel_axis)
+    if spatial_shape is None:
+        return data, None
+    factor = int(np.ceil(max(spatial_shape) / float(max_axis)))
+    if factor <= 1:
+        return data, None
+
+    show_info(
+        "  Registered image is too large for stable OpenGL display; "
+        f"showing a {factor}x downsampled preview layer."
+    )
+    if data.ndim == 2:
+        return data[::factor, ::factor], (float(factor), float(factor))
+
+    napari_axis = _napari_channel_axis(channel_axis, data)
+    if data.ndim == 3 and napari_axis == 0:
+        return data[:, ::factor, ::factor], (1.0, float(factor), float(factor))
+    if data.ndim == 3 and napari_axis == -1:
+        return data[::factor, ::factor, :], (float(factor), float(factor), 1.0)
+    return data, None
+
+
+def _spatial_shape_for_display(
+    image: np.ndarray,
+    channel_axis: ImageChannelAxis | str,
+) -> tuple[int, int] | None:
+    data = np.asarray(image)
+    if data.ndim == 2:
+        return int(data.shape[0]), int(data.shape[1])
+    napari_axis = _napari_channel_axis(channel_axis, data)
+    if data.ndim == 3 and napari_axis == 0:
+        return int(data.shape[1]), int(data.shape[2])
+    if data.ndim == 3 and napari_axis == -1:
+        return int(data.shape[0]), int(data.shape[1])
+    return None
+
+
+def _spatial_scale_for_rgb(scale: tuple[float, ...] | None) -> tuple[float, float] | None:
+    if scale is None:
+        return None
+    if len(scale) == 2:
+        return float(scale[0]), float(scale[1])
+    if len(scale) == 3 and scale[0] == 1.0:
+        return float(scale[1]), float(scale[2])
+    if len(scale) == 3 and scale[2] == 1.0:
+        return float(scale[0]), float(scale[1])
+    return None
+
+
+def _add_registered_channels_as_layers(
+    viewer: napari.Viewer,
+    image: np.ndarray,
+    name: str,
+    channel_axis: ImageChannelAxis | str,
+    opacity: float,
+    image_kwargs: dict,
+) -> bool:
+    channels = _channels_first_view(image, channel_axis)
+    if channels is None:
+        return False
+
+    palette = _display_palette()
+    for idx in range(channels.shape[0]):
+        color = palette[idx % len(palette)]
+        norm = _normalize_channel_for_composite(channels[idx])
+        rgb = np.clip(norm[..., None] * color[None, None, :], 0.0, 1.0)
+        viewer.add_image(
+            rgb,
+            name=f"{name} C{idx}",
+            opacity=opacity,
+            blending="additive",
+            rgb=True,
+            **image_kwargs,
+        )
+    return True
+
+
+def _make_rgb_channel_stack(image: np.ndarray, channel_axis: ImageChannelAxis | str) -> np.ndarray | None:
+    data = np.asarray(image)
+    if data.ndim != 3:
+        return None
+    channels = _channels_first_view(data, channel_axis)
+    if channels is None:
+        return None
+
+    palette = _display_palette()
+    rgb_stack = np.zeros((*channels.shape, 3), dtype=np.float32)
+    for idx in range(channels.shape[0]):
+        color = palette[idx % len(palette)]
+        norm = _normalize_channel_for_composite(channels[idx])
+        rgb_stack[idx] = norm[..., None] * color[None, None, :]
+    return np.clip(rgb_stack, 0.0, 1.0)
+
+
+def _make_rgb_composite(image: np.ndarray, channel_axis: ImageChannelAxis | str) -> np.ndarray | None:
+    data = np.asarray(image)
+    if data.ndim != 3:
+        return None
+    channels = _channels_first_view(data, channel_axis)
+    if channels is None:
+        return None
+
+    palette = _display_palette()
+    rgb = np.zeros((*channels.shape[1:], 3), dtype=np.float32)
+    for idx in range(channels.shape[0]):
+        color = palette[idx % len(palette)]
+        norm = _normalize_channel_for_composite(channels[idx])
+        rgb += norm[..., None] * color[None, None, :]
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _channels_first_view(image: np.ndarray, channel_axis: ImageChannelAxis | str) -> np.ndarray | None:
+    data = np.asarray(image)
+    napari_axis = _napari_channel_axis(channel_axis, data)
+    if data.ndim == 3 and napari_axis == 0:
+        return data
+    if data.ndim == 3 and napari_axis == -1:
+        return np.moveaxis(data, -1, 0)
+    return None
+
+
+def _display_palette() -> np.ndarray:
+    return np.array(
+        [
+            [0.10, 0.25, 1.00],  # DAPI: blue
+            [0.00, 1.00, 0.25],  # signal 1: green
+            [1.00, 0.05, 0.05],  # signal 2: red
+            [1.00, 0.00, 1.00],  # signal 3: magenta
+            [1.00, 0.85, 0.00],  # signal 4: yellow
+            [0.00, 0.90, 1.00],  # extra: cyan
+        ],
+        dtype=np.float32,
+    )
+
+
+def _normalize_channel_for_composite(channel: np.ndarray) -> np.ndarray:
+    arr = np.asarray(channel, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return np.zeros(arr.shape, dtype=np.float32)
+    p_low, p_high = np.percentile(arr[finite], (1, 99.8))
+    if p_high <= p_low:
+        max_value = float(np.max(arr[finite]))
+        if max_value <= 0:
+            return np.zeros(arr.shape, dtype=np.float32)
+        return np.clip(arr / max_value, 0.0, 1.0)
+    return np.clip((arr - p_low) / (p_high - p_low), 0.0, 1.0)
+
+
+def _tiff_axes_for_image(image: np.ndarray, channel_axis: ImageChannelAxis | str) -> str | None:
+    if image.ndim == 2:
+        return "YX"
+    napari_axis = _napari_channel_axis(channel_axis, image)
+    if image.ndim == 3 and napari_axis == 0:
+        return "CYX"
+    if image.ndim == 3 and napari_axis == -1:
+        return "YXC"
+    return None
+
+
 def segment_cells_widget(
     viewer: napari.Viewer,
     images: list[ImageData],
     model: CellposeModel = CellposeModel.CPSAM,
     gpu: bool = False,
+    channel_axis: ImageChannelAxis = ImageChannelAxis.AUTO,
+    dapi_channel: int = 0,
     diameter: float = 15,
     flow_threshold: Annotated[float, {"min": -10.0, "max": 10.0, "step": 0.1}] = -2.0,
     cellprob_threshold: Annotated[float, {"min": -10.0, "max": 10.0, "step": 0.1}] = 1.0,
@@ -108,6 +482,7 @@ def segment_cells_widget(
 
     show_info("=== Starting Cell Segmentation ===")
     show_info(f"Model: {model.value} | Total images: {len(images)}")
+    show_info(f"DAPI source: channel_axis={_channel_axis_key(channel_axis)} channel={int(dapi_channel)}")
 
     config = CellposeConfig(
         gpu=gpu,
@@ -127,10 +502,11 @@ def segment_cells_widget(
     for idx, image in enumerate(images):
         progress = f"[{idx + 1}/{len(images)}]"
         layer_name = _find_layer_name(viewer, image, idx)
+        dapi_image = _extract_dapi_channel(image, channel_axis, int(dapi_channel))
 
         use_chunked, megapixels = _should_use_chunked(
             segmenter,
-            image,
+            dapi_image,
             mode,
             large_image_threshold_mp,
         )
@@ -142,14 +518,14 @@ def segment_cells_widget(
                 f"overlap={chunk_overlap}px stitch={stitch_text}"
             )
             mask, flows, styles = segmenter.segment_array_chunked(
-                image,
+                dapi_image,
                 chunk_size=chunk_size,
                 overlap=chunk_overlap,
                 stitch_labels=stitch_labels,
             )
         else:
             show_info(f"{progress} Full-image segmentation; chunk settings are ignored.")
-            mask, flows, styles = segmenter.segment_array(np.asarray(image))
+            mask, flows, styles = segmenter.segment_array(dapi_image)
         n_cells = int(mask.max())
 
         # Truncate long layer names for cleaner UI
@@ -164,7 +540,7 @@ def segment_cells_widget(
             layer_name = short_name
 
         mask_name = f"{layer_name}_mask"
-        viewer.add_labels(mask, name=mask_name, opacity=0.5)
+        _add_mask_layer(viewer, mask, name=mask_name, opacity=0.5)
         show_info(f"{progress} {mask_name}: Found {n_cells} cells")
 
         if save_masks:
@@ -173,6 +549,20 @@ def segment_cells_widget(
             show_info(f"{progress} Saved: {mask_filename.name}")
 
     show_info(f"=== Segmentation Complete! Processed {len(images)} image(s) ===")
+
+
+segment_cells_factory = magic_factory(
+    segment_cells_widget,
+    call_button="Segment cells",
+    widget_init=_segment_cells_widget_init,
+    images={"label": "Image layers"},
+    channel_axis={"label": "Channel layout"},
+    dapi_channel={
+        "widget_type": "ComboBox",
+        "choices": _dapi_channel_choices,
+        "label": "DAPI channel",
+    },
+)
 
 
 def _find_layer_name(viewer: napari.Viewer, image: ImageData, idx: int) -> str:
@@ -206,6 +596,127 @@ def _mask_for_saving(mask: np.ndarray) -> np.ndarray:
     return mask.astype(np.uint16, copy=False)
 
 
+def _safe_output_stem(name: str) -> str:
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(name)).strip(" ._")
+    return stem or "mask"
+
+
+def save_mask_layers_widget(
+    viewer: napari.Viewer,
+    mask_layer: str = "__all__",
+    output_dir: Path = Path("./segmentation_output"),
+    relabel_binary_masks: bool = True,
+) -> None:
+    """Save existing 2D mask layers after segmentation has finished."""
+    from tifffile import imwrite
+
+    apply_default_font()
+    masks = _selected_label_layers(viewer, mask_layer)
+    if not masks:
+        show_info("Select at least one mask layer to save.")
+        return
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    show_info(f"Saving {len(masks)} mask layer(s) to: {output_path.absolute()}")
+
+    used_names: set[str] = set()
+    for idx, layer in enumerate(masks, start=1):
+        layer_name = getattr(layer, "name", f"mask_{idx}")
+        try:
+            mask = _mask_layer_to_array(layer, "mask")
+        except ValueError as exc:
+            show_info(f"Skipped {layer_name}: {exc}")
+            continue
+        mask_to_save = _instance_mask_for_saving(mask, relabel_binary_masks)
+
+        stem = _safe_output_stem(layer_name)
+        base_stem = stem
+        suffix = 2
+        while stem.lower() in used_names:
+            stem = f"{base_stem}_{suffix}"
+            suffix += 1
+        used_names.add(stem.lower())
+
+        out_file = output_path / f"{stem}.tif"
+        imwrite(str(out_file), mask_to_save, metadata={"axes": "YX"})
+        show_info(f"Saved mask: {out_file.name}")
+
+    show_info("Mask saving complete.")
+
+
+def _instance_mask_for_saving(mask: np.ndarray, relabel_binary_masks: bool) -> np.ndarray:
+    arr = np.asarray(mask)
+    if relabel_binary_masks and _looks_like_binary_mask(arr):
+        from skimage.measure import label
+
+        arr = label(arr > 0, connectivity=1)
+    return _mask_for_saving(arr)
+
+
+def _looks_like_binary_mask(mask: np.ndarray) -> bool:
+    arr = np.asarray(mask)
+    if arr.size == 0:
+        return False
+    values = np.unique(arr)
+    nonzero = values[values != 0]
+    return len(nonzero) == 1
+
+
+def _label_layer_choices(widget) -> list[tuple[str, str]]:
+    parent = getattr(widget, "parent", None)
+    viewer = getattr(parent, "viewer", None)
+    choices = [("All label layers", "__all__")]
+    if viewer is None:
+        return choices
+    choices.extend((layer.name, layer.name) for layer in viewer.layers if isinstance(layer, Labels))
+    return choices
+
+
+def _selected_label_layers(viewer: napari.Viewer, mask_layer: str) -> list[Labels]:
+    if str(mask_layer) == "__all__":
+        return [layer for layer in viewer.layers if isinstance(layer, Labels)]
+    try:
+        layer = viewer.layers[str(mask_layer)]
+    except KeyError:
+        return []
+    return [layer] if isinstance(layer, Labels) else []
+
+
+save_mask_layers_factory = magic_factory(
+    save_mask_layers_widget,
+    call_button="Save mask layers",
+    mask_layer={
+        "widget_type": "ComboBox",
+        "choices": _label_layer_choices,
+        "label": "Mask layer",
+    },
+    output_dir={"label": "Save to", "widget_type": "FileEdit", "mode": "d"},
+    relabel_binary_masks={"label": "Relabel binary masks"},
+)
+
+
+def _mask_for_display(mask: np.ndarray) -> np.ndarray:
+    """Use unsigned label textures to avoid unstable int64 labels rendering in napari/vispy."""
+    mask = np.asarray(mask)
+    if mask.size == 0:
+        return mask.astype(np.uint16, copy=False)
+    if int(np.nanmax(mask)) > np.iinfo(np.uint16).max:
+        return mask.astype(np.uint32, copy=False)
+    return mask.astype(np.uint16, copy=False)
+
+
+def _add_mask_layer(
+    viewer: napari.Viewer,
+    mask: np.ndarray,
+    name: str,
+    opacity: float,
+) -> Layer:
+    """Display masks as Labels so label colors stay visible in napari."""
+    display_mask = _mask_for_display(mask)
+    return viewer.add_labels(display_mask, name=name, opacity=opacity)
+
+
 def _should_use_wsi_registration(
     image_shape: tuple[int, ...],
     mode: RegistrationMode,
@@ -224,64 +735,91 @@ def _should_use_wsi_registration(
 
 def _run_wsi_registration(
     viewer: napari.Viewer,
-    img1: np.ndarray,
-    img2: np.ndarray,
     mask1: np.ndarray,
     mask2: np.ndarray,
     feats1: pd.DataFrame,
     feats2: pd.DataFrame,
+    fixed_layer_metadata: dict | None,
+    moving_layer_metadata: dict | None,
     top_k: int,
     image_megapixels: float,
+    channel_axis: ImageChannelAxis | str,
+    registered_display: RegisteredDisplayMode | str,
+    wsi_refine_model: WSIRefineModel | str,
+    wsi_knn_k: int,
+    wsi_knn_power: float,
+    wsi_residual_filter: bool,
+    save_results: bool = False,
+    output_path: Path | None = None,
 ) -> None:
-    show_info(f"[3/5] WSI landmark search from real mask centroids ({image_megapixels:.1f} MP)...")
-    matches = _find_wsi_landmark_matches(feats1, feats2, top_k=top_k)
-    if matches.empty:
-        show_info("  WSI landmark search failed; no registration was applied.")
-        return
-    if len(matches) < 3:
-        show_info(f"  WSI landmark search found only {len(matches)} pairs; need at least 3.")
-        return
-
-    show_info(f"  WSI landmarks selected: {len(matches)} real mask cell pairs")
-    _add_wsi_landmark_layers(viewer, feats1, feats2, matches)
-
-    transform = estimate_wsi_translation_from_matches(matches)
-    residuals = compute_match_residuals(feats1, feats2, matches, transform)
-    matches["residual_px"] = residuals
-    tx, ty = transform.translation
-    show_info(
-        "  WSI translation: "
-        f"dx={float(tx):.1f}px dy={float(ty):.1f}px, "
-        f"residual mean={float(residuals.mean()):.2f}px max={float(residuals.max()):.2f}px"
-    )
-
-    local_grid = estimate_local_translation_grid(
-        matches,
-        mask1.shape[:2],
-        grid=4,
-        fallback_translation=transform.translation,
-    )
-    show_info("  WSI local 4x4 translation grid (dx,dy):\n" + _format_wsi_translation_grid(local_grid))
-
-    show_info("[4/5] Applying WSI local translation registration...")
     import time as _time
 
     _t0 = _time.perf_counter()
-    img2_warped = warp_array_with_translation_grid(img2, local_grid, output_shape=mask1.shape[:2], order=1)
-    img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
-    image_kwargs = {"name": "Registered Image Round 2 (WSI Local Translation)", "opacity": 0.5, "blending": "additive"}
-    if img2_registered.ndim == 2:
-        image_kwargs["colormap"] = "green"
-    viewer.add_image(img2_registered, **image_kwargs)
+    model_value = wsi_refine_model.value if isinstance(wsi_refine_model, WSIRefineModel) else str(wsi_refine_model)
+    use_knn = model_value.startswith("knn")
+    show_info(f"[3/5] WSI centroid registration in level-0 coordinates ({image_megapixels:.1f} MP)...")
+    try:
+        fixed_meta = _wsi_metadata_from_layer(fixed_layer_metadata, mask1.shape, "HE", "unknown")
+        moving_meta = _wsi_metadata_from_layer(moving_layer_metadata, mask2.shape, "DAPI", "unknown")
+        result = run_wsi_centroid_registration(
+            fixed_centroids=feats1,
+            fixed_metadata=fixed_meta,
+            moving_centroids=feats2,
+            moving_metadata=moving_meta,
+            output_dir=output_path if save_results else None,
+            top_k=top_k,
+            use_knn_local_affine=use_knn,
+            knn_k=max(3, int(wsi_knn_k)),
+            knn_power=float(wsi_knn_power),
+            residual_filter=bool(wsi_residual_filter),
+            write_preview=save_results,
+        )
+    except ValueError as exc:
+        show_info(f"  WSI registration failed: {exc}")
+        return
+    except NotImplementedError as exc:
+        show_info(f"  WSI export skipped: {exc}")
+        return
 
-    mask2_warped = warp_array_with_translation_grid(
-        mask2.astype(np.int32, copy=False),
-        local_grid,
-        output_shape=mask1.shape[:2],
-        order=0,
+    matches = result.matches.copy()
+    residuals = result.residuals
+    affine = result.global_affine_mif_to_he
+    tx, ty = affine[0, 2], affine[1, 2]
+    show_info(f"  WSI centroid matches selected: {len(matches)} spatial cell pairs")
+    show_info(
+        "  WSI affine mIF level-0 -> HE level-0: "
+        f"scale_x={float(affine[0, 0]):.6g} scale_y={float(affine[1, 1]):.6g} "
+        f"tx={float(tx):.1f}px ty={float(ty):.1f}px"
     )
-    mask2_registered = np.rint(mask2_warped).astype(np.int32)
-    viewer.add_labels(mask2_registered, name="Registered Mask Round 2 (WSI Local Translation)", opacity=0.35)
+    if residuals.size:
+        show_info(
+            f"  WSI centroid residual mean={float(residuals.mean()):.2f}px "
+            f"max={float(residuals.max()):.2f}px in HE level-0 space"
+        )
+    _add_wsi_centroid_landmark_layers(viewer, result, fixed_meta, moving_meta)
+
+    all_pts_r2_registered_xy = result.registered_moving_centroids[
+        ["registered_centroid_x", "registered_centroid_y"]
+    ].to_numpy(dtype=float)
+
+    if result.local_affine_warp is not None:
+        show_info("[4/5] Applying WSI KNN local affine to mIF-DAPI centroids...")
+        method_text = "KNN Local Affine"
+    else:
+        show_info("[4/5] Applying WSI global affine to mIF-DAPI centroids...")
+        method_text = "Global Affine"
+
+    display_registered_yx = _level0_xy_to_layer_yx(all_pts_r2_registered_xy, fixed_meta)
+    viewer.add_points(
+        display_registered_yx,
+        name=f"Registered Points Round 2 (WSI {method_text})",
+        size=5,
+        face_color="red",
+        opacity=0.7,
+    )
+    show_info("  WSI mode estimated transform from centroids only; 8-channel mIF is not read during registration.")
+    if save_results and output_path is not None:
+        show_info("  Saved WSI centroid matches, transform JSON, deformation grid, and registered centroid tables.")
     show_info(f"[5/5] WSI registration complete in {_time.perf_counter() - _t0:.2f}s")
 
 
@@ -391,6 +929,77 @@ def _add_wsi_landmark_layers(
         viewer.add_shapes(lines, shape_type="line", edge_width=1, edge_color="cyan", name="WSI Landmark Lines")
 
 
+def _wsi_metadata_from_layer(
+    layer_metadata: dict | None,
+    mask_shape: tuple[int, int],
+    channel: str,
+    segmentation_method: str,
+) -> WSICentroidMetadata:
+    payload = dict(layer_metadata or {})
+    if "wsi_centroid_metadata" in payload and isinstance(payload["wsi_centroid_metadata"], dict):
+        payload = dict(payload["wsi_centroid_metadata"])
+    if not payload:
+        raise ValueError(
+            "WSI mode requires mask layers with WSI centroid metadata. "
+            "Run WSI Segmentation first or provide centroid CSV files with paired metadata JSON."
+        )
+    h, w = int(mask_shape[0]), int(mask_shape[1])
+    origin_x = float(payload.get("origin_x", 0.0))
+    origin_y = float(payload.get("origin_y", 0.0))
+    downsample = float(payload.get("downsample", 1.0))
+    payload.setdefault("source_wsi_path", payload.get("wsi_path") or payload.get("source_path"))
+    payload.setdefault("source_mask_path", payload.get("mask_path"))
+    payload.setdefault("coordinate_space", "mask_pixel")
+    payload.setdefault("origin_x", origin_x)
+    payload.setdefault("origin_y", origin_y)
+    payload.setdefault("downsample", downsample)
+    payload.setdefault("image_width", int(np.ceil(origin_x + w * downsample)))
+    payload.setdefault("image_height", int(np.ceil(origin_y + h * downsample)))
+    payload.setdefault("mpp_x", payload.get("mpp_x"))
+    payload.setdefault("mpp_y", payload.get("mpp_y"))
+    payload.setdefault("mpp_reliable", payload.get("mpp_reliable", False))
+    payload.setdefault("channel", payload.get("channel", channel))
+    payload.setdefault("segmentation_method", payload.get("segmentation_method", segmentation_method))
+    return WSICentroidMetadata.from_mapping(payload, source_name="mask layer metadata")
+
+
+def _level0_xy_to_layer_yx(points_xy: np.ndarray, metadata: WSICentroidMetadata) -> np.ndarray:
+    pts = np.asarray(points_xy, dtype=float)
+    x = (pts[:, 0] - float(metadata.origin_x)) / float(metadata.downsample)
+    y = (pts[:, 1] - float(metadata.origin_y)) / float(metadata.downsample)
+    return np.column_stack([y, x])
+
+
+def _add_wsi_centroid_landmark_layers(
+    viewer: napari.Viewer,
+    result,
+    fixed_metadata: WSICentroidMetadata,
+    moving_metadata: WSICentroidMetadata,
+) -> None:
+    matches = result.matches
+    if matches.empty:
+        return
+    fixed_xy = matches[["fixed_x", "fixed_y"]].to_numpy(dtype=float)
+    moving_xy = matches[["moving_x", "moving_y"]].to_numpy(dtype=float)
+    fixed_yx = _level0_xy_to_layer_yx(fixed_xy, fixed_metadata)
+    moving_yx = _level0_xy_to_layer_yx(moving_xy, moving_metadata)
+    viewer.add_points(fixed_yx, name="WSI HE Landmark Centroids", size=9, face_color="yellow")
+    viewer.add_points(moving_yx, name="WSI mIF-DAPI Landmark Centroids", size=9, face_color="orange")
+    fixed_display_for_registered = _level0_xy_to_layer_yx(fixed_xy, fixed_metadata)
+    moving_registered_xy = result.local_affine_warp.predict(moving_xy) if result.local_affine_warp is not None else _apply_affine_for_display(moving_xy, result.global_affine_mif_to_he)
+    moving_registered_yx = _level0_xy_to_layer_yx(moving_registered_xy, fixed_metadata)
+    lines = [[fixed_display_for_registered[idx], moving_registered_yx[idx]] for idx in range(len(matches))]
+    if lines:
+        viewer.add_shapes(lines, shape_type="line", edge_width=1, edge_color="cyan", name="WSI Registered Landmark Residuals")
+
+
+def _apply_affine_for_display(points_xy: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points_xy, dtype=float)
+    hom = np.hstack([pts, np.ones((len(pts), 1), dtype=float)])
+    out = hom @ np.asarray(matrix, dtype=float).T
+    return out[:, :2] / np.maximum(out[:, 2:3], 1e-12)
+
+
 def _shift_array_xy(arr: np.ndarray, translation_xy: np.ndarray, order: int) -> np.ndarray:
     return shift_array_xy(arr, translation_xy, order)
 
@@ -413,6 +1022,8 @@ def registration_workflow_widget(
     image_round2: ImageData,
     mask_round1: Layer,
     mask_round2: Layer,
+    image_channel_axis: ImageChannelAxis = ImageChannelAxis.AUTO,
+    registered_display: RegisteredDisplayMode = RegisteredDisplayMode.COLORED_STACK,
     top_k: Annotated[int, {"min": 1, "max": 10000, "step": 100}] = 320,
     max_match_distance_px: int = 100,
     position_weight: float = 1.0,
@@ -422,6 +1033,10 @@ def registration_workflow_widget(
     ransac_residual_threshold: float = 2.0,
     registration_mode: RegistrationMode = RegistrationMode.AUTO,
     wsi_threshold_mp: Annotated[float, {"min": 1.0, "max": 5000.0, "step": 1.0}] = 64.0,
+    wsi_refine_model: WSIRefineModel = WSIRefineModel.KNN_LOCAL_AFFINE,
+    wsi_knn_k: Annotated[int, {"min": 3, "max": 64, "step": 1}] = 8,
+    wsi_knn_power: Annotated[float, {"min": 0.0, "max": 8.0, "step": 0.5}] = 2.0,
+    wsi_residual_filter: bool = True,
     min_area: int = 0,
     max_area: int = 0,
     use_gpu: bool = True,
@@ -462,6 +1077,9 @@ def registration_workflow_widget(
         )
 
     show_info("=== Starting Cell Registration Workflow ===")
+    show_info(f"  Image channel axis: {_channel_axis_key(image_channel_axis)}")
+    display_value = registered_display.value if isinstance(registered_display, RegisteredDisplayMode) else str(registered_display)
+    show_info(f"  Registered display: {display_value}")
     from .core import gpu_ops as _gpu_ops
     if use_gpu:
         _torch = _gpu_ops._get_torch_cuda()
@@ -481,8 +1099,26 @@ def registration_workflow_widget(
 
     mask1 = _mask_layer_to_array(mask_round1, "mask_round1")
     mask2 = _mask_layer_to_array(mask_round2, "mask_round2")
-    img1 = np.asarray(image_round1)
-    img2 = np.asarray(image_round2)
+    fixed_layer_metadata = dict(getattr(mask_round1, "metadata", {}) or {})
+    moving_layer_metadata = dict(getattr(mask_round2, "metadata", {}) or {})
+    use_wsi, registration_mp = _should_use_wsi_registration(mask1.shape, registration_mode, wsi_threshold_mp)
+    if use_wsi:
+        show_info(f"  WSI mode selected from mask shape {mask1.shape} ({registration_mp:.1f} MP).")
+    else:
+        img1 = np.asarray(image_round1)
+        img2 = np.asarray(image_round2)
+        show_info(f"  Round 1 image shape: {img1.shape}, mask shape: {mask1.shape}")
+        show_info(f"  Round 2 image shape: {img2.shape}, mask shape: {mask2.shape}")
+        if img2.ndim == 3:
+            axis_key = _channel_axis_key(image_channel_axis)
+            if axis_key == "first" or (
+                axis_key == "auto" and img2.shape[0] <= 10 and img2.shape[1] > 10 and img2.shape[2] > 10
+            ):
+                show_info(f"  Round 2 registered output will warp all {img2.shape[0]} channels (C,Y,X).")
+            elif axis_key == "last" or (axis_key == "auto" and img2.shape[-1] <= 10):
+                show_info(f"  Round 2 registered output will warp all {img2.shape[-1]} channels (Y,X,C).")
+        elif img2.ndim == 2:
+            show_info("  Round 2 image is 2D; only the selected image layer will be registered.")
 
     show_info("[1/5] Extracting features from Round 1...")
     feat_config = CellFeaturesConfig(
@@ -511,18 +1147,25 @@ def registration_workflow_widget(
         show_info("No cells available after feature extraction.")
         return
 
-    use_wsi, registration_mp = _should_use_wsi_registration(mask1.shape, registration_mode, wsi_threshold_mp)
     if use_wsi:
         _run_wsi_registration(
             viewer,
-            img1,
-            img2,
             mask1,
             mask2,
             feats1,
             feats2,
+            fixed_layer_metadata=fixed_layer_metadata,
+            moving_layer_metadata=moving_layer_metadata,
             top_k=max(1, int(top_k)),
             image_megapixels=registration_mp,
+            channel_axis=image_channel_axis,
+            registered_display=registered_display,
+            wsi_refine_model=wsi_refine_model,
+            wsi_knn_k=wsi_knn_k,
+            wsi_knn_power=wsi_knn_power,
+            wsi_residual_filter=wsi_residual_filter,
+            save_results=save_results,
+            output_path=output_path if save_results else None,
         )
         return
     show_info(f"  Normal registration mode ({registration_mp:.1f} MP); using existing workflow.")
@@ -921,51 +1564,50 @@ def registration_workflow_widget(
 
     if use_tps:
         # Warp image with TPS (non-rigid)
-        show_info("  Warping image with TPS...")
+        show_info(f"  Warping image with TPS; moving image shape {img2.shape}")
         _t0 = _time.perf_counter()
         img2_warped = warp_image_with_tps(img2, tps, mask1.shape[:2], order=1)
         _warp_sec = _time.perf_counter() - _t0
-        show_info(f"  TPS image warp completed in {_warp_sec:.2f}s")
         img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
-        image_kwargs = {"name": "Registered Image Round 2 (TPS)", "opacity": 0.5, "blending": "additive"}
-        if img2_registered.ndim == 2:
-            image_kwargs["colormap"] = "green"
-        viewer.add_image(img2_registered, **image_kwargs)
+        show_info(f"  TPS image warp completed in {_warp_sec:.2f}s; registered shape {img2_registered.shape}")
+        _add_registered_image_layer(
+            viewer,
+            img2_registered,
+            name="Registered Image Round 2 (TPS)",
+            channel_axis=image_channel_axis,
+            display_mode=registered_display,
+            opacity=0.5,
+        )
 
         mask2_warped = warp_image_with_tps(mask2.astype(np.int32), tps, mask1.shape[:2], order=0)
         mask2_registered = np.rint(mask2_warped).astype(np.int32)
     else:
         # Rigid fallback warp
-        from scipy.ndimage import map_coordinates
-        show_info(f"  Rigid fallback warp: {len(matches)} matches, using affine")
+        show_info(f"  Rigid fallback warp: {len(matches)} matches, moving image shape {img2.shape}")
         _t0 = _time.perf_counter()
-        H, W = mask1.shape[:2]
-        gy, gx = np.meshgrid(np.arange(H, dtype=float), np.arange(W, dtype=float), indexing="ij")
-        queries_xy = np.stack([gx.ravel(), gy.ravel()], axis=1)
-        inv_affine = np.linalg.inv(affine_transform)
-        ones = np.ones((len(queries_xy), 1))
-        src_xy = (inv_affine @ np.hstack([queries_xy, ones]).T).T[:, :2]
-        src_row = src_xy[:, 1].reshape(H, W)
-        src_col = src_xy[:, 0].reshape(H, W)
-
-        img2_warped = map_coordinates(img2.astype(float), [src_row, src_col], order=1, mode="constant", cval=0.0)
+        img2_warped = warp_image_with_transform(img2, affine_transform, mask1.shape[:2], order=1)
         img2_registered = cast_warped_like_original(img2_warped, img2.dtype)
-        image_kwargs = {"name": "Registered Image Round 2 (Rigid)", "opacity": 0.5, "blending": "additive"}
-        if img2_registered.ndim == 2:
-            image_kwargs["colormap"] = "green"
-        viewer.add_image(img2_registered, **image_kwargs)
+        show_info(f"  Rigid registered moving image shape: {img2_registered.shape}")
+        _add_registered_image_layer(
+            viewer,
+            img2_registered,
+            name="Registered Image Round 2 (Rigid)",
+            channel_axis=image_channel_axis,
+            display_mode=registered_display,
+            opacity=0.5,
+        )
 
-        mask2_warped = map_coordinates(mask2.astype(float), [src_row, src_col], order=0, mode="constant", cval=0.0)
+        mask2_warped = warp_image_with_transform(mask2.astype(float), affine_transform, mask1.shape[:2], order=0)
         mask2_registered = np.rint(mask2_warped).astype(np.int32)
         _warp_sec = _time.perf_counter() - _t0
         show_info(f"  Rigid warp completed in {_warp_sec:.2f}s")
 
-    # Full Fusion
+    # Keep multichannel registered intensities unchanged; 2D legacy view keeps the old fusion overlay.
     mask2_registered = np.where(mask2_registered == 0, mask1, mask2_registered)
 
-    if img1.shape == img2_registered.shape:
+    if img1.ndim == 2 and img1.shape == img2_registered.shape:
         img2_registered = np.maximum(img1, img2_registered)
-    viewer.add_labels(mask2_registered, name="Registered Mask Round 2", opacity=0.35)
+    _add_mask_layer(viewer, mask2_registered, name="Registered Mask Round 2", opacity=0.35)
 
     # Warp ALL round2 centroids
     all_pts_r2_xy = feats2[["centroid_x", "centroid_y"]].to_numpy(dtype=float)
@@ -973,7 +1615,7 @@ def registration_workflow_widget(
         all_pts_r2_registered_xy = tps.predict(all_pts_r2_xy)
     else:
         ones_all = np.ones((len(all_pts_r2_xy), 1))
-        all_pts_r2_registered_xy = (affine_transform @ np.hstack([all_pts_r2_xy, ones_all]).T).T[:, :2]
+        all_pts_r2_registered_xy = (affine_transform.params @ np.hstack([all_pts_r2_xy, ones_all]).T).T[:, :2]
     viewer.add_points(
         all_pts_r2_registered_xy[:, ::-1],
         name="Registered Points Round 2",
@@ -1003,11 +1645,12 @@ def registration_workflow_widget(
     if save_results:
         show_info("Saving results...")
         img_filename = output_path / "registered_image.tif"
-        imwrite(str(img_filename), img2_registered)
+        image_metadata = {"axes": axes} if (axes := _tiff_axes_for_image(img2_registered, image_channel_axis)) else None
+        imwrite(str(img_filename), img2_registered, metadata=image_metadata)
         show_info(f"  Saved: {img_filename.name}")
 
         mask_filename = output_path / "registered_mask.tif"
-        imwrite(str(mask_filename), mask2_registered)
+        imwrite(str(mask_filename), mask2_registered, metadata={"axes": "YX"})
         show_info(f"  Saved: {mask_filename.name}")
 
         feats1_csv = output_path / "features_round1.csv"

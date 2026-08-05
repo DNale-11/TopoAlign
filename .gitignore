@@ -1,27 +1,73 @@
-# Python cache
+# Python caches and packaging artifacts
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
+build/
+dist/
 
-# VS Code
+# Local editor and agent state
 .vscode/
-
-# Data files
-*.tif
-*.tiff
-
-# Generated outputs
-outputs*/
-segmentation_output/
-benchmark/results_tune/
-benchmark/results/*
-!benchmark/results/
-!benchmark/results/benchmark_params.json
-!benchmark/results/benchmark_results.csv
-
-# OS
+.agents/
 .DS_Store
 Thumbs.db
+
+# Private runtime configuration (track the sanitized example instead)
+topoalign.config.json
+!topoalign.config.example.json
+
+# Local scripts and one-off figure sources
+/scripts/
+/*.jsx
+/inspect_svd.py
+/lif_zmax.py
+
+# Datasets, generated outputs, benchmarks, and vendored methods
+/synthetic_dataset/
+/real_dataset/
+/outputs/
+/outputs*/
+/segmentation_output/
+/external_methods/
+/benchmark/
+/wsi_registration_output/
+/bigwarp/
+/elastixITK/
+/eld/
+/tmp_topoalign_check/
+
+# Images and scientific data artifacts
+*.tif
+*.tiff
+*.svs
+*.qptiff
+*.ndpi
+*.mrxs
+*.scn
+*.lif
+*.czi
+*.nd2
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.zarr/
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.geojson
+*.log
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# Temporary local notes and checks
+temp_*
+tmp_*

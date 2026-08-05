@@ -1,4 +1,10 @@
-"""Cell registration package: segmentation, feature extraction, matching, and rigid alignment."""
+"""TopoAlign core package.
+
+The historical ``cell_registration`` import path remains intentionally
+available for existing benchmark and user scripts.
+"""
+
+__version__ = "0.1.0"
 
 from .config import CellposeConfig, CellFeaturesConfig, DEFAULT_CELLPOSE_CONFIG, DEFAULT_FEATURE_CONFIG
 try:
@@ -32,5 +38,6 @@ __all__ = [
     "MaskMatchResult",
     "match_cells_by_mask_overlap",
     "match_masks_pipeline",
+    "__version__",
 ]
 

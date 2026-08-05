@@ -62,6 +62,27 @@ class TwoStageMatchResult:
     coarse_transform_accepted: bool
 
 
+def _coerce_affine_transform(transform: AffineTransform | np.ndarray | None) -> AffineTransform | None:
+    if transform is None:
+        return None
+    if isinstance(transform, AffineTransform):
+        return transform
+    matrix = np.asarray(transform, dtype=float)
+    if matrix.shape != (3, 3):
+        raise ValueError(f"initial_coarse_transform must be a 3x3 matrix, got {matrix.shape}.")
+    return AffineTransform(matrix=matrix)
+
+
+def _compose_affine_transforms(
+    first: AffineTransform | None,
+    second: AffineTransform,
+) -> AffineTransform:
+    """Return transform equivalent to applying first, then second."""
+    if first is None:
+        return second
+    return AffineTransform(matrix=np.asarray(second.params) @ np.asarray(first.params))
+
+
 def _standardize_features(
     df1: pd.DataFrame, df2: pd.DataFrame, feature_columns: Tuple[str, ...]
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -575,6 +596,8 @@ def two_stage_match_cells(
     coarse_min_inlier_ratio: float = 0.35,
     coarse_max_median_inlier_residual: float | None = None,
     guided_spatial_window_size: float | None = None,
+    initial_coarse_transform: AffineTransform | np.ndarray | None = None,
+    initial_coarse_transform_method: str = "initial_coarse_transform",
 ) -> TwoStageMatchResult:
     coarse_matches = pd.DataFrame(columns=["idx1", "idx2", "distance"])
     aligned_df2 = df2
@@ -590,6 +613,15 @@ def two_stage_match_cells(
         guided_spatial_window_size,
         coarse_residual_threshold,
     )
+    seed_transform = _coerce_affine_transform(initial_coarse_transform)
+    coarse_source_df2 = df2
+    if seed_transform is not None:
+        coarse_source_df2 = apply_transform_to_features(df2, seed_transform, image_shape)
+        aligned_df2 = coarse_source_df2
+        coarse_offset_xy = np.asarray(seed_transform.translation, dtype=float)
+        coarse_transform = seed_transform
+        coarse_transform_method = str(initial_coarse_transform_method)
+        coarse_transform_accepted = True
 
     if len(df1) >= min_cells_for_two_stage and len(df2) >= min_cells_for_two_stage:
         coarse_config = MatchingConfig(
@@ -610,7 +642,7 @@ def two_stage_match_cells(
             )
             coarse_matches = _build_local_morphology_candidates(
                 df1,
-                df2,
+                coarse_source_df2,
                 coarse_config,
                 image_shape=image_shape,
                 top_k_per_cell=coarse_candidates_per_cell,
@@ -636,7 +668,7 @@ def two_stage_match_cells(
             patch_rows = max(1, int(coarse_patch_rows))
             patch_cols = max(1, int(coarse_patch_cols))
             fixed_patched = _add_patch_coordinates(df1, image_shape, patch_rows, patch_cols)
-            moving_patched = _add_patch_coordinates(df2, image_shape, patch_rows, patch_cols)
+            moving_patched = _add_patch_coordinates(coarse_source_df2, image_shape, patch_rows, patch_cols)
             local_top_k = _resolve_patch_top_k(
                 coarse_config.top_k,
                 patch_rows,
@@ -656,13 +688,13 @@ def two_stage_match_cells(
                     .reset_index(drop=True)
                 )
         else:
-            coarse_matches = greedy_match_cells(df1, df2, coarse_config)
+            coarse_matches = greedy_match_cells(df1, coarse_source_df2, coarse_config)
 
         if len(coarse_matches) >= 3:
-            coarse_transform, coarse_offset_xy, coarse_transform_method, coarse_inlier_count, coarse_median_inlier_residual = (
+            correction_transform, correction_offset_xy, correction_method, coarse_inlier_count, coarse_median_inlier_residual = (
                 _estimate_coarse_transform_from_matches(
                     df1,
-                    df2,
+                    coarse_source_df2,
                     coarse_matches,
                     allow_scale=coarse_allow_scale,
                     prefer_affine=coarse_prefer_affine,
@@ -672,7 +704,7 @@ def two_stage_match_cells(
                 )
             )
             coarse_inlier_ratio = float(coarse_inlier_count) / float(max(len(coarse_matches), 1))
-            coarse_transform_accepted = _should_accept_coarse_transform(
+            correction_accepted = _should_accept_coarse_transform(
                 len(coarse_matches),
                 coarse_inlier_count,
                 coarse_median_inlier_residual,
@@ -684,8 +716,21 @@ def two_stage_match_cells(
                     else coarse_max_median_inlier_residual
                 ),
             )
-            if coarse_transform_accepted:
-                aligned_df2 = apply_transform_to_features(df2, coarse_transform, image_shape)
+            if correction_accepted:
+                coarse_transform = _compose_affine_transforms(seed_transform, correction_transform)
+                coarse_offset_xy = np.asarray(coarse_transform.translation, dtype=float)
+                if seed_transform is not None:
+                    coarse_transform_method = (
+                        f"{initial_coarse_transform_method}+{correction_method}"
+                    )
+                else:
+                    coarse_transform_method = correction_method
+                coarse_transform_accepted = True
+                aligned_df2 = apply_transform_to_features(coarse_source_df2, correction_transform, image_shape)
+            elif seed_transform is None:
+                coarse_offset_xy = correction_offset_xy
+                coarse_transform = correction_transform
+                coarse_transform_method = correction_method
 
     fine_spatial_window_size = (
         guided_window_size

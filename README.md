@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="logo.png" alt="Cell Registration Logo" width="600">
+  <img src="topoalign-logo.png" alt="TopoAlign Logo" width="600">
 
-  # Topology-Preserving Cellular Registration
+  # TopoAlign — Topology-Preserving Cellular Registration
 
   **A robust, landmark-based alignment framework for highly multiplexed tissue imaging**
 
@@ -98,11 +98,33 @@ pip install -r requirements.txt
 
 ## 💻 Usage & CLI Reference
 
-Execute the comprehensive registration pipeline directly via the command-line interface:
+The public command is `topoalign`; the legacy Python module remains available for existing scripts:
 
 ```bash
-python -m cell_registration.main path/to/fixed.tif path/to/moving.tif [OPTIONS]
+topoalign run --fixed path/to/fixed.tif --moving path/to/moving.tif \\
+  --mode image --method rigid --output-dir outputs/run-001
+
+# Legacy compatibility entry point
+python -m cell_registration.main path/to/fixed.tif path/to/moving.tif
 ```
+
+Running `topoalign` opens a persistent local shell. Local commands such as
+`run`, `segment`, `features`, `match`, `transform`, `warp`, and `inspect` do
+not require an API key. The optional Agent can be configured independently
+with an API key, OpenAI-compatible base URL, and model; the shell validates
+that connection before entering Agent mode.
+
+Copy `topoalign.config.example.json` to `topoalign.config.json` to create a
+local configuration. The shell reads `topoalign.config.json` from the current
+project, falling back to `%USERPROFILE%\.topoalign\config.json`. The default interface language is
+English; menu option `[5]` switches between English and Chinese. Registration
+defaults under the JSON `registration` section are used by `run` when command
+line flags do not override them. The project configuration is git-ignored
+because it may contain an API key; only the credential-free example is tracked.
+
+Inside the optional Agent, enter `/+` to list shortcuts. Available commands
+include `/model`, `/model <id>`, `/api`, `/config`, `/reload`, `/tools`,
+`/local`, `/result`, `/artifacts`, `/clear`, and `/exit`.
 
 ### Advanced Algorithmic Tuning
 

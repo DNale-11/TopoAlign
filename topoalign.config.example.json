@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "cli": {
+    "language": "en",
+    "show_banner": true,
+    "workspace": "."
+  },
+  "agent": {
+    "enabled": false,
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "",
+    "api_key_env": "OPENAI_API_KEY",
+    "model": "gpt-5",
+    "timeout_seconds": 30,
+    "max_tool_rounds": 8
+  },
+  "registration": {
+    "mode": "auto",
+    "fixed": null,
+    "moving": null,
+    "fixed_mask": null,
+    "moving_mask": null,
+    "fixed_features": null,
+    "moving_features": null,
+    "matches": null,
+    "fixed_shape": null,
+    "segmentation": {
+      "channel_axis": "auto",
+      "registration_channel": -1,
+      "gpu": false,
+      "min_area": null,
+      "max_area": null
+    },
+    "matching": {
+      "top_k": 50,
+      "feature_weight": 1.0,
+      "topology_weight": 0.35,
+      "position_weight": 4.0,
+      "distance_threshold": 2.0,
+      "spatial_window_size": 100.0,
+      "use_spatial_clusters": false,
+      "n_clusters": 9,
+      "use_topology_filtering": false,
+      "k_pos_nei": 5,
+      "k_neighbor": 5,
+      "tau_pos": 0.5,
+      "tau_nei": 0.3,
+      "tau_map": 0.3
+    },
+    "transform": {
+      "method": "rigid",
+      "use_ransac": false,
+      "ransac_max_trials": 1000,
+      "ransac_residual_threshold": 2.0,
+      "residual_prune_quantile": null,
+      "initial_coarse_transform": null
+    },
+    "output": {
+      "output_dir": "outputs/topoalign-run",
+      "save_overlay": true,
+      "save_registered_moving": true,
+      "save_features": true,
+      "save_matches": true
+    }
+  }
+}

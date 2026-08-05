@@ -1,12 +1,18 @@
 from __future__ import annotations
 import argparse
+import json
+from dataclasses import replace
 import math
 from pathlib import Path
 import sys
+from typing import Literal
 import numpy as np
 import pandas as pd
+import imageio.v3 as iio
+import tifffile as tiff
 from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
+from skimage.transform import AffineTransform, warp
 from .config import DEFAULT_CELLPOSE_CONFIG, DEFAULT_FEATURE_CONFIG
 from .features import compute_cell_features
 from .matching import (
@@ -16,7 +22,10 @@ from .matching import (
 )
 from .point_registration import estimate_robust_transform
 from .registration import RigidTransform, estimate_rigid_transform_from_matches
-from .segmentation import CellposeSegmenter
+try:
+    from .segmentation import CellposeSegmenter
+except ImportError:  # Cellpose is optional for help and precomputed inputs.
+    CellposeSegmenter = None
 from .io_utils import infer_image_mode, load_image, project_intensity_max
 
 # Allow running as `python cell_registration/main.py` by setting package context.
@@ -38,6 +47,7 @@ DEFAULT_SAVE_MATCH_OVERLAY = Path("outputs/match _overlay")
 DEFAULT_SAVE_SEGMENTATION_PREFIX = Path("outputs/segmentation")
 DEFAULT_SAVE_MATCH_PLOT = Path("outputs/match_plot")
 DEFAULT_SAVE_REGISTRATION_OVERLAY = Path("outputs/registration_overlay")
+DEFAULT_SAVE_REGISTERED_MOVING = None
 DEFAULT_SAVE_FEATURES_DIR = Path("outputs")
 DEFAULT_RESIDUAL_PRUNE_QUANTILE = None
 MIN_MATCHES_FOR_REFINEMENT = 3
@@ -151,6 +161,172 @@ def _patch_diag_px(image_width: float, image_height: float) -> float:
 def _apply_rigid_to_points(points: np.ndarray, rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
     """Apply a rigid transform (2x2 R, 2-dim t) to an array of (x,y) points."""
     return (rotation @ points.T).T + translation
+
+
+ChannelAxis = Literal["auto", "first", "last", "none"]
+
+
+def _resolve_channel_index(channel_count: int, channel: int) -> int:
+    idx = int(channel)
+    if idx < 0:
+        idx += channel_count
+    if idx < 0 or idx >= channel_count:
+        raise ValueError(f"registration_channel {channel} is out of range for {channel_count} channels.")
+    return idx
+
+
+def _extract_registration_channel(
+    img: np.ndarray,
+    channel_axis: ChannelAxis,
+    registration_channel: int,
+) -> np.ndarray:
+    """
+    Extract the 2D intensity image used for segmentation and landmark registration.
+
+    The explicit channel-axis modes are for multi-channel 2D images. The "auto" mode
+    preserves the previous pipeline behavior.
+    """
+    if channel_axis == "none":
+        if img.ndim != 2:
+            raise ValueError(f"--channel-axis none expects a 2D image, got shape {img.shape}.")
+        return img
+
+    if channel_axis == "first":
+        if img.ndim != 3:
+            raise ValueError(f"--channel-axis first expects a C,Y,X image, got shape {img.shape}.")
+        ch = _resolve_channel_index(img.shape[0], registration_channel)
+        return img[ch, :, :]
+
+    if channel_axis == "last":
+        if img.ndim != 3:
+            raise ValueError(f"--channel-axis last expects a Y,X,C image, got shape {img.shape}.")
+        ch = _resolve_channel_index(img.shape[-1], registration_channel)
+        return img[..., ch]
+
+    if img.ndim == 2:
+        return img
+    if img.ndim == 3 and img.shape[-1] <= 4:
+        ch = _resolve_channel_index(img.shape[-1], registration_channel)
+        return img[..., ch]
+    raise ValueError(
+        f"Cannot infer a 2D registration channel from shape {img.shape}; "
+        "use --channel-axis first or --channel-axis last for multi-channel images."
+    )
+
+
+def _rigid_transform_to_affine(transform: RigidTransform) -> AffineTransform:
+    R = np.asarray(transform.rotation, dtype=float)
+    t = np.asarray(transform.translation, dtype=float)
+    return AffineTransform(
+        matrix=np.array(
+            [
+                [R[0, 0], R[0, 1], t[0]],
+                [R[1, 0], R[1, 1], t[1]],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+    )
+
+
+def _load_affine_transform_json(path: Path | str | None) -> np.ndarray | None:
+    if path is None:
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if isinstance(data, dict):
+        for key in (
+            "matrix",
+            "affine",
+            "transform",
+            "coarse_affine",
+            "global_affine",
+            "global_affine_moving_to_fixed",
+            "coarse_affine_moving_to_fixed",
+        ):
+            if key in data:
+                data = data[key]
+                break
+        else:
+            raise ValueError(
+                f"No affine matrix found in {path}; expected one of "
+                "matrix/affine/transform/coarse_affine/global_affine_moving_to_fixed."
+            )
+    matrix = np.asarray(data, dtype=float)
+    if matrix.shape != (3, 3):
+        raise ValueError(f"Affine transform JSON must contain a 3x3 matrix, got {matrix.shape}.")
+    return matrix
+
+
+def _cast_warped_like_input(warped: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        return np.rint(np.clip(warped, info.min, info.max)).astype(dtype)
+    if np.issubdtype(dtype, np.floating):
+        return warped.astype(dtype)
+    return warped
+
+
+def warp_moving_image_to_fixed(
+    moving_image: np.ndarray,
+    transform: RigidTransform,
+    output_shape: tuple[int, int],
+    channel_axis: ChannelAxis,
+    order: int = 1,
+) -> np.ndarray:
+    """
+    Apply a moving->fixed transform to a 2D or multi-channel moving image.
+
+    For C,Y,X input with --channel-axis first, the output keeps C,Y,X layout.
+    """
+    affine = _rigid_transform_to_affine(transform)
+    source_dtype = np.asarray(moving_image).dtype
+
+    def warp_plane(plane: np.ndarray) -> np.ndarray:
+        return warp(
+            plane.astype(float),
+            inverse_map=affine.inverse,
+            output_shape=output_shape,
+            preserve_range=True,
+            order=order,
+            mode="constant",
+            cval=0.0,
+        )
+
+    if channel_axis == "first":
+        if moving_image.ndim != 3:
+            raise ValueError(f"--channel-axis first expects a C,Y,X moving image, got shape {moving_image.shape}.")
+        warped = np.stack([warp_plane(moving_image[c]) for c in range(moving_image.shape[0])], axis=0)
+        return _cast_warped_like_input(warped, source_dtype)
+
+    if channel_axis == "last":
+        if moving_image.ndim != 3:
+            raise ValueError(f"--channel-axis last expects a Y,X,C moving image, got shape {moving_image.shape}.")
+        warped = np.stack([warp_plane(moving_image[..., c]) for c in range(moving_image.shape[-1])], axis=-1)
+        return _cast_warped_like_input(warped, source_dtype)
+
+    if channel_axis == "none" or moving_image.ndim == 2:
+        return _cast_warped_like_input(warp_plane(moving_image), source_dtype)
+
+    if channel_axis == "auto" and moving_image.ndim == 3 and moving_image.shape[-1] <= 4:
+        warped = np.stack([warp_plane(moving_image[..., c]) for c in range(moving_image.shape[-1])], axis=-1)
+        return _cast_warped_like_input(warped, source_dtype)
+
+    raise ValueError(
+        f"Cannot infer how to warp moving image shape {moving_image.shape}; "
+        "use --channel-axis first or --channel-axis last."
+    )
+
+
+def _axes_metadata_for_registered_image(img: np.ndarray, channel_axis: ChannelAxis) -> str | None:
+    if img.ndim == 2:
+        return "YX"
+    if img.ndim == 3 and channel_axis == "first":
+        return "CYX"
+    if img.ndim == 3 and channel_axis in ("last", "auto"):
+        return "YXC"
+    return None
 
 
 def compute_L_pos(
@@ -701,8 +877,12 @@ def run_pipeline(
     save_segmentation_prefix: Path = DEFAULT_SAVE_SEGMENTATION_PREFIX,
     save_match_plot_path: Path = DEFAULT_SAVE_MATCH_PLOT,
     save_registration_overlay_path: Path = DEFAULT_SAVE_REGISTRATION_OVERLAY,
+    save_registered_moving_path: Path | None = DEFAULT_SAVE_REGISTERED_MOVING,
     save_features_dir: Path | None = DEFAULT_SAVE_FEATURES_DIR,
     residual_prune_quantile: float | None = DEFAULT_RESIDUAL_PRUNE_QUANTILE,
+    channel_axis: ChannelAxis = "auto",
+    registration_channel: int = -1,
+    cellpose_gpu: bool = False,
     use_spatial_clusters: bool = False,
     n_clusters: int = 9,
     use_topology_filtering: bool = False,
@@ -714,29 +894,35 @@ def run_pipeline(
     use_ransac_transform: bool = False,
     ransac_max_trials: int = 1000,
     ransac_residual_threshold: float = 2.0,
+    initial_coarse_transform_path: Path | None = None,
 ) -> None:
-    segmenter = CellposeSegmenter(DEFAULT_CELLPOSE_CONFIG)
+    segmenter = CellposeSegmenter(replace(DEFAULT_CELLPOSE_CONFIG, gpu=cellpose_gpu))
 
     img1 = load_image(img1_path)
     img2 = load_image(img2_path)
 
-    mode1 = infer_image_mode(img1)
-    mode2 = infer_image_mode(img2)
-    if mode1 != mode2:
-        raise ValueError(f"Both images must be either 2D or 3D Z-stacks; got {mode1} and {mode2}.")
+    if channel_axis == "auto":
+        mode1 = infer_image_mode(img1)
+        mode2 = infer_image_mode(img2)
+        if mode1 != mode2:
+            raise ValueError(f"Both images must be either 2D or 3D Z-stacks; got {mode1} and {mode2}.")
+        use_zstack = mode1 == "3d_zstack"
 
-    use_zstack = mode1 == "3d_zstack"
-
-    if use_zstack:
-        _masks1_3d, masks1, _, _ = segmenter.segment_zstack(img1)
-        _masks2_3d, masks2, _, _ = segmenter.segment_zstack(img2)
-        overlay_img1 = project_intensity_max(img1)
-        overlay_img2 = project_intensity_max(img2)
+        if use_zstack:
+            _masks1_3d, masks1, _, _ = segmenter.segment_zstack(img1)
+            _masks2_3d, masks2, _, _ = segmenter.segment_zstack(img2)
+            overlay_img1 = project_intensity_max(img1)
+            overlay_img2 = project_intensity_max(img2)
+        else:
+            overlay_img1 = _extract_registration_channel(img1, channel_axis, registration_channel)
+            overlay_img2 = _extract_registration_channel(img2, channel_axis, registration_channel)
+            masks1, _, _ = segmenter.segment_array(overlay_img1)
+            masks2, _, _ = segmenter.segment_array(overlay_img2)
     else:
-        masks1, _, _ = segmenter.segment_array(img1)
-        masks2, _, _ = segmenter.segment_array(img2)    
-        overlay_img1 = img1
-        overlay_img2 = img2
+        overlay_img1 = _extract_registration_channel(img1, channel_axis, registration_channel)
+        overlay_img2 = _extract_registration_channel(img2, channel_axis, registration_channel)
+        masks1, _, _ = segmenter.segment_array(overlay_img1)
+        masks2, _, _ = segmenter.segment_array(overlay_img2)
 
     if segmentation_only:
         if save_segmentation_prefix is not None:
@@ -765,6 +951,9 @@ def run_pipeline(
     feats1 = compute_cell_features(masks1, DEFAULT_FEATURE_CONFIG).reset_index(drop=True)
     feats2 = compute_cell_features(masks2, DEFAULT_FEATURE_CONFIG).reset_index(drop=True)
     h1, w1 = masks1.shape
+    initial_coarse_transform = _load_affine_transform_json(initial_coarse_transform_path)
+    if initial_coarse_transform is not None:
+        print(f"Loaded initial coarse transform from {initial_coarse_transform_path}")
     two_stage = two_stage_match_cells(
         feats1,
         feats2,
@@ -782,6 +971,8 @@ def run_pipeline(
         coarse_prefer_affine=False,
         coarse_residual_threshold=max(5.0, float(ransac_residual_threshold) * 2.0),
         coarse_max_trials=min(max(ransac_max_trials, 200), 2000),
+        initial_coarse_transform=initial_coarse_transform,
+        initial_coarse_transform_method="json_coarse_affine",
     )
     feats2_aligned = two_stage.aligned_df2
 
@@ -1023,6 +1214,21 @@ def run_pipeline(
         )
         print(f"Saved registration overlay to {reg_overlay_path}")
 
+    if save_registered_moving_path is not None:
+        moving_original = np.asarray(iio.imread(img2_path))
+        registered_moving = warp_moving_image_to_fixed(
+            moving_original,
+            transform,
+            output_shape=masks1.shape,
+            channel_axis=channel_axis,
+            order=1,
+        )
+        save_registered_moving_path.parent.mkdir(parents=True, exist_ok=True)
+        axes = _axes_metadata_for_registered_image(registered_moving, channel_axis)
+        metadata = {"axes": axes} if axes is not None else None
+        tiff.imwrite(save_registered_moving_path, registered_moving, metadata=metadata)
+        print(f"Saved registered moving image to {save_registered_moving_path}")
+
     if napari_view:
         try:
             import napari  # type: ignore
@@ -1045,7 +1251,7 @@ def run_pipeline(
     
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cell registration demo using Cellpose-SAM.")
+    parser = argparse.ArgumentParser(description="TopoAlign legacy compatibility CLI using Cellpose-SAM.")
     parser.add_argument(
         "image1",
         type=Path,
@@ -1145,11 +1351,46 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Residual threshold (pixels) to count an inlier in RANSAC.",
     )
+    parser.add_argument(
+        "--residual-prune-quantile",
+        type=float,
+        default=None,
+        help="Optional quantile in (0,1) for post-fit residual pruning.",
+    )
+    parser.add_argument(
+        "--initial-coarse-transform",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON file containing a 3x3 moving->fixed coarse affine. "
+            "The original morphology/topology landmark pipeline then runs in the coarse-aligned space."
+        ),
+    )
     parser.add_argument("--napari", action="store_true", help="Open napari viewers for segmentation results.")
     parser.add_argument(
         "--segmentation-only",
         action="store_true",
         help="Run segmentation (and optional napari view) only; skip feature extraction, matching, registration.",
+    )
+    parser.add_argument(
+        "--channel-axis",
+        choices=("auto", "first", "last", "none"),
+        default="auto",
+        help=(
+            "Channel layout for 2D multi-channel images. Use 'first' for C,Y,X "
+            "DNA FISH images; default 'auto' preserves legacy behavior."
+        ),
+    )
+    parser.add_argument(
+        "--registration-channel",
+        type=int,
+        default=-1,
+        help="Channel index used for DAPI/nuclear segmentation and landmark registration.",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Run Cellpose segmentation on GPU.",
     )
     parser.add_argument(
         "--save-match-table",
@@ -1182,6 +1423,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to save registration overlay (mask1 warped onto image2, TIF).",
     )
     parser.add_argument(
+        "--save-registered-moving",
+        type=Path,
+        default=DEFAULT_SAVE_REGISTERED_MOVING,
+        help="Path to save the moving image warped into fixed-image coordinates.",
+    )
+    parser.add_argument(
         "--save-features-dir",
         type=Path,
         default=DEFAULT_SAVE_FEATURES_DIR,
@@ -1192,36 +1439,72 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    run_pipeline(
-        args.image1,
-        args.image2,
-        top_k=args.top_k,
-        feature_weight=args.feature_weight,
-        topology_weight=args.topology_weight,
-        position_weight=args.position_weight,
-        distance_threshold=args.distance_threshold,
-        spatial_window_size=args.spatial_window_size,
-        napari_view=args.napari,
-        segmentation_only=args.segmentation_only,
-        save_match_table=args.save_match_table,
-        save_match_overlay_path=args.save_match_overlay,
-        save_segmentation_prefix=args.save_segmentation_prefix,
-        save_match_plot_path=args.save_match_plot,
-        save_registration_overlay_path=args.save_registration_overlay,
-        save_features_dir=args.save_features_dir,
-        use_spatial_clusters=args.use_spatial_clusters,
-        n_clusters=args.n_clusters,
-        use_topology_filtering=args.use_topology_filtering,
-        k_pos_nei=args.k_pos_nei,
-        k_neighbor=args.k_neighbor,
-        tau_pos=args.tau_pos,
-        tau_nei=args.tau_nei,
-        tau_map=args.tau_map,
-        use_ransac_transform=args.use_ransac_transform,
-        ransac_max_trials=args.ransac_max_trials,
-        ransac_residual_threshold=args.ransac_residual_threshold,
-    )
+    # Compatibility adapter: the historical positional CLI now delegates to
+    # the structured TopoAlign service.  The old import path remains valid for
+    # benchmark and user scripts, while new users should call ``topoalign``.
+    from .cli_config import MatchingOptions, OutputOptions, TopoAlignConfig, TransformOptions, SegmentationOptions
+    from .service import register, segment_image
+
+    try:
+        if args.segmentation_only:
+            segmentation_dir = args.save_features_dir or Path("outputs/topoalign-segmentation")
+            segment_image(
+                args.image1,
+                segmentation_dir / "fixed",
+                channel_axis=args.channel_axis,
+                registration_channel=args.registration_channel,
+                gpu=args.gpu,
+            )
+            segment_image(
+                args.image2,
+                segmentation_dir / "moving",
+                channel_axis=args.channel_axis,
+                registration_channel=args.registration_channel,
+                gpu=args.gpu,
+            )
+            return 0
+
+        output_dir = args.save_features_dir or Path("outputs/topoalign-run")
+        config = TopoAlignConfig(
+            fixed=str(args.image1),
+            moving=str(args.image2),
+            segmentation=SegmentationOptions(
+                channel_axis=args.channel_axis,
+                registration_channel=args.registration_channel,
+                gpu=args.gpu,
+            ),
+            matching=MatchingOptions(
+                top_k=args.top_k,
+                feature_weight=args.feature_weight,
+                topology_weight=args.topology_weight,
+                position_weight=args.position_weight,
+                distance_threshold=args.distance_threshold,
+                spatial_window_size=args.spatial_window_size,
+                use_spatial_clusters=args.use_spatial_clusters,
+                n_clusters=args.n_clusters,
+                use_topology_filtering=args.use_topology_filtering,
+                k_pos_nei=args.k_pos_nei,
+                k_neighbor=args.k_neighbor,
+                tau_pos=args.tau_pos,
+                tau_nei=args.tau_nei,
+                tau_map=args.tau_map,
+            ),
+            transform=TransformOptions(
+                method="rigid",
+                use_ransac=args.use_ransac_transform,
+                ransac_max_trials=args.ransac_max_trials,
+                ransac_residual_threshold=args.ransac_residual_threshold,
+                initial_coarse_transform=str(args.initial_coarse_transform) if args.initial_coarse_transform else None,
+                residual_prune_quantile=args.residual_prune_quantile,
+            ),
+            output=OutputOptions(output_dir=str(output_dir)),
+        )
+        register(config)
+        return 0
+    except (ValueError, FileNotFoundError, ImportError, OSError) as exc:
+        print(f"TopoAlign error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

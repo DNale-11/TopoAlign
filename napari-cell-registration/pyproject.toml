@@ -55,10 +55,10 @@ where = ["src"]
 [project.entry-points."napari.manifest"]
 napari-cell-registration = "napari_cell_registration:napari.yaml"
 
-[project.scripts]
-wsi-mask-registration = "napari_cell_registration.wsi_registration:cli_main"
-
 [project.optional-dependencies]
+wsi = [
+    "openslide-python>=1.3",
+]
 dev = [
     "pytest>=7.0",
     "pytest-qt",
