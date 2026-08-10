@@ -3,92 +3,202 @@
 
   # TopoAlign
 
-  **Command-line and napari tools for cellular image registration**
+  **Cellular image registration from CLI, Web, Agent, and napari**
 
-  [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-  [![CLI](https://img.shields.io/badge/CLI-topoalign-1496D4)](#command-line-usage)
+  [![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+  [![CPU](https://img.shields.io/badge/Runtime-CPU-64748B)](#cpu-installation)
+  [![GPU](https://img.shields.io/badge/Runtime-NVIDIA%20GPU-76B900?logo=nvidia&logoColor=white)](#gpu-installation)
+  [![Web](https://img.shields.io/badge/UI-Web-0EA5E9)](#web-usage)
   [![Agent](https://img.shields.io/badge/Agent-optional-19A974)](#agent-usage)
 </div>
 
-TopoAlign can be used from the command line, from its interactive Agent, or
-through the napari plugin. The local registration commands do not require an
-API key.
+TopoAlign provides four ways to run the same registration workflow:
 
-<details>
-<summary><strong>中文说明</strong></summary>
+| Interface | Start command | API key required |
+|---|---|---|
+| CLI | `topoalign` | No |
+| Web | `python webapp/backend.py` | No; only the Web Assistant needs one |
+| Agent | `topoalign agent` | Yes |
+| napari | `napari` | No |
 
-TopoAlign 提供命令行、交互式 Agent 和 napari 插件三种使用方式。本地分割、
-特征提取、匹配、变换估计和图像重采样均不需要 API key；只有使用 Agent
-理解指令并操控这些功能时才需要配置模型 API。
-
-</details>
+The local pipeline supports image, mask, and feature-table inputs. Agent access
+is optional and does not control whether local registration commands can run.
 
 ## Requirements
 
 - Windows or Linux
-- Python 3.10 or newer
-- A CUDA-compatible environment is optional
-- An API key is optional and is only required for Agent mode
+- Python 3.10
+- CPU mode: no NVIDIA GPU or CUDA installation required
+- GPU mode: NVIDIA GPU, a compatible driver, and CUDA-enabled PyTorch
+- An API key is required only for CLI Agent or Web Assistant conversations
 
-## Installation
-
-Clone the repository and create an isolated environment:
+## Clone the repository
 
 ```powershell
 git clone https://github.com/DNale-11/cell_registration.git
 cd cell_registration
-conda create -n topoalign python=3.10 -y
-conda activate topoalign
 ```
 
-Install the registration dependencies and TopoAlign in editable mode:
+Choose either the CPU installation or GPU installation below. Do not install
+both PyTorch variants in the same environment.
+
+## CPU installation
+
+CPU mode is the simplest installation and works on machines without an NVIDIA
+GPU. Segmentation can be slower on large images, but all CLI, Web, Agent, and
+napari entry points remain available.
 
 ```powershell
-pip install -r requirements.txt
-pip install -e .
-```
+conda create -n cell_registration_cpu python=3.10 -y
+conda activate cell_registration_cpu
 
-Install the optional Agent dependency when conversational control is needed:
+python -m pip install --upgrade pip
+pip install torch==2.11.0 torchvision==0.26.0 `
+  --index-url https://download.pytorch.org/whl/cpu
 
-```powershell
+pip install -r webapp/requirements.txt
 pip install -e ".[agent]"
 ```
 
-Verify the installation:
+Verify that the environment is using CPU PyTorch:
+
+```powershell
+python -c "import torch; print('torch:', torch.__version__); print('CUDA available:', torch.cuda.is_available())"
+```
+
+Expected result:
+
+```text
+CUDA available: False
+```
+
+### CPU usage
+
+Use `--no-gpu` when running image segmentation from the CLI:
+
+```powershell
+topoalign run `
+  --fixed fixed.tif `
+  --moving moving.tif `
+  --mode image `
+  --method rigid `
+  --no-gpu `
+  --output-dir outputs/cpu-run
+```
+
+For a standalone segmentation stage:
+
+```powershell
+topoalign segment `
+  --image fixed.tif `
+  --no-gpu `
+  --output-dir outputs/cpu-segmentation
+```
+
+Start the Web interface manually in the CPU environment and leave **Use GPU**
+disabled:
+
+```powershell
+conda activate cell_registration_cpu
+python webapp/backend.py
+```
+
+## GPU installation
+
+GPU mode is recommended for image segmentation and large-image workflows.
+The example below installs the official CUDA 12.8 PyTorch wheels. If the local
+NVIDIA driver requires another build, select the appropriate command from the
+[official PyTorch installer](https://pytorch.org/get-started/locally/) and keep
+the project version constraints in `requirements.txt`.
+
+```powershell
+conda create -n cell_registration_gpu python=3.10 -y
+conda activate cell_registration_gpu
+
+python -m pip install --upgrade pip
+pip install torch==2.11.0 torchvision==0.26.0 `
+  --index-url https://download.pytorch.org/whl/cu128
+
+pip install -r webapp/requirements.txt
+pip install -e ".[agent]"
+```
+
+Verify CUDA before starting a registration:
+
+```powershell
+python -c "import torch; print('torch:', torch.__version__); print('CUDA:', torch.version.cuda); print('available:', torch.cuda.is_available()); print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+```
+
+`available` must be `True`. If it is `False`, do not enable GPU in TopoAlign
+until the PyTorch/driver installation is corrected.
+
+### GPU usage
+
+Enable GPU segmentation from the CLI:
+
+```powershell
+topoalign run `
+  --fixed fixed.tif `
+  --moving moving.tif `
+  --mode image `
+  --method rigid `
+  --gpu `
+  --output-dir outputs/gpu-run
+```
+
+For a standalone segmentation stage:
+
+```powershell
+topoalign segment `
+  --image fixed.tif `
+  --gpu `
+  --output-dir outputs/gpu-segmentation
+```
+
+On Windows, `webapp/start_server.bat` activates the
+`cell_registration_gpu` environment and checks whether CUDA is available:
+
+```powershell
+.\webapp\start_server.bat
+```
+
+GPU mode primarily accelerates segmentation and GPU-enabled plugin operations.
+Feature extraction, matching, transform estimation, file I/O, and some WSI
+operations may still use the CPU.
+
+## Verify TopoAlign
+
+The following checks apply to both installations:
 
 ```powershell
 topoalign --version
 topoalign --help
 ```
 
-## Start the interactive CLI
+If `topoalign` is not recognized, activate the correct environment and run:
 
-Run TopoAlign without a subcommand:
+```powershell
+pip install -e ".[agent]"
+```
+
+## CLI usage
+
+Run without a subcommand to enter the persistent interface:
 
 ```powershell
 topoalign
 ```
 
-The persistent shell provides four main actions:
-
-1. Enter the optional Agent.
-2. Configure and test the Agent API connection.
-3. View local CLI command help.
-4. Exit.
-
-Use menu option `5` to switch between English and Chinese. Local commands can
-also be entered directly at the `TopoAlign>` prompt, for example:
+The main interface lets you enter the optional Agent, configure the Agent API,
+view local command help, change the interface language, or run a local command
+directly:
 
 ```text
 TopoAlign> inspect fixed.tif
 TopoAlign> run --fixed fixed.tif --moving moving.tif --mode image --method rigid --output-dir outputs/run-001
 ```
 
-## Command-line usage
-
 ### Complete registration
-
-Register two images:
 
 ```powershell
 topoalign run `
@@ -102,7 +212,7 @@ topoalign run `
 
 Available transform methods are `rigid`, `similarity`, and `affine`.
 
-Register existing label masks without running segmentation:
+Use existing masks without segmentation:
 
 ```powershell
 topoalign run `
@@ -113,7 +223,7 @@ topoalign run `
   --output-dir outputs/mask-run
 ```
 
-Start from existing feature tables:
+Use existing feature tables:
 
 ```powershell
 topoalign run `
@@ -124,27 +234,26 @@ topoalign run `
   --output-dir outputs/feature-run
 ```
 
-Use `--json` to print the structured result to stdout.
+Mask and feature workflows do not need PyTorch or GPU computation during the
+matching and transform stages.
 
-### Run individual stages
-
-Every registration stage can be run independently:
+### Individual stages
 
 ```powershell
-# Segment an image
-topoalign segment --image fixed.tif --output-dir outputs/fixed-segmentation
+# Segment
+topoalign segment --image fixed.tif --output-dir outputs/segmentation
 
-# Extract features from a label mask
-topoalign features --mask fixed_mask.tif --output-dir outputs/fixed-features
+# Extract features
+topoalign features --mask fixed_mask.tif --output-dir outputs/features
 
-# Match two feature tables
+# Match features
 topoalign match `
   --fixed-features fixed_features.csv `
   --moving-features moving_features.csv `
   --fixed-shape 2048 2048 `
   --output-dir outputs/matching
 
-# Estimate a moving-to-fixed transform
+# Estimate the moving-to-fixed transform
 topoalign transform `
   --fixed-features fixed_features.csv `
   --moving-features moving_features.csv `
@@ -152,81 +261,108 @@ topoalign transform `
   --method rigid `
   --output-dir outputs/transform
 
-# Warp an image into fixed coordinates
+# Warp the moving image
 topoalign warp `
   --moving moving.tif `
   --transform transform.moving_to_fixed.json `
   --fixed-shape 2048 2048 `
   --output-dir outputs/warp
 
-# Inspect an input, config, transform, or result manifest
+# Inspect an input or result
 topoalign inspect outputs/run-001/result.json
 ```
 
-Use `topoalign <command> --help` for the complete options of a stage.
+Use `topoalign <command> --help` for all parameters. Add `--json` to supported
+commands when a machine-readable stdout result is needed.
 
-## JSON configuration
+## Web usage
 
-Copy the credential-free example before editing local settings:
+The local Web application provides:
 
-```powershell
-Copy-Item topoalign.config.example.json topoalign.config.json
-```
+- fixed and moving image upload and preview;
+- one-fixed-to-many-moving batch registration;
+- segmentation-only execution;
+- normal and WSI registration modes;
+- CPU/GPU selection;
+- fixed, moving, mask, registered, overlay, and match-line views;
+- progress updates, result downloads, and system resource statistics;
+- an optional AI Assistant that can inspect Web state and call allowlisted
+  TopoAlign actions.
 
-On Linux:
-
-```bash
-cp topoalign.config.example.json topoalign.config.json
-```
-
-The configuration contains these sections:
-
-```text
-cli
-agent
-registration
-  segmentation
-  matching
-  transform
-  output
-```
-
-Run registration from JSON:
+Start the server from the repository root:
 
 ```powershell
-topoalign run --config topoalign.config.json
+# CPU
+conda activate cell_registration_cpu
+python webapp/backend.py
+
+# GPU
+conda activate cell_registration_gpu
+python webapp/backend.py
 ```
 
-Command-line values override values from the JSON file. The local
-`topoalign.config.json` file is ignored by Git because it may contain an API
-key. Commit only `topoalign.config.example.json`, which contains no
-credentials.
+Open [http://localhost:8000](http://localhost:8000) in a browser.
+
+### Web workflow
+
+1. Upload one fixed image.
+2. Upload one or multiple moving images.
+3. Select Cellpose or CellViT when available.
+4. Enable **Use GPU** only in a verified GPU environment.
+5. Select **Normal registration** or **WSI registration**.
+6. Adjust parameters or keep the defaults.
+7. Run segmentation only, or start the full registration batch.
+8. Switch between moving-image results and inspect masks, overlay, and match
+   lines.
+9. Download the registered moving image or other generated artifacts.
+
+Uploads and task results are written under `data/`. This directory is ignored
+by Git and should not be committed.
+
+### Web Assistant
+
+Open **AI Configuration** in the Web interface and enter:
+
+- an OpenAI-compatible API URL;
+- an API key;
+- a model ID supported by that API account.
+
+The Web application can run without these values. They are required only for
+the Assistant panel. The Assistant can inspect uploaded images, update Web
+parameters, start an analysis, inspect completed results, and summarize a
+one-fixed-to-many-moving batch through allowlisted tools.
+
+The Web server listens on `0.0.0.0:8000`. It is intended for trusted local or
+private-network use. Add authentication and a restricted CORS policy before
+exposing it to an untrusted network.
 
 ## Agent usage
 
-The Agent converts natural-language requests into calls to TopoAlign's
-allowlisted registration tools. It does not provide a web server and it does
-not execute arbitrary shell commands.
+The CLI Agent interprets natural-language tasks and calls a restricted set of
+TopoAlign tools. It can inspect inputs and runtime resources, generate and
+validate configuration, run individual stages or complete registration,
+process one fixed image against multiple moving images, and diagnose
+structured results.
 
-### Configure the Agent from the CLI
+It cannot execute arbitrary shell commands, modify source code, or access
+files outside the selected workspace.
 
-Start the persistent interface:
+### Configure the Agent
+
+Run the main interface and select the Agent configuration option:
 
 ```powershell
 topoalign
 ```
 
-Select **Configure/test Agent API URL, API key, and model**. Enter:
+Enter the API URL, API key, and model ID. TopoAlign makes a minimal model call
+to verify that the complete combination works.
 
-- API base URL, such as `https://api.openai.com/v1`
-- API key
-- Model ID supported by that API account
+Configuration can also be loaded from JSON:
 
-TopoAlign makes a minimal model request and reports whether the selected model
-can be called. The API key is visible while it is entered, as requested by the
-CLI design, so avoid sharing terminal screenshots.
-
-The same values can be entered in the local JSON file:
+```powershell
+Copy-Item topoalign.config.example.json topoalign.config.json
+```
 
 ```json
 {
@@ -242,95 +378,121 @@ The same values can be entered in the local JSON file:
 }
 ```
 
-For better credential isolation, leave `api_key` empty and use an environment
-variable:
+To keep the key outside JSON:
 
 ```powershell
 $env:OPENAI_API_KEY = "YOUR_API_KEY"
-topoalign
+topoalign agent
 ```
 
-An OpenAI-compatible provider can be used by changing `base_url` and `model`
-to values supported by that provider.
+### Agent examples
 
-### Talk to the Agent
-
-Choose **Enter optional Agent** from the main shell, or start it directly:
+Start the conversational interface:
 
 ```powershell
 topoalign agent
 ```
 
-Example conversation:
+CPU request:
 
 ```text
-You> inspect fixed.tif and moving.tif, then run rigid registration into outputs/sample-01
-
-Agent> Thinking...
-
-Agent> The registration completed. The moving-to-fixed transform and result manifest were written to outputs/sample-01.
+You> Inspect the runtime and both images. Use CPU segmentation, run rigid registration, and diagnose the result.
 ```
 
-The `Thinking...` animation indicates that the model or a registration tool is
-still running. It is an activity indicator, not a display of private model
-reasoning.
+GPU request:
 
-Run a single Agent request without entering the REPL:
+```text
+You> Confirm that CUDA is available. Use GPU segmentation, register fixed.tif to moving.tif, and inspect the output quality.
+```
+
+Batch request:
+
+```text
+You> Inspect fixed.tif and every image in moving/, choose explicit parameters, run one-fixed-to-many-moving registration into outputs/batch-01, and diagnose every result.
+```
+
+One-shot usage:
 
 ```powershell
-topoalign agent --prompt "Inspect the project and explain the rigid registration inputs"
+topoalign agent --prompt "Inspect the runtime and explain whether CPU or GPU mode is available"
 ```
+
+The Agent shows `Thinking...` while a model request or local tool is still
+running. This is an activity indicator, not private model reasoning.
 
 ### Agent commands
 
-Enter `/+` inside the Agent to display the command list.
+Enter `/+` inside the Agent to show the command list.
 
 | Command | Action |
 |---|---|
 | `/model` | Show the current model |
-| `/model <id>` | Validate and switch to a model |
-| `/api` | Test the configured API URL, key, and model |
+| `/model <id>` | Validate and switch model |
+| `/api` | Test the configured URL, key, and model |
 | `/config` | Show active configuration with the key redacted |
-| `/reload` | Reload `topoalign.config.json` |
-| `/tools` | List the allowlisted Agent tools |
+| `/reload` | Reload the local JSON configuration |
+| `/tools` | List allowlisted Agent tools |
 | `/local <command>` | Run a local TopoAlign command |
 | `/result` | Read the latest `result.json` |
-| `/artifacts` | List outputs from the latest run |
-| `/clear` | Clear the current model conversation context |
-| `/exit` | Return to the TopoAlign main shell |
+| `/artifacts` | List the latest output artifacts |
+| `/clear` | Clear model conversation context |
+| `/exit` | Return to the TopoAlign main interface |
 
-The Agent can inspect project files, validate inputs and configuration, run
-registration stages, and read structured results. Source-code modification,
-arbitrary shell execution, and access outside the selected workspace are not
-enabled.
+The project-local `.agents/skills/topoalign-analysis` instructions are shared
+by the CLI Agent and Web Assistant.
+
+## JSON registration configuration
+
+The credential-free template is `topoalign.config.example.json`. Copy it to
+`topoalign.config.json`, then edit local values:
+
+```powershell
+Copy-Item topoalign.config.example.json topoalign.config.json
+topoalign run --config topoalign.config.json
+```
+
+Important sections:
+
+```text
+cli
+agent
+registration
+  segmentation
+  matching
+  transform
+  output
+```
+
+Set `registration.segmentation.gpu` to `false` for CPU or `true` for GPU.
+Command-line parameters override JSON values. `topoalign.config.json` is
+ignored by Git because it may contain credentials and local paths.
 
 ## Output files
 
-A complete image run writes structured artifacts such as the following to the
-selected output directory (the exact files depend on the supplied inputs and
-output settings):
+A complete image run can produce:
 
 ```text
 outputs/run-001/
-├── config.resolved.json
-├── result.json
-├── diagnostics.json
-├── fixed_features.csv
-├── moving_features.csv
-├── matches.csv
-├── transform.moving_to_fixed.json
-├── registered_moving.tif
-├── valid_overlap_mask.tif
-└── overlay.tif
+|-- config.resolved.json
+|-- result.json
+|-- diagnostics.json
+|-- fixed_features.csv
+|-- moving_features.csv
+|-- matches.csv
+|-- transform.moving_to_fixed.json
+|-- registered_moving.tif
+|-- valid_overlap_mask.tif
+`-- overlay.tif
 ```
 
-`registered_moving.tif` contains only the warped moving image.
-`overlay.tif` is stored separately. The transform direction is always named
-`moving_to_fixed` in output manifests.
+The exact files depend on the input mode and output settings.
+`registered_moving.tif` contains only the warped moving image; the visualization
+is stored separately as `overlay.tif`. Transform direction is always named
+`moving_to_fixed` in structured outputs.
 
-## napari plugin
+## napari usage
 
-Install the plugin from the repository:
+The root requirements install napari. Install the plugin package and launch:
 
 ```powershell
 pip install -e .\napari-cell-registration
@@ -338,49 +500,53 @@ napari
 ```
 
 Open the TopoAlign/cell-registration widgets from napari's **Plugins** menu.
-The napari interface and CLI expose the same registration workflow through
-different user interfaces.
+Choose the GPU option only when `torch.cuda.is_available()` is `True`.
 
 ## Legacy entry point
 
-Existing scripts can continue using the original package namespace:
+The original Python namespace remains available for existing scripts:
 
 ```powershell
 python -m cell_registration.main fixed.tif moving.tif
 ```
 
-The public application and command name is `TopoAlign`; the
-`cell_registration` Python namespace remains available for compatibility.
+The public application and command name is `TopoAlign`.
 
 ## Troubleshooting
 
 ### `topoalign` is not recognized
 
-Activate the environment where TopoAlign was installed and reinstall the
-editable package:
-
 ```powershell
-conda activate topoalign
-pip install -e .
+conda activate cell_registration_cpu  # or cell_registration_gpu
+pip install -e ".[agent]"
 ```
 
-### Agent dependency is missing
+### GPU is enabled but CUDA is unavailable
 
 ```powershell
-pip install -e ".[agent]"
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+If the final value is `False`, reinstall a PyTorch wheel compatible with the
+local NVIDIA driver or continue with `--no-gpu`.
+
+### Web server dependencies are missing
+
+```powershell
+pip install -r webapp/requirements.txt
 ```
 
 ### Agent model cannot be called
 
-Use `/api` to test the complete URL/key/model combination. Use
-`/model <id>` to validate a specific model before switching. TopoAlign does not
-treat a provider's public model catalog as proof that the current API key can
-call every model.
+Use `/api` to test the complete URL/key/model combination and `/model <id>` to
+validate a model before switching. A provider's public model catalog does not
+prove that the current API key can call every listed model.
 
-### Local registration without an API key
+### Run without an API key
 
-Use any local command directly. Agent configuration is optional:
+Use CLI, Web registration, or napari directly. Only Agent conversations need
+an API key:
 
 ```powershell
-topoalign run --fixed fixed.tif --moving moving.tif --output-dir outputs/local-run
+topoalign run --fixed fixed.tif --moving moving.tif --no-gpu --output-dir outputs/local-run
 ```
