@@ -1,0 +1,17 @@
+body,
+.wy-nav-content-wrap {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+}
+
+.wy-nav-content {
+  max-width: 980px;
+}
+
+.rst-content p,
+.rst-content li {
+  line-height: 1.75;
+}
+
+.wy-side-nav-search > a img.logo {
+  width: 220px;
+}

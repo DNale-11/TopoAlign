@@ -10,7 +10,15 @@
   [![GPU](https://img.shields.io/badge/Runtime-NVIDIA%20GPU-76B900?logo=nvidia&logoColor=white)](#gpu-installation)
   [![Web](https://img.shields.io/badge/UI-Web-0EA5E9)](#web-usage)
   [![Agent](https://img.shields.io/badge/Agent-optional-19A974)](#agent-usage)
+  [![Documentation](https://img.shields.io/badge/docs-Read%20the%20Docs-8CA1AF?logo=readthedocs&logoColor=white)](https://topoalign.readthedocs.io/en/latest/)
 </div>
+
+<p align="center">
+  <a href="https://topoalign.readthedocs.io/en/latest/"><strong>Documentation</strong></a>
+  · <a href="https://topoalign.readthedocs.io/en/latest/quickstart.html">Quick Start</a>
+  · <a href="https://topoalign.readthedocs.io/en/latest/web_guide.html">Web Guide</a>
+  · <a href="https://topoalign.readthedocs.io/en/latest/cli_guide.html">CLI Guide</a>
+</p>
 
 TopoAlign provides four ways to run the same registration workflow:
 
