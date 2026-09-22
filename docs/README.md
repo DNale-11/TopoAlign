@@ -1,25 +1,27 @@
 # TopoAlign User Manual
 
+Read the complete [online user manual](https://topoalign.readthedocs.io/en/latest/) on Read the Docs.
+
 This English manual covers the public TopoAlign 0.1.0 source at commit
 `693c6781e162`. Start with installation and the synthetic mask example, then
 choose the CLI, napari, or optional Agent workflow.
 
-## Read the manual on GitHub
+## Read the online manual
 
-- [Overview](overview.rst): workflow, inputs, coordinates, and interface selection.
-- [Installation](installation.rst): core CLI, CPU/GPU segmentation, napari, and Agent setup.
-- [Quick start](quickstart.rst): a reproducible mask example and your first image pair.
-- [CLI guide](cli_guide.rst): complete runs, individual stages, data schemas, and batches.
-- [napari guide](napari_guide.rst): widgets, manual segmentation, registration, and WSI.
-- [Agent guide](agent_guide.rst): API setup, conversation commands, and local tool use.
-- [Parameters](parameters.rst): defaults, configuration files, and tuning.
-- [Outputs and quality control](outputs.rst): generated files, coordinates, and diagnostics.
-- [Troubleshooting](troubleshooting.rst): symptoms, recovery steps, and known limitations.
-- [Web interface availability](web_guide.rst): why earlier Web commands are absent from this revision.
+- [Overview](https://topoalign.readthedocs.io/en/latest/overview.html): workflow, inputs, coordinates, and interface selection.
+- [Installation](https://topoalign.readthedocs.io/en/latest/installation.html): core CLI, CPU/GPU segmentation, napari, and Agent setup.
+- [Quick start](https://topoalign.readthedocs.io/en/latest/quickstart.html): a reproducible mask example and your first image pair.
+- [CLI guide](https://topoalign.readthedocs.io/en/latest/cli_guide.html): complete runs, individual stages, data schemas, and batches.
+- [napari guide](https://topoalign.readthedocs.io/en/latest/napari_guide.html): widgets, manual segmentation, registration, and WSI.
+- [Agent guide](https://topoalign.readthedocs.io/en/latest/agent_guide.html): API setup, conversation commands, and local tool use.
+- [Parameters](https://topoalign.readthedocs.io/en/latest/parameters.html): defaults, configuration files, and tuning.
+- [Outputs and quality control](https://topoalign.readthedocs.io/en/latest/outputs.html): generated files, coordinates, and diagnostics.
+- [Troubleshooting](https://topoalign.readthedocs.io/en/latest/troubleshooting.html): symptoms, recovery steps, and known limitations.
+- [Web interface availability](https://topoalign.readthedocs.io/en/latest/web_guide.html): why earlier Web commands are absent from this revision.
 
-The `.rst` pages are the source of the Sphinx manual. GitHub displays their
-content, but Sphinx-specific cross-references and download directives work best
-in the HTML build. The links above provide navigation directly on GitHub.
+The links above open the published documentation website. This directory
+contains the Sphinx source used to build that website; the instructions below
+are for documentation maintainers.
 
 ## Build the HTML manual
 

@@ -5,8 +5,8 @@
 
   **Topology-guided cellular image registration**
 
-  [![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](docs/installation.rst)
-  [![Documentation](https://img.shields.io/badge/docs-User%20Manual-8CA1AF?logo=readthedocs&logoColor=white)](docs/README.md)
+  [![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://topoalign.readthedocs.io/en/latest/installation.html)
+  [![Documentation](https://img.shields.io/badge/docs-User%20Manual-8CA1AF?logo=readthedocs&logoColor=white)](https://topoalign.readthedocs.io/en/latest/)
 </div>
 
 TopoAlign registers cellular microscopy images using cell morphology and local
@@ -19,21 +19,21 @@ Fixed space; CLI transform files record the direction as `moving_to_fixed`.
 
 ## User manual
 
-Read the [English User Manual](docs/README.md) for the complete documentation.
+Read the [English User Manual](https://topoalign.readthedocs.io/en/latest/) for the complete documentation.
 
 | Task | Guide |
 |---|---|
-| Install the core CLI or CPU/GPU image environment | [Installation](docs/installation.rst) |
-| Try a small reproducible example | [Quick start](docs/quickstart.rst) |
-| Run single pairs, individual stages, or scripted batches | [CLI guide](docs/cli_guide.rst) |
-| Inspect images and edit masks interactively | [napari guide](docs/napari_guide.rst) |
-| Configure optional API-assisted operation | [Agent guide](docs/agent_guide.rst) |
-| Choose parameters and assess alignment | [Parameters](docs/parameters.rst) and [outputs](docs/outputs.rst) |
-| Resolve common problems | [Troubleshooting](docs/troubleshooting.rst) |
+| Install the core CLI or CPU/GPU image environment | [Installation](https://topoalign.readthedocs.io/en/latest/installation.html) |
+| Try a small reproducible example | [Quick start](https://topoalign.readthedocs.io/en/latest/quickstart.html) |
+| Run single pairs, individual stages, or scripted batches | [CLI guide](https://topoalign.readthedocs.io/en/latest/cli_guide.html) |
+| Inspect images and edit masks interactively | [napari guide](https://topoalign.readthedocs.io/en/latest/napari_guide.html) |
+| Configure optional API-assisted operation | [Agent guide](https://topoalign.readthedocs.io/en/latest/agent_guide.html) |
+| Choose parameters and assess alignment | [Parameters](https://topoalign.readthedocs.io/en/latest/parameters.html) and [outputs](https://topoalign.readthedocs.io/en/latest/outputs.html) |
+| Resolve common problems | [Troubleshooting](https://topoalign.readthedocs.io/en/latest/troubleshooting.html) |
 
 The manual describes public version 0.1.0. CLI and napari pipelines have
 different defaults and export conventions. The documented source revision
-does not include a Web server; see [Web interface availability](docs/web_guide.rst).
+does not include a Web server; see [Web interface availability](https://topoalign.readthedocs.io/en/latest/web_guide.html).
 
 ## Quick installation check
 
@@ -58,15 +58,9 @@ The example should recover 12 matches and a Moving-to-Fixed translation of
 biological accuracy benchmark. Use a new output directory for each run.
 
 For raw-image segmentation, use the manual's
-[CPU or GPU installation](docs/installation.rst). The published requirements
+[CPU or GPU installation](https://topoalign.readthedocs.io/en/latest/installation.html). The published requirements
 constrain PyTorch to `>=2.2,<2.5`; follow the matching PyTorch/torchvision
 versions in that guide.
-
-## Documentation development
-
-The manual uses Sphinx and supports Read the Docs. See
-[build and publishing instructions](docs/README.md#build-the-html-manual).
-Documentation builds use a separate Python 3.11 environment.
 
 Report reproducible problems through
 [GitHub Issues](https://github.com/DNale-11/TopoAlign/issues).
