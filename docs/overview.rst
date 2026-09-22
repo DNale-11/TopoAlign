@@ -1,72 +1,123 @@
-概览
-====
+Overview
+========
 
-工作流程
---------
+What TopoAlign does
+-------------------
 
-TopoAlign 的标准配准流程由五个阶段组成：
+TopoAlign estimates alignment from corresponding cells. It can segment images,
+extract cell features from instance masks, identify corresponding cells, and
+fit a geometric transform. The command-line workflow can start at any of these
+stages, so existing segmentation and feature tables can be reused.
 
-#. **分割**：从 Fixed 与 Moving 的核或细胞通道生成实例标签 mask。
-#. **特征提取**：计算质心、面积、形态以及局部邻域拓扑特征。
-#. **匹配**：先估计粗对齐，再选择一组一对一且空间分布尽量均匀的细胞对应关系。
-#. **变换估计**：由匹配细胞的质心拟合刚性、相似或仿射变换。
-#. **重采样与质检**：将 Moving 映射到 Fixed 空间，输出叠加图、残差和结构化诊断。
+The typical CLI workflow is::
 
-接口选择
---------
+   Fixed image   -> Fixed mask   -> Fixed features  --+
+                                                     +-> Matches -> Transform
+   Moving image  -> Moving mask  -> Moving features --+                |
+                                                                      v
+                         Fixed coordinates <- Resampled Moving image
+
+The same tissue structures must be identifiable in both inputs. Segmentation
+quality, overlapping field of view, and the spatial distribution of correct
+matches determine whether a fitted transform is useful. A completed run is not
+by itself evidence of a biologically correct alignment.
+
+Choose an interface
+-------------------
 
 .. list-table::
    :header-rows: 1
-   :widths: 14 40 26 20
+   :widths: 18 46 20 16
 
-   * - 入口
-     - 适合场景
-     - 启动方式
-     - API Key
-   * - Web
-     - 新用户、可视化质检、1 张 Fixed 配准多张 Moving
-     - ``python webapp/backend.py``
-     - 本地配准不需要
+   * - Interface
+     - Use it for
+     - Start command
+     - API key
    * - CLI
-     - 可复现分析、脚本和分阶段运行
-     - ``topoalign``
-     - 不需要
+     - Reproducible registration, saved configurations, individual stages,
+       and scripted batches
+     - ``topoalign --help``
+     - Not required
    * - napari
-     - 交互式分割、人工修订和 WSI 工作流
+     - Image and label inspection, manual segmentation, interactive
+       registration, and dedicated WSI tools
      - ``napari``
-     - 不需要
+     - Not required
    * - Agent
-     - 自然语言配置、执行和结果诊断
+     - Natural-language assistance with the local CLI workflow
      - ``topoalign agent``
-     - 需要
+     - Required
 
-输入与坐标约定
---------------
+The CLI and napari share the project name but use separate implementations.
+CLI registration offers rigid, similarity, and affine transforms. The napari
+Normal workflow can refine a rigid alignment with thin-plate splines (TPS),
+while its WSI workflow has additional metadata requirements. Do not assume that
+identical-looking parameters or exported files are interchangeable.
 
-* 常规图像可使用 TIFF、PNG 或 JPEG；Web 文件选择器当前接受 TIFF 和 PNG。
-* 可直接输入原始图像，也可复用已有的标签 mask、特征表或匹配表。
-* 标签 mask 中 ``0`` 必须代表背景，每个细胞实例使用独立的正整数标签。
-* Fixed 与 Moving 可以尺寸不同；输出图像使用 Fixed 的空间尺寸。
-* 如果输入为多通道图像，请确认通道轴和用于分割的通道索引。
-* 所有变换文件都描述 Moving 到 Fixed 的映射，不要反向套用。
+Inputs and coordinates
+----------------------
 
-CLI 变换模型
-------------
+**Images.** Common inputs are TIFF, PNG, and JPEG. Use lossless source images
+when possible. Check the array shape and dtype with ``topoalign inspect``, then
+review the intensity range and channel contents in an image viewer before
+segmentation. Automatic interpretation uses array shape rather than a complete
+microscopy metadata model.
+
+**Masks.** Supply integer instance labels: ``0`` for background and a distinct
+positive label for each cell. A binary foreground mask is not an instance
+segmentation. Save masks as TIFF, retaining the integer labels; a colorized
+preview or JPEG cannot substitute for a label mask.
+
+**Feature tables.** Reuse TopoAlign-generated CSV files whenever possible.
+Default matching uses morphology and neighborhood features as well as
+centroids. See :doc:`cli_guide` for the full schema and index conventions.
+
+**Coordinates.** Image shapes are written as ``[height, width]`` or ``[Y, X]``.
+Feature and transform coordinates are ``(x, y)`` in pixels: ``x`` is the column
+and ``y`` is the row. Fixed and Moving may have different image dimensions.
+The registered Moving image uses the Fixed canvas, so content outside that
+canvas is clipped.
+
+**Multichannel data.** Select the actual cell or nuclear channel deliberately.
+Channel indices are zero-based; ``-1`` selects the last channel. For ``C,Y,X``
+images, set ``--channel-axis first``. For ``Y,X,C`` images, set
+``--channel-axis last``; see the current limitations in :doc:`troubleshooting`.
+
+**Z-stacks.** Some segmentation paths accept Z-stacks and project their masks
+to two dimensions. The CLI registration and transform described here are 2D;
+this is not a general volumetric registration pipeline. For a first run, prepare
+and inspect a 2D projection yourself.
+
+Choose a transform
+------------------
 
 ``rigid``
-   只估计旋转和平移。应作为首选基线，参数最少、最容易诊断。
+   Rotation and translation. Start here when pixel size and tissue geometry
+   are comparable.
 
 ``similarity``
-   在刚性变换基础上增加统一缩放。仅当两轮图像存在明确倍率差异时使用。
+   Rotation, translation, and a single scale factor. Use it when an isotropic
+   scale difference is plausible.
 
 ``affine``
-   允许各向异性缩放和剪切。自由度更高，需要更多、分布更广且可信的匹配点。
+   Rotation, translation, anisotropic scaling, and shear. It needs well-spread,
+   reliable correspondences; flexibility can also fit incorrect matches.
 
-这些模型选项属于主 CLI。Web Normal 当前固定使用 ``similarity``；napari Normal
-使用刚性基线，并在控制点足够时自动执行 TPS。各入口不是同一套默认算法。
+These names apply to the CLI. Read :doc:`napari_guide` before choosing Normal,
+WSI, or TPS behavior in the plugin.
 
-质量原则
---------
+A practical analysis workflow
+-----------------------------
 
-TopoAlign 的质量标签和阈值是工程启发式，不是生物学真值。正式分析应同时检查：
-匹配数量与空间分布、残差统计、叠加图、有效重叠区域，以及组织结构是否合理。
+#. Pick a representative overlapping region and a common cell or nuclear channel.
+#. Inspect both images, then inspect the segmentation masks before matching.
+#. Establish a rigid baseline in a new output directory.
+#. Check match locations, residuals, overlap coverage, and tissue alignment.
+#. Adjust one parameter group at a time and compare results on the same region.
+#. Save the configuration and software version with the selected result.
+#. Apply the selected workflow to additional images, using a distinct output
+   directory for every Moving input.
+
+Residuals describe agreement at fitted matches, not accuracy everywhere in the
+image. When quantitative accuracy matters, evaluate independent landmarks that
+were not used to estimate the transform.

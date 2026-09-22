@@ -1,166 +1,233 @@
-输出文件与质量判读
-==================
+Outputs and quality checks
+==========================
 
-建议检查顺序
-------------
+This page describes the CLI exports. The napari plugin has different save
+controls and filenames; see :doc:`napari_guide`.
 
-#. 确认 ``result.json`` 存在且任务没有记录错误。
-#. 检查 Fixed/Moving 分割是否合理。
-#. 检查匹配数量和匹配点是否覆盖整个有效视野。
-#. 查看 ``overlay.tif`` 是否在组织边缘与细胞结构上同时对齐。
-#. 查看平均、P95/最大残差，并寻找局部系统性偏差。
-#. 确认有效重叠区域足以支持后续分析。
+Full-pipeline outputs
+---------------------
 
-CLI 完整流程与 Web Normal
--------------------------
-
-默认完整输出通常为：
+A successful image-based ``topoalign run`` with default save settings produces:
 
 .. code-block:: text
 
    <output_dir>/
-   ├── segmentation_fixed/
-   │   ├── mask.tif
-   │   └── segmentation.json
-   ├── segmentation_moving/
-   │   ├── mask.tif
-   │   └── segmentation.json
-   ├── config.resolved.json
-   ├── fixed_features.csv
-   ├── moving_features.csv
-   ├── matches.csv
-   ├── transform.moving_to_fixed.json
-   ├── registered_moving.tif
-   ├── valid_overlap_mask.tif
-   ├── overlay.tif
-   ├── diagnostics.json
-   └── result.json
+   |-- segmentation_fixed/
+   |   |-- mask.tif
+   |   `-- segmentation.json
+   |-- segmentation_moving/
+   |   |-- mask.tif
+   |   `-- segmentation.json
+   |-- config.resolved.json
+   |-- fixed_features.csv
+   |-- moving_features.csv
+   |-- matches.csv
+   |-- transform.moving_to_fixed.json
+   |-- registered_moving.tif
+   |-- valid_overlap_mask.tif
+   |-- overlay.tif
+   |-- diagnostics.json
+   `-- result.json
 
-提供已有 mask/features、关闭保存选项或没有可重采样的 Moving 图像时，部分文件不会生成。
-``result.json`` 是完成清单；运行异常时可能已经留下部分中间文件，但还没有最终清单。
-
-.. list-table:: 主要文件
-   :header-rows: 1
-   :widths: 34 66
-
-   * - 文件
-     - 含义
-   * - ``config.resolved.json``
-     - 本次运行实际使用的完整 registration 配置
-   * - ``fixed_features.csv`` / ``moving_features.csv``
-     - 细胞质心、形态、归一化位置和拓扑特征
-   * - ``matches.csv``
-     - 一对一匹配及最终 ``residual_px``
-   * - ``transform.moving_to_fixed.json``
-     - 3×3 像素坐标变换矩阵及方向说明
-   * - ``registered_moving.tif``
-     - Moving 重采样到 Fixed 尺寸后的图像或 mask
-   * - ``valid_overlap_mask.tif``
-     - Moving 有效像素域经过几何变换后在 Fixed 中的覆盖
-   * - ``overlay.tif``
-     - Fixed 为洋红、registered Moving 为绿色；共同高亮处接近白色
-   * - ``diagnostics.json``
-     - 匹配数、残差、耗时、警告与错误
-   * - ``result.json``
-     - 任务状态、阶段耗时、诊断和 artifact 路径的结构化清单
-
-.. note::
-
-   ``valid_overlap_mask.tif`` 表示几何有效覆盖，不是细胞重叠率，也不是配准正确率。
-
-CLI 分阶段输出
---------------
+This is a conditional set of files, not a required checklist for every workflow.
 
 .. list-table::
    :header-rows: 1
-   :widths: 25 75
+   :widths: 34 66
 
-   * - 命令
-     - 固定输出
-   * - ``segment``
-     - ``mask.tif``、``segmentation.json``
-   * - ``features``
-     - ``features.csv``、``features.json``
-   * - ``match``
-     - ``matches.csv``、``matching_diagnostics.json``
-   * - ``transform``
-     - ``transform.moving_to_fixed.json``、``matches.with_residuals.csv``
-   * - ``warp``
-     - ``registered_moving.tif``、``valid_overlap_mask.tif``
-   * - ``inspect``
-     - 只打印检查结果，不写新的分析文件
+   * - File
+     - Contents and export condition
+   * - ``segmentation_fixed/``, ``segmentation_moving/``
+     - Created only for a side segmented during this run. Existing input masks are not copied here.
+   * - ``config.resolved.json``
+     - Effective registration configuration, written at the start. Its presence does not prove success.
+   * - ``fixed_features.csv``, ``moving_features.csv``
+     - Feature tables used for registration, if ``save_features`` is true.
+   * - ``matches.csv``
+     - Final match table with ``residual_px``. Written after transform fitting, including when ``save_matches`` is false.
+   * - ``transform.moving_to_fixed.json``
+     - Method, direction, coordinate space, and 3-by-3 transform matrix.
+   * - ``registered_moving.tif``
+     - Moving intensity data, or the Moving mask when no Moving image was supplied. Requires a resampling source and ``save_registered_moving=true``.
+   * - ``valid_overlap_mask.tif``
+     - Binary geometric coverage in the Fixed output grid. Written whenever warping runs, independent of the image save switch.
+   * - ``overlay.tif``
+     - RGB comparison of Fixed (magenta) and registered Moving (green), when enabled and their display projections have matching shapes.
+   * - ``diagnostics.json``
+     - Match count, transform, mean and maximum residual, elapsed time, warnings, and errors.
+   * - ``result.json``
+     - Completed-run manifest containing stage timings, artifact paths, and diagnostics.
 
-``--json`` 只改变标准输出格式，不会阻止上述文件写入。即使 ``warp --mask``，输出文件名
-仍为 ``registered_moving.tif``。
-
-Web 输出差异
-------------
-
-Web Normal 与 CLI 完整流程使用同一注册服务，因此文件结构基本相同；任务目录位于
-``data/tasks/<task_id>``。顶部 **Download** 只下载当前活动结果的
-``registered_moving.tif``，不会打包整个目录或整个批次。
-
-Web WSI 当前只写：
-
-.. code-block:: text
-
-   segmentation_fixed/
-   segmentation_moving/
-   registered_moving.tif
-   registered_mask.tif
-   overlay.tif
-   matches.csv
-   result.json
-
-它不会生成 ``config.resolved.json``、``diagnostics.json``、有效重叠 mask、特征表或
-可下载的 transform JSON。输出是普通 TIFF，而不是保留金字塔与 slide 元数据的 WSI。
-
-napari 输出差异
----------------
-
-napari 所有保存选项默认关闭；默认只有图层和通知消息。
-
-Normal（TPS 成功路径）启用 ``save_results`` 后通常写出：
-
-* ``registered_image.tif``、``registered_mask.tif``
-* ``features_round1.csv``、``features_round2.csv``、``matches.csv``
-* ``registered_features_round2.csv``、``registered_centroids_round2.csv``
-* ``transform_info.txt``
+A feature-only run with no Moving image or mask has no warp, overlap-mask, or
+overlay output. When reusing features and also supplying a Moving image, supply
+a Fixed image/mask for the overlay or set ``output.save_overlay=false``.
+To set the output grid without a Fixed mask, use ``fixed_shape`` in the
+registration JSON.
 
 .. warning::
 
-   对同形 2D 图像，napari Normal 的 ``registered_image.tif`` 是 Fixed 与已配准
-   Moving 的逐像素最大值融合图；``registered_mask.tif`` 也会用 Fixed mask 填补
-   Moving 变换后的零区域。它们不是 CLI/Web 中的纯 registered Moving。
+   Files can remain after an unsuccessful run. The release does not write a
+   final failure manifest when an exception interrupts the pipeline, and an old
+   ``result.json`` can remain if an output directory is reused. Use a new
+   directory for each run and check the command's exit status and terminal log.
 
-FISH 模式保存纯 Moving 结果，文件名为 ``registered_image_fish.tif``、
-``registered_mask_fish_pure_moving.tif``、``matches_fish_topology.csv`` 和
-``transform_fish.txt``。
+The manifest has ``product``, ``status``, ``run_id``, ``stages``,
+``artifacts``, ``diagnostics``, ``warnings``, and ``errors`` fields.
+Artifact paths may be relative to the working directory from which the command
+ran. Do not automatically interpret them as relative to ``result.json``.
+The segmentation directories are not individually indexed in the artifact map.
+When ``save_matches=false``, the final match CSV can exist without a
+``matches`` entry in that map.
 
-napari WSI 启用保存后写 level-0 质心表、``wsi_centroid_matches.csv``、
-``local_deformation_grid_he_level0.csv``、``wsi_transform.json``、标准化元数据 JSON
-和 ``centroid_registration_preview.tif``。它不自动写完整的多通道 registered WSI。
+Stage-command outputs
+---------------------
 
-数值解释
---------
+.. list-table::
+   :header-rows: 1
+   :widths: 22 78
 
-匹配数量
-   太少时模型不稳定；数量很多也不代表正确。优先检查是否覆盖视野四周和组织主要区域。
+   * - Command
+     - Files written in its output directory
+   * - ``segment``
+     - ``mask.tif``, ``segmentation.json``
+   * - ``features``
+     - ``features.csv``, ``features.json``
+   * - ``match``
+     - ``matches.csv``, ``matching_diagnostics.json``
+   * - ``transform``
+     - ``transform.moving_to_fixed.json``, ``matches.with_residuals.csv``
+   * - ``warp``
+     - ``registered_moving.tif``, ``valid_overlap_mask.tif``
+   * - ``inspect``
+     - None; prints inspection information.
 
-``residual_px``
-   匹配点经过拟合后在 Fixed 像素坐标中的欧氏误差。低残差可能来自少量或局部聚集的
-   匹配，因此必须结合空间覆盖。
+``segment`` metadata records the source path, mode, mask shapes, channel
+settings, and GPU flag. For a Z-stack, ``mask_shape`` describes the 3D result,
+while the saved ``mask.tif`` is the 2D projection described by
+``projected_mask_shape``. The CLI does not save the 3D label volume here.
+``features.json`` records the source mask, projected shape, cell count, and
+column names. ``matching_diagnostics.json`` contains the match count and
+reference shape; it has no post-fit residuals.
 
-平均与最大/P95
-   平均值描述总体拟合，P95 或最大值帮助发现离群和局部错配。阈值需要按像素尺寸与
-   细胞直径校准。
+Feature table schema
+--------------------
 
-Overlay
-   观察全局旋转/平移、组织边缘、局部细胞结构和空白边界。不要只看最亮的一小块。
+The tables exported by ``features`` and by mask/image-based ``run`` have one
+row per retained instance. Area filtering happens before neighborhood descriptors
+are calculated. Features are computed from label geometry, not image intensity.
 
-数据类型
---------
+.. list-table::
+   :header-rows: 1
+   :widths: 46 54
 
-CLI 完整流程和 Web Normal 读取强度图时通常转换为 ``float32``，因此
-``registered_moving.tif`` 往往也是 float32。独立 ``topoalign warp`` 和 napari
-常规/FISH 路径会尽量转换回输入 dtype。下游软件若依赖位深，应在导入前检查 dtype。
+   * - Columns
+     - Meaning
+   * - ``cell_id``
+     - Original instance label. It need not equal the feature row number.
+   * - ``centroid_x``, ``centroid_y``
+     - Cell centroid in pixel column/row coordinates.
+   * - ``area``, ``perimeter``
+     - Region area in pixels and boundary-length estimate in pixels.
+   * - ``eccentricity``, ``solidity``, ``major_axis_length``, ``minor_axis_length``, ``orientation``
+     - Region properties from scikit-image; axis lengths are in pixels and orientation is in radians.
+   * - ``roundness``
+     - ``4 * pi * area / perimeter**2``, with safe handling of zero perimeter.
+   * - ``aspect_ratio``, ``elongation``, ``equivalent_diameter``
+     - Major/minor axis ratio, ``1 - minor/major`` clipped to [0, 1], and diameter of an equal-area circle.
+   * - ``pos_x_norm``, ``pos_y_norm``
+     - Centroid divided by the mask width and height, respectively.
+   * - ``axis_vec_x``, ``axis_vec_y``
+     - Cosine and sine of the stored orientation.
+   * - ``nn_dist_1``, ``nn_dist_2``, ``nn_dist_3``
+     - Neighbor distances normalized by the median nearest-neighbor distance, with that scale bounded below by one pixel.
+   * - ``local_density``
+     - The same global distance scale divided by mean neighbor distance.
+   * - ``neighbor_area_ratio_mean``, ``neighbor_roundness_mean``
+     - Mean neighboring area relative to the current cell area, and mean neighboring roundness.
+
+The automatic matcher requires the ten morphology columns ``area``,
+``perimeter``, ``roundness``, ``eccentricity``, ``solidity``,
+``major_axis_length``, ``minor_axis_length``, ``aspect_ratio``,
+``elongation``, and ``equivalent_diameter``, plus the six neighborhood
+columns in the last three rows of the table, centroid coordinates, and normalized
+positions under the default settings. Preserve the complete generated table
+when exchanging data between stages. Disabling a feature weight does not remove
+all column checks.
+
+If feature CSVs are supplied to ``run``, the exported tables retain the supplied
+columns; missing morphology is not reconstructed. Coordinate-only tables are
+usable when matches are supplied explicitly.
+
+Match table schema
+------------------
+
+``idx1`` and ``idx2`` index the Fixed and Moving feature rows, starting at zero.
+``cell_id_1`` and ``cell_id_2`` report the corresponding labels.
+``distance`` is the weighted matching score; smaller means a better match
+under the chosen scoring settings. It is not the fitted geometric error or a
+probability. Columns ending in ``_1`` and ``_2`` report the paired feature
+values. Cluster-based matching can also include ``cluster_id``.
+
+After transform fitting, ``residual_px`` is the Euclidean distance between the
+transformed Moving centroid and its Fixed partner, in Fixed pixels. Residual
+pruning can remove rows and refit the transform. RANSAC fitting alone does not
+remove all non-inlier rows from the exported table or mark them with an inlier
+column; inspect residuals as well.
+
+Transform convention
+--------------------
+
+The matrix maps Moving points to Fixed points:
+
+.. code-block:: text
+
+   [x_fixed, y_fixed, 1]^T = matrix @ [x_moving, y_moving, 1]^T
+
+Here ``x`` is the image column and ``y`` is the image row. The full pipeline
+records ``"direction": "moving_to_fixed"`` and
+``"coordinate_space": "pixel_xy"``. The standalone ``transform`` export
+omits ``coordinate_space`` but uses the same convention. Pass this file directly
+to ``topoalign warp``; the resampler handles the inverse mapping internally.
+These files describe global rigid, similarity, or affine geometry, not a
+deformation field.
+
+Image types and display
+-----------------------
+
+``run`` loads intensity images as ``float32``, so its registered intensity
+output is also normally ``float32``. Loaded/generated masks are ``int32``.
+Standalone ``warp`` preserves the input dtype, rounding and clipping integer
+results after interpolation. Both paths write ordinary TIFF files; they do not
+preserve a slide pyramid or reproduce all input metadata.
+
+The overlap mask is a ``uint8`` array with values 0 and 1. It represents the
+transformed rectangular Moving pixel domain, not cell overlap, tissue overlap,
+or registration accuracy.
+
+The overlay independently scales each display image between its 1st and 99th
+intensity percentiles and saves ``uint8`` RGB. Bright agreement appears white.
+Its projection helper uses the last channel for channel-last images with up to
+four channels, or a maximum projection over axis 0 for other three-dimensional
+arrays. It does not necessarily display the selected segmentation channel.
+Inspect relevant channels independently before accepting a result.
+
+Assess a result
+---------------
+
+#. Confirm that the command completed and that the manifest belongs to this run.
+#. Inspect masks for missed, merged, or spurious cells.
+#. Check that matched cells correspond visually and span the overlapping tissue,
+   rather than concentrating in one small region.
+#. Review global alignment, tissue edges, and individual cells in the overlay and
+   registered image.
+#. Review the distribution of ``residual_px`` together with spatial coverage.
+   The full-run diagnostics export the mean and maximum, not P95. Compute other
+   summaries from the final CSV if needed.
+#. Check whether the geometric field-of-view overlap is adequate for the
+   downstream analysis.
+
+``diagnostics.match_count`` in a full run is recorded **before** residual
+pruning. Count the final match CSV rows to obtain the retained count. Empty
+warning/error lists mean no messages were recorded; they are not a scientific
+quality assessment. Fit residuals are measured on the landmarks used to estimate
+the transform, so independent landmarks are preferable when measuring accuracy.

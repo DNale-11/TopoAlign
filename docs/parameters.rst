@@ -1,145 +1,270 @@
-参数说明与调优
-==============
+Parameter reference
+===================
 
-调参原则
+These are the released CLI defaults, before project/user settings or explicit
+arguments are applied. The napari plugin has its own controls and defaults; see
+:doc:`napari_guide`. See :doc:`cli_guide` for configuration precedence.
+
+In JSON, put each setting in its named section and use underscores, for example
+``"matching": {"top_k": 50}``. CLI flags use hyphens. Boolean flags accept both
+forms, such as ``--gpu`` and ``--no-gpu``,
+``--use-ransac`` and ``--no-use-ransac``. Optional numeric settings can be
+set to ``null`` in JSON; the CLI numeric flags do not accept the word ``null``.
+
+Inputs and output size
+----------------------
+
+.. list-table:: Top-level registration configuration
+   :header-rows: 1
+   :widths: 28 24 48
+
+   * - JSON key
+     - CLI flag / default
+     - Meaning
+   * - ``mode``
+     - ``--mode`` / ``auto``
+     - ``auto``, ``image``, ``mask``, or ``features``. Input paths determine execution.
+   * - ``fixed``, ``moving``
+     - ``--fixed``, ``--moving`` / ``null``
+     - Reference and source intensity images.
+   * - ``fixed_mask``, ``moving_mask``
+     - ``--fixed-mask``, ``--moving-mask`` / ``null``
+     - Existing instance label images.
+   * - ``fixed_features``, ``moving_features``
+     - ``--fixed-features``, ``--moving-features`` / ``null``
+     - Existing feature CSVs; take precedence over features extracted from masks.
+   * - ``matches``
+     - ``--matches`` / ``null``
+     - Existing match CSV, using feature row indices ``idx1`` and ``idx2``.
+   * - ``fixed_shape``
+     - JSON only on ``run`` / ``null``
+     - ``[height, width]`` in pixels. A Fixed mask takes precedence; otherwise this value precedes inference from centroid extents.
+
+The standalone ``match`` and ``warp`` commands accept
+``--fixed-shape HEIGHT WIDTH``; it is required for ``warp``. ``run`` does
+not accept that flag. Pass ``--config FILE`` to load registration-only JSON.
+
+Segmentation and feature filtering
+----------------------------------
+
+These settings belong to ``segmentation``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 16 54
+
+   * - JSON key / CLI flag
+     - Default
+     - Meaning
+   * - ``channel_axis`` / ``--channel-axis``
+     - ``auto``
+     - ``auto``, ``first``, ``last``, or ``none``; see the image-layout limits in :doc:`cli_guide`.
+   * - ``registration_channel`` / ``--registration-channel``
+     - ``-1``
+     - Zero-based segmentation channel for 2D multichannel inputs; ``-1`` selects the last channel.
+   * - ``gpu`` / ``--gpu``
+     - ``false``
+     - Use the GPU for Cellpose segmentation.
+   * - ``min_area`` / ``--min-area``
+     - ``null``
+     - Retain cells with area greater than or equal to this number of pixels.
+   * - ``max_area`` / ``--max-area``
+     - ``null``
+     - Retain cells with area less than or equal to this number of pixels.
+
+Area filtering applies during feature extraction; it does not remove labels
+from the saved mask. It is not reapplied to a supplied feature CSV. The
+standalone ``segment`` command accepts channel and GPU settings; standalone
+``features`` accepts the area bounds. Standalone ``match`` extracts mask
+features with default area bounds.
+
+The CLI uses Cellpose-SAM (``cpsam``) with diameter ``None``, flow threshold
+``0.4``, cell probability threshold ``0.0``, and minimum size ``15``.
+These model settings are not exposed as CLI flags or accepted keys in the
+registration JSON. Feature extraction uses three nearest neighbors for its
+topology descriptors.
+
+Matching
 --------
 
-#. 先确认 Fixed/Moving 方向和分割通道。
-#. 先用 ``rigid`` 建立基线。
-#. 一次只改变一组参数，并使用新的输出目录。
-#. 匹配数量、残差和叠加图必须一起判断。
-#. 只有存在明确倍率差或剪切证据时，才提高变换自由度。
+These settings belong to ``matching`` and are accepted by ``run`` and
+``match``.
 
-CLI 默认值
------------
-
-.. list-table:: 分割与输入
+.. list-table::
    :header-rows: 1
-   :widths: 30 20 50
+   :widths: 30 16 54
 
-   * - 参数
-     - 默认值
-     - 说明
-   * - ``channel_axis``
-     - ``auto``
-     - 自动判断通道轴；可显式设为 ``first``、``last`` 或 ``none``
-   * - ``registration_channel``
-     - ``-1``
-     - 用于分割的通道索引；``-1`` 为最后一个通道
-   * - ``gpu``
-     - ``false``
-     - 是否使用 GPU 运行 Cellpose-SAM
-   * - ``min_area`` / ``max_area``
-     - ``null``
-     - 特征提取时过滤过小或过大的实例
-
-.. list-table:: 匹配
-   :header-rows: 1
-   :widths: 30 20 50
-
-   * - 参数
-     - 默认值
-     - 说明
-   * - ``top_k``
+   * - JSON key / CLI flag
+     - Default
+     - Meaning
+   * - ``top_k`` / ``--top-k``
      - ``50``
-     - 最终保留的代表性高质量匹配数量上限
-   * - ``feature_weight``
+     - Target number of representative matches; see the coverage and clustering exceptions below.
+   * - ``feature_weight`` / ``--feature-weight``
      - ``1.0``
-     - 形态/强度等细胞特征在匹配代价中的权重
-   * - ``topology_weight``
+     - Weight of standardized morphological feature distances.
+   * - ``topology_weight`` / ``--topology-weight``
      - ``0.35``
-     - 局部邻域拓扑一致性的权重
-   * - ``position_weight``
+     - Weight of standardized local-neighborhood feature distances.
+   * - ``position_weight`` / ``--position-weight``
      - ``4.0``
-     - 粗对齐后空间位置一致性的权重
-   * - ``distance_threshold``
+     - Weight of normalized spatial distances after coarse alignment.
+   * - ``distance_threshold`` / ``--distance-threshold``
      - ``2.0``
-     - 候选匹配距离阈值
-   * - ``spatial_window_size``
-     - ``100.0`` px
-     - 粗对齐后搜索对应细胞的空间窗口
-   * - ``use_spatial_clusters``
+     - Matching-score cutoff; this is not a pixel distance. ``null`` disables this cutoff for fine matching, subject to the coverage behavior below.
+   * - ``spatial_window_size`` / ``--spatial-window-size``
+     - ``100.0``
+     - Spatial candidate window in pixels. ``null`` selects an internally derived guided window; it does not make fine matching unrestricted.
+   * - ``use_spatial_clusters`` / ``--use-spatial-clusters``
      - ``false``
-     - 是否按空间簇组织候选
-   * - ``n_clusters``
+     - Replace the final matches with matching performed separately within spatial clusters.
+   * - ``n_clusters`` / ``--n-clusters``
      - ``9``
-     - 启用空间簇后的簇数
-   * - ``use_topology_filtering``
-     - ``false``
-     - 是否启用额外拓扑一致性筛选
+     - Number of clusters when spatial clustering is enabled.
 
-高级拓扑参数 ``k_pos_nei=5``、``k_neighbor=5``、``tau_pos=0.5``、
-``tau_nei=0.3``、``tau_map=0.3`` 只在相应筛选启用后发挥作用。建议先保留默认值。
+The default matcher balances landmarks across a 2-by-2 grid of the Fixed field
+of view. Its first coverage pass may retain one available pair per region even
+when the matching score exceeds ``distance_threshold``. This can also exceed
+``top_k`` when that value is smaller than four. With spatial clustering enabled,
+``top_k`` is applied within each cluster, so the total can exceed it. Neither
+the score nor the count is an automatic quality guarantee.
 
-.. list-table:: 变换
+The coarse matching stage is attempted when each side contains at least 20
+cells. It uses morphology-guided candidates and a rigid coarse model even if the
+final method is similarity or affine. In ``run``,
+``ransac_residual_threshold`` and ``ransac_max_trials`` also influence this
+coarse fit: its residual threshold is ``max(5, 2 * threshold)`` pixels and its
+trial count is clamped to 200–2000. Disabling final RANSAC does not disable this
+coarse estimation.
+
+Accepted but inactive options
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following ``matching`` keys and corresponding flags are accepted and saved,
+but are not used by the released CLI registration service:
+
+.. list-table::
    :header-rows: 1
-   :widths: 30 20 50
+   :widths: 38 42 20
 
-   * - 参数
-     - 默认值
-     - 说明
-   * - ``method``
-     - ``rigid``
-     - ``rigid``、``similarity`` 或 ``affine``
-   * - ``use_ransac``
+   * - JSON key
+     - CLI flag
+     - Default
+   * - ``use_topology_filtering``
+     - ``--use-topology-filtering``
      - ``false``
-     - 使用 RANSAC 抑制离群匹配；当前只对 ``rigid`` 生效
-   * - ``ransac_max_trials``
+   * - ``k_pos_nei``
+     - ``--k-pos-nei``
+     - ``5``
+   * - ``k_neighbor``
+     - ``--k-neighbor``
+     - ``5``
+   * - ``tau_pos``
+     - ``--tau-pos``
+     - ``0.5``
+   * - ``tau_nei``
+     - ``--tau-nei``
+     - ``0.3``
+   * - ``tau_map``
+     - ``--tau-map``
+     - ``0.3``
+
+These inactive controls are separate from ``topology_weight``, which is active.
+
+Transform estimation
+--------------------
+
+These settings belong to ``transform``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 16 52
+
+   * - JSON key / CLI flag
+     - Default
+     - Meaning
+   * - ``method`` / ``--method``
+     - ``rigid``
+     - ``rigid``: rotation and translation; ``similarity``: also uniform scale; ``affine``: also directional scaling and shear.
+   * - ``use_ransac`` / ``--use-ransac``
+     - ``false``
+     - Robust final fitting for ``rigid`` only. Ignored for similarity and affine.
+   * - ``ransac_max_trials`` / ``--ransac-max-trials``
      - ``1000``
-     - RANSAC 最大尝试次数
-   * - ``ransac_residual_threshold``
-     - ``2.0`` px
-     - RANSAC 内点残差阈值
-   * - ``residual_prune_quantile``
+     - Maximum final rigid RANSAC trials.
+   * - ``ransac_residual_threshold`` / ``--ransac-residual-threshold``
+     - ``2.0``
+     - Final rigid RANSAC inlier threshold, in Fixed-image pixels.
+   * - ``residual_prune_quantile`` / ``--residual-prune-quantile``
      - ``null``
-     - 首次拟合后按残差分位数剔除高残差匹配并重新拟合
-   * - ``initial_coarse_transform``
+     - Refit after dropping residuals above a quantile, for example ``0.9``. Active only for ``0 < q < 1``, when at least three pairs remain and at least one pair is removed.
+   * - ``initial_coarse_transform`` / ``--initial-coarse-transform``
      - ``null``
-     - 可选的 3×3 初始 moving-to-fixed 变换
+     - Path to a JSON 3-by-3 Moving-to-Fixed matrix used to initialize matching in ``run``.
 
-常见调优路径
-------------
+Rigid and similarity fits require at least two match pairs; affine fits require
+at least three. Degenerate, duplicated, or poorly distributed points can still
+give an unreliable fit. Prefer well-spread landmarks over the minimum count.
 
-分割明显错误
-~~~~~~~~~~~~
+An initial-transform JSON may contain the raw nested 3-by-3 array or an object
+with a ``matrix``, ``moving_to_fixed``, ``affine``, or ``transform`` key.
+The exported ``transform.moving_to_fixed.json`` is suitable. All matrices use
+pixel ``(x, y)`` coordinates, not row-column order or physical units.
 
-* 先确认 ``registration_channel`` 和 ``channel_axis``。
-* 检查背景是否被分成大量小实例，必要时设置 ``min_area``。
-* 如果粘连或漏分严重，优先在 napari 中修订 mask，再用 mask 模式配准。
-* GPU 开关只影响执行设备，不会自动改善分割质量。
+.. note::
 
-匹配太少
-~~~~~~~~
+   ``match`` accepts the transform flags listed above but does not apply them
+   in the release. Standalone ``transform`` applies the final-fit controls but
+   ignores ``--initial-coarse-transform``; matching has already been completed.
+   Use ``run`` when initializing matching from an existing matrix.
 
-* 确认两幅图确实有足够视野重叠。
-* 检查两侧分割出的细胞规模是否相近。
-* 在已有候选充足时适度提高 ``top_k``。
-* 粗位移较大时可扩大 ``spatial_window_size``；扩大后要更严格检查离群点。
-* 跨模态形态差异大时，可降低 ``feature_weight`` 或提高 ``topology_weight``，每次小幅调整。
+Output controls
+---------------
 
-匹配多但离群明显
-~~~~~~~~~~~~~~~~
+These settings belong to ``output``. Only ``output_dir`` has a CLI flag;
+set the save switches in a configuration file.
 
-* 刚性模型可启用 ``--use-ransac``。
-* 根据预期定位误差调整 ``ransac_residual_threshold``。
-* 可设置 ``residual_prune_quantile`` 做二次残差裁剪。
-* 不要只追求更低平均残差；要检查匹配是否覆盖整个视野。
+.. list-table::
+   :header-rows: 1
+   :widths: 32 25 43
 
-倍率不同
-~~~~~~~~
+   * - JSON key
+     - Default
+     - Meaning
+   * - ``output_dir``
+     - ``outputs/topoalign-run``
+     - Destination directory; overridden by ``--output-dir``.
+   * - ``save_overlay``
+     - ``true``
+     - Save an overlay when a resampled source and compatible Fixed reference are available.
+   * - ``save_registered_moving``
+     - ``true``
+     - Save the resampled Moving image or mask.
+   * - ``save_features``
+     - ``true``
+     - Save the Fixed and Moving feature tables.
+   * - ``save_matches``
+     - ``true``
+     - Save/register the initial match artifact. The final transform stage still writes ``matches.csv`` even when this is ``false``.
 
-先用刚性模型确认旋转和平移方向正确，再改为 ``similarity``。如果拟合出的缩放比例
-不符合显微镜元数据，应回到输入像素尺寸和匹配质量排查。
+A resampling source still triggers warping and ``valid_overlap_mask.tif`` export
+when ``save_registered_moving`` is false. Existing output directories are not
+cleared. See :doc:`outputs` for the exact files and export conditions.
 
-考虑仿射
-~~~~~~~~
+Tuning workflow
+---------------
 
-只有当叠加图显示稳定的方向性缩放或剪切，并且匹配点数量足够、覆盖整个视野时，
-才使用 ``affine``。仿射至少需要 3 对匹配点，但实际可靠拟合通常需要远多于最低数量。
+#. Check the Fixed/Moving direction, image axes, segmentation channel, and masks.
+   Correct segmentation errors before tuning matching.
+#. Start with a rigid fit and inspect both landmark coverage and the overlay.
+#. If too few candidates are found, check field-of-view overlap and cell counts.
+   Adjust the spatial window or supply an initial transform when appropriate.
+   Increasing ``top_k`` cannot create missing candidates.
+#. For outliers, try final rigid RANSAC or a residual-pruning quantile. Recheck
+   the spatial coverage after pruning.
+#. Use similarity when uniform scale differences are expected; use affine only
+   when the geometry justifies its additional degrees of freedom.
+#. Change one group of settings at a time and keep separate output directories.
 
-质量阈值的使用
---------------
-
-Agent/诊断中的阈值是筛查提示而非硬性验收标准。经验上，少于 3 对匹配无法支持可靠
-模型；P95 残差大于约 5 px 应人工复核，大于约 10 px 通常提示明显问题；有效重叠比例
-低于约 0.25 也需要复核。像素大小、细胞直径和实验目标不同，阈值应随数据校准。
+Residual tolerances depend on pixel size, cell dimensions, and the downstream
+analysis. A low fitted residual alone does not demonstrate correct registration.

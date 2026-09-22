@@ -1,78 +1,151 @@
-快速开始
-========
+Quick start
+===========
 
-本仓库当前不附带公开演示图像。下面命令是操作模板，请把 ``fixed.tif`` 和
-``moving.tif`` 替换为自己的文件。
+This tutorial first checks registration using small synthetic instance masks.
+It requires only the :ref:`core CLI installation <install-core>`: no GPU,
+segmentation model, API account, or microscopy dataset is needed. The second
+part shows how to run your own image pair.
 
-准备输入
---------
+Run a reproducible mask example
+-------------------------------
 
-* Fixed：参考图像，定义最终输出坐标。
-* Moving：待变换图像，将被映射到 Fixed。
-* 优先选择两张图中都清晰、细胞数量足够且视野有较大重叠的核/细胞通道。
-* 先裁出有代表性的中小视野调参，再运行整幅图像或 WSI。
+1. Create the example masks
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Web 快速开始
---------------
+From the repository root, run:
 
-从仓库根目录启动：
+.. code-block:: console
 
-.. code-block:: powershell
+   python docs/examples/create_demo_masks.py
 
-   conda activate cell_registration_gpu
-   python webapp/backend.py
+The script writes ``demo/fixed_mask.tif`` and ``demo/moving_mask.tif``.
+Each is a 256 by 256 integer label image with 12 distinct elliptical objects.
+The Moving objects are shifted six pixels right and four pixels up relative
+to Fixed. The script refuses to overwrite existing example files.
 
-浏览器打开 http://localhost:8000 ，按以下顺序操作：
+For readers using the HTML manual, the script is available as
+:download:`create_demo_masks.py <examples/create_demo_masks.py>`.
+Save it locally and run ``python create_demo_masks.py`` from a working
+directory of your choice.
 
-#. 在 **Fixed Image** 中选择参考图像。
-#. 在 **Moving Images** 中选择一张或多张待配准图像。
-#. 第一次运行保留 **Normal registration** 和默认参数；当前 Web Normal 固定使用
-   similarity。需要刚性基线时使用下方 CLI 示例。
-#. 确认 GPU 设置与当前 PyTorch 环境一致。
-#. 提交配准并等待每张 Moving 顺序完成。
-#. 在 Result、Overlay 与 Match Lines 间切换，最后再下载结果。
+These shapes are synthetic installation data, not a biological benchmark.
 
-界面细节和已知限制见 :doc:`web_guide`。
+2. Register the masks
+~~~~~~~~~~~~~~~~~~~~~
 
-CLI 快速开始
---------------
+.. code-block:: console
 
-GPU：
+   topoalign run --fixed-mask demo/fixed_mask.tif --moving-mask demo/moving_mask.tif --mode mask --method rigid --output-dir outputs/demo-mask
 
-.. code-block:: powershell
+Use a fresh output directory for each rerun, such as
+``outputs/demo-mask-002``. The CLI can overwrite existing files with the same
+names.
 
-   topoalign run `
-     --fixed fixed.tif `
-     --moving moving.tif `
-     --mode image `
-     --method rigid `
-     --gpu `
-     --output-dir outputs/first-run
+The command extracts features, matches the objects, estimates a rigid
+Moving-to-Fixed transform, and resamples the Moving labels. It does not invoke
+Cellpose.
 
-CPU：
+3. Inspect the result
+~~~~~~~~~~~~~~~~~~~~~
 
-.. code-block:: powershell
+.. code-block:: console
 
-   topoalign run `
-     --fixed fixed.tif `
-     --moving moving.tif `
-     --mode image `
-     --method rigid `
-     --no-gpu `
-     --output-dir outputs/first-run-cpu
+   topoalign inspect outputs/demo-mask/result.json
 
-检查结果：
+The verified example produces 12 matches. The transform in
+``transform.moving_to_fixed.json`` is approximately:
 
-.. code-block:: powershell
+.. code-block:: json
 
-   topoalign inspect outputs/first-run/result.json
+   {
+     "direction": "moving_to_fixed",
+     "coordinate_space": "pixel_xy",
+     "matrix": [
+       [1.0, 0.0, -6.0],
+       [0.0, 1.0, 4.0],
+       [0.0, 0.0, 1.0]
+     ]
+   }
 
-重点查看 ``overlay.tif``、``matches.csv``、``diagnostics.json`` 和 ``result.json``。
-如果刚性基线合理，再按 :doc:`parameters` 逐项调整，不要一次改变许多参数。
+Only selected transform fields are shown. Small floating-point differences
+around zero and one are expected.
 
-下一步
-------
+The translation is ``x_fixed = x_moving - 6``,
+``y_fixed = y_moving + 4``. Residuals should be close to zero, and
+``registered_moving.tif`` should coincide with the Fixed labels. In a mask-only
+run, this file contains registered labels rather than intensity data.
 
-* 需要复用 mask、特征或单独执行阶段：参阅 :doc:`cli_guide`。
-* 需要人工修订分割：参阅 :doc:`napari_guide`。
-* 需要解释输出和判断质量：参阅 :doc:`outputs`。
+Open Fixed and the registered mask as **Labels** layers in napari to compare
+their outlines. The generated ``overlay.tif`` compares the label values for
+this mask-only example; it is not an intensity image. See :doc:`outputs` for
+conditional output files and display conventions.
+
+Register your own images
+------------------------
+
+Install the :ref:`image segmentation dependencies <install-images>` first.
+Replace the sample filenames below with your data paths; the repository does
+not include a microscopy image pair.
+
+1. Inspect both inputs
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: console
+
+   topoalign inspect fixed.tif
+   topoalign inspect moving.tif
+
+Choose images with overlapping tissue and a comparable cell or nuclear
+channel. Begin with a representative region that fits comfortably in memory.
+
+For a 2D grayscale pair, the following CPU example is explicit about the
+channel layout:
+
+.. code-block:: console
+
+   topoalign run --fixed fixed.tif --moving moving.tif --mode image --channel-axis none --method rigid --no-gpu --output-dir outputs/first-image-run
+
+For a ``C,Y,X`` array, replace ``--channel-axis none`` with
+``--channel-axis first --registration-channel 0``, adjusting the channel
+index to your data. Both images use the same channel-axis and channel-index
+settings in a single run. If their layouts or nuclear-channel positions differ,
+prepare compatible images or segment them separately.
+
+For a verified CUDA environment, replace ``--no-gpu`` with ``--gpu``.
+The first Cellpose-SAM run may download model weights. CPU segmentation can
+be slow; reuse saved masks when trying different matching parameters.
+
+2. Check segmentation before tuning matching
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Open ``segmentation_fixed/mask.tif`` and ``segmentation_moving/mask.tif`` in
+the output directory. Check that cells are distinct positive labels and that the
+tissue regions of interest are represented on both sides. If segmentation is
+poor, fix the channel selection or supply corrected instance masks before
+interpreting the registration.
+
+To use corrected masks with the raw images:
+
+.. code-block:: console
+
+   topoalign run --fixed fixed.tif --moving moving.tif --fixed-mask fixed_mask.tif --moving-mask moving_mask.tif --method rigid --no-gpu --output-dir outputs/corrected-mask-run
+
+The supplied masks avoid repeated segmentation, while the raw images allow
+intensity resampling and an overlay.
+
+3. Review alignment
+~~~~~~~~~~~~~~~~~~~
+
+Inspect ``result.json`` and ``diagnostics.json``, then review
+``overlay.tif``, ``registered_moving.tif``, and
+``valid_overlap_mask.tif`` when present.
+
+Check several locations across the overlapping field. Look for coherent
+alignment of the same structures, well-distributed matches, and residuals
+consistent with the precision needed for your analysis. A low residual from
+a small cluster of matches does not establish accuracy in the rest of the
+image.
+
+Keep the input files, ``config.resolved.json``, and software revision with
+the selected result. The :doc:`parameters` guide explains how to adjust a
+rigid baseline, while :doc:`cli_guide` covers stage reuse and scripted batches.

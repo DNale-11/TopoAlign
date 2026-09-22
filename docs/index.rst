@@ -1,26 +1,39 @@
-TopoAlign 用户手册
-====================
+TopoAlign User Manual
+=====================
 
-.. image:: ../topoalign-logo.png
+.. image:: _static/topoalign-release-logo.png
    :alt: TopoAlign
    :width: 360px
    :align: center
 
-TopoAlign 是一个面向显微与空间组学图像的拓扑引导细胞配准工具。
-它以细胞为配准地标，完成实例分割、特征提取、细胞匹配、几何变换估计、
-图像重采样和结果质检，并提供 Web、CLI、napari 与可选 AI Agent 四种入口。
+TopoAlign registers cellular microscopy images using cell morphology and local
+spatial relationships. This manual explains how to install the software, choose
+inputs, run registration, and assess the result before using it in an analysis.
+
+The public repository provides a command-line interface, a napari plugin, and
+an optional conversational Agent. Start with :doc:`installation` and the
+reproducible mask example in :doc:`quickstart`. For interactive work, use
+the :doc:`napari_guide`.
 
 .. important::
 
-   ``Fixed`` 是参考图像和最终坐标空间，``Moving`` 是待变换的源图像。
-   TopoAlign 输出的变换方向始终是 ``moving_to_fixed``。
+   **Fixed** is the reference image and defines the output coordinate system.
+   **Moving** is the source image to transform. CLI transform files map
+   ``moving_to_fixed`` in pixel coordinates.
 
-首次使用建议先阅读 :doc:`installation` 和 :doc:`quickstart`；需要可视化操作时阅读
-:doc:`web_guide`，需要可复现脚本时阅读 :doc:`cli_guide`。
+Choose a starting point
+-----------------------
+
+* **Check the installation without a GPU or model download:** :doc:`quickstart`.
+* **Register images, masks, or feature tables:** :doc:`cli_guide`.
+* **Review and edit segmentation interactively:** :doc:`napari_guide`.
+* **Get assistance through an API provider:** :doc:`agent_guide`.
+* **Understand parameters and assess alignment:** :doc:`parameters` and
+  :doc:`outputs`.
 
 .. toctree::
    :maxdepth: 2
-   :caption: 开始使用
+   :caption: Getting started
 
    overview
    installation
@@ -28,19 +41,30 @@ TopoAlign 是一个面向显微与空间组学图像的拓扑引导细胞配准�
 
 .. toctree::
    :maxdepth: 2
-   :caption: 操作指南
+   :caption: User guides
 
-   web_guide
    cli_guide
    napari_guide
    agent_guide
 
 .. toctree::
    :maxdepth: 2
-   :caption: 参考
+   :caption: Reference
 
    parameters
    outputs
    troubleshooting
 
-项目源码与问题反馈：`DNale-11/cell_registration <https://github.com/DNale-11/cell_registration>`_。
+Version and support
+-------------------
+
+This edition covers the public TopoAlign 0.1.0 source at commit
+``693c6781e162``. The CLI and napari plugin have different pipelines and export
+conventions; their guides describe those differences explicitly. A Web server is
+not included in this source revision; see :doc:`web_guide` for the status of
+older Web instructions.
+
+Source code is available at `DNale-11/TopoAlign
+<https://github.com/DNale-11/TopoAlign>`_. Report reproducible problems through
+`GitHub Issues <https://github.com/DNale-11/TopoAlign/issues>`_, using the
+information checklist in :doc:`troubleshooting`.
